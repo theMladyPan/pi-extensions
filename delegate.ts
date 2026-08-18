@@ -121,33 +121,53 @@ const ROLE_CONFIG: Record<Role, { tools: string[]; thinking: string; prompt: str
   scout: {
     tools: READ_TOOLS,
     thinking: "medium",
-    prompt:
-      "Scout the codebase without modifying files. Locate relevant files, trace the real flow, and return compressed findings with exact paths and line references.",
+    prompt: [
+      "Primary job: reduce later agents' context cost by answering the assigned discovery question without modifying files.",
+      "Suggested approach, adapt as needed: locate narrowly -> trace relevant entry points, callers, data/control flow, tests, configuration, and repository instructions -> verify -> compress.",
+      "Return a dense handoff: direct answer, observed evidence with exact paths and symbols or lines, important relationships and constraints, uncertainties, and the smallest sensible next task when useful.",
+      "Separate evidence from inference; never invent details. Challenge a requested plan when repository evidence shows it is incomplete, unsafe, or aimed at the wrong place.",
+    ].join("\n"),
   },
   implement: {
     tools: WRITE_TOOLS,
     thinking: "high",
-    prompt:
-      "Implement the bounded task. Read the existing flow first, make the smallest correct change, run focused checks, and do not expand scope.",
+    prompt: [
+      "Primary job: complete one coherent, bounded change that advances the stated goal.",
+      "Suggested approach, adapt as needed: verify scope against repository evidence -> inspect the relevant flow, callers, tests, and conventions -> make the smallest root-cause change -> run focused checks.",
+      "Reuse existing patterns and preserve unrelated work. Essential adjacent edits are allowed when correctness or validation requires them; explain material scope changes.",
+      "If the requested approach conflicts with the goal or repository evidence, stop before consequential edits, show why, and recommend a corrected bounded assignment rather than forcing the implementation.",
+    ].join("\n"),
   },
   review: {
     tools: READ_TOOLS,
     thinking: "high",
-    prompt:
-      "Review without modifying files. Inspect the working diff and relevant callers. Report only actionable findings, ordered by severity, with exact paths and lines.",
+    prompt: [
+      "Primary job: independently judge the requested artifact or diff against the stated goal, acceptance criteria, repository behavior, and expected quality without modifying files.",
+      "Suggested approach, adapt as needed: recover the intended contract -> inspect the artifact plus relevant callers and tests -> test important claims -> report only evidence-backed results.",
+      "Check correctness, regressions, security or data-loss risks, missing validation, and avoidable complexity. Report actionable findings by severity with path and line, impact, and the smallest credible fix; distinguish blockers from suggestions.",
+      "Challenge a flawed assignment or goal mismatch even when the code follows its literal wording. If there are no findings, say so and mention only material unverified or residual risks.",
+    ].join("\n"),
   },
   chore: {
     tools: WRITE_TOOLS,
     thinking: "medium",
-    prompt:
-      "Complete the bounded repository chore directly. Preserve unrelated work, verify the result, and avoid speculative cleanup.",
+    prompt: [
+      "Primary job: execute bounded supporting repository work such as tests, checks, formatting, documentation, configuration, or maintenance.",
+      "Suggested approach, adapt as needed: inspect the target and relevant behavior -> perform the smallest useful support task -> run focused checks -> report exact results.",
+      "For tests, assert externally observable behavior and the relevant failure mode rather than implementation details. Do not mask a production defect or rewrite behavior merely to make a check pass.",
+      "A small adjacent correction is allowed when safe and essential to the chore; explain it. Otherwise report the defect and propose a targeted implement fix.",
+    ].join("\n"),
   },
 };
 
 const DelegateParams = Type.Object({
-  task: Type.String({ minLength: 1, description: "A bounded, well-defined coding task with acceptance criteria" }),
+  task: Type.String({
+    minLength: 1,
+    description:
+      "A self-contained task packet with the relevant goal, bounded scope or question, known context, acceptance criteria, constraints, checks, and desired output",
+  }),
   role: StringEnum(["scout", "implement", "review", "chore"] as const, {
-    description: "Role controlling tools and execution instructions",
+    description: "Dominant role controlling available tools and guidance; workflows may skip or reorder roles",
   }),
   cwd: Type.Optional(Type.String({ description: "Child working directory; defaults to the current directory" })),
   provider: Type.Optional(
@@ -279,10 +299,12 @@ async function truncateOutput(output: string): Promise<string> {
 function buildPrompt(role: Role): string {
   return [
     `You are a delegated ${role} agent running non-interactively.`,
+    "Your role is a center of gravity, not a rigid script. Stay focused and use only available tools. Do adjacent analysis or work that your role permits when necessary for a correct result, and explain material deviations.",
     ROLE_CONFIG[role].prompt,
-    "Do not ask the user questions. If a minor detail is ambiguous, choose the safest reasonable option and state it.",
-    "Use web tools only when repository evidence is insufficient. Follow Ponytail: understand first, then use the smallest solution that works.",
-    "Finish with a concise summary using: Summary, Files changed, Checks, Follow-up.",
+    "First test the assignment against its stated goal and repository evidence. If it is contradictory, unsafe, wrongly scoped, or based on a false premise, do not blindly execute it: explain why with evidence and propose a better bounded assignment. Complete a clearly safe portion only when it will not hide the blocker.",
+    "Do not ask the user questions; you cannot interact. Resolve minor reversible ambiguity with the safest reasonable assumption and state it. For consequential ambiguity or a product or architecture decision, stop and return the blocker, evidence, options, and your recommendation to the parent agent.",
+    "Follow repository instructions and preserve unrelated work. Use web tools only when repository evidence is insufficient. Follow Ponytail: understand first, then use the smallest solution that works.",
+    "Follow any output form requested by the task. Otherwise answer free-form and concise, including only relevant results, evidence, changed files, checks, assumptions, or blockers. Do not add empty headings or speculative follow-up.",
   ].join("\n");
 }
 
@@ -291,12 +313,16 @@ export default function delegateExtension(pi: ExtensionAPI) {
     name: "delegate",
     label: "Delegate",
     description:
-      "Run one bounded coding task in an isolated non-interactive Pi subprocess. Roles: scout, implement, review, chore. Supports provider/model/thinking overrides and optional timeout, turn, and best-effort cost limits. Limit events preserve completed filesystem changes and return partial progress for reassignment.",
-    promptSnippet: "Delegate a bounded coding task to a cheaper isolated Pi process",
+      "Run one bounded repository task in an isolated non-interactive Pi subprocess. Roles are centers of gravity: scout, implement, review, chore. Supports provider/model/thinking overrides and optional timeout, turn, and best-effort cost limits. Limit events preserve completed filesystem changes and return partial progress for reassignment.",
+    promptSnippet:
+      "Delegate context-dense, bounded work to cheaper isolated Pi agents; orchestrate flexibly and avoid ritual loops",
     promptGuidelines: [
-      "Use delegate for bounded coding work that a smaller model can complete without the parent conversation.",
-      "Give delegate concrete acceptance criteria and a role; do not delegate unresolved product or architecture decisions.",
-      "When delegate returns a limited result, inspect its preserved partial progress and decide whether to continue, narrow, or reassign the task.",
+      "The master owns the end goal, product and architecture decisions, decomposition, and synthesis. Delegate work, not accountability, to the cheapest role and model likely to succeed.",
+      "Make each task a self-contained, context-dense packet using the relevant goal and why, exact question or one coherent work slice, known evidence and paths, acceptance criteria, constraints and non-goals, checks, and desired output. Pass context you already know instead of making the child rediscover it.",
+      "Treat roles as centers of gravity, not rigid stages: scout maps unknown files and relationships; implement changes one coherent slice; review checks an artifact against the goal and expected quality; chore handles separable tests, checks, docs, and maintenance. A child may challenge a bad assignment; inspect its evidence and reframe instead of forcing compliance.",
+      "Suggested coding flow, not a required loop: scout when locations or relationships are unclear -> implement a bounded slice -> run review and, when useful, a non-conflicting chore for tests or checks in parallel -> request one targeted implement fix for concrete findings. Skip, reorder, or stop when the task or evidence warrants it; avoid ritual agent rotation and repeated review/fix loops.",
+      "Prefer cheap scouts for distinct discovery questions and consolidate their findings before expensive implementation. Examples: investigation -> scout only; known small edit -> implement plus focused check; existing diff -> review plus optional parallel chore; test-only work -> chore. Keep consequential product or architecture choices with the master, though scouts and reviewers can gather evidence or compare options.",
+      "When a delegate stops on consequential ambiguity, returns limited partial work, or shows that the assignment conflicts with repository evidence, inspect its evidence and preserved work, then decide directly or issue a narrower corrected task.",
     ],
     parameters: DelegateParams,
 
