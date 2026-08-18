@@ -19,7 +19,7 @@ const ExaSearchParameters = Type.Object({
 		{
 			minItems: 1,
 			maxItems: 5,
-			description: "Ranked list of 1 to 5 search queries.",
+			description: "Ranked list of 1 to 5 search queries. Pass a JSON string array as `queries`, never bracket-indexed keys such as `queries[0]`.",
 		},
 	),
 	numResults: Type.Optional(
