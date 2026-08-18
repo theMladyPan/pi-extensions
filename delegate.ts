@@ -120,25 +120,25 @@ interface DelegateDetails {
 const ROLE_CONFIG: Record<Role, { tools: string[]; thinking: string; prompt: string }> = {
   scout: {
     tools: READ_TOOLS,
-    thinking: "low",
+    thinking: "medium",
     prompt:
       "Scout the codebase without modifying files. Locate relevant files, trace the real flow, and return compressed findings with exact paths and line references.",
   },
   implement: {
     tools: WRITE_TOOLS,
-    thinking: "medium",
+    thinking: "high",
     prompt:
       "Implement the bounded task. Read the existing flow first, make the smallest correct change, run focused checks, and do not expand scope.",
   },
   review: {
     tools: READ_TOOLS,
-    thinking: "medium",
+    thinking: "high",
     prompt:
       "Review without modifying files. Inspect the working diff and relevant callers. Report only actionable findings, ordered by severity, with exact paths and lines.",
   },
   chore: {
     tools: WRITE_TOOLS,
-    thinking: "low",
+    thinking: "medium",
     prompt:
       "Complete the bounded repository chore directly. Preserve unrelated work, verify the result, and avoid speculative cleanup.",
   },
@@ -668,7 +668,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
           refresh: async () => ({ models: availableModels, errors: new Map() }),
         };
         const settingsManagerAdapter = {
-          setDefaultModelAndProvider: () => {},
+          setDefaultModelAndProvider: () => { },
         };
         return new ModelSelectorComponent(
           tui,
