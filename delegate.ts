@@ -3,7 +3,7 @@ import { existsSync, statSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, StringEnum } from "@earendil-works/pi-ai";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -113,6 +113,7 @@ interface DelegateDetails {
   exitCode: number | null;
   changedFiles: string[];
   completedTools: string[];
+  retries: number;
   stderr?: string;
   advisory?: string;
 }
@@ -308,6 +309,30 @@ function buildPrompt(role: Role): string {
   ].join("\n");
 }
 
+export function decideRetry(opts: {
+  status: "completed" | "failed" | "limited" | "cancelled";
+  limit?: string;
+  sessionId?: string;
+  lastErrorMessage: string;
+  latestText: string;
+  hasWork: boolean;
+  continueRetriesUsed: number;
+  summaryRetriesUsed: number;
+}): { kind: "continue" | "summary" } | null {
+  if (opts.status === "cancelled" || opts.limit || !opts.sessionId) return null;
+  if (
+    opts.status === "failed" &&
+    opts.continueRetriesUsed < 2 &&
+    isRetryableAssistantError({ stopReason: "error", errorMessage: opts.lastErrorMessage } as any)
+  ) {
+    return { kind: "continue" };
+  }
+  if (opts.status === "completed" && opts.latestText === "" && opts.hasWork && opts.summaryRetriesUsed < 1) {
+    return { kind: "summary" };
+  }
+  return null;
+}
+
 export default function delegateExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "delegate",
@@ -347,7 +372,6 @@ export default function delegateExtension(pi: ExtensionAPI) {
         "--mode",
         "json",
         "-p",
-        "--no-session",
         "--no-extensions",
         "--tools",
         tools.join(","),
@@ -389,15 +413,25 @@ export default function delegateExtension(pi: ExtensionAPI) {
       let model: string | undefined;
       let provider: string | undefined;
       let lastStopReason: string | undefined;
+      let lastErrorMessage = "";
+      let sessionId: string | undefined;
       let limit: Limit | undefined;
       let cancelled = false;
       let spawnError: Error | undefined;
       let proc: ChildProcess | undefined;
       let forceKillTimer: NodeJS.Timeout | undefined;
       let emitTimer: NodeJS.Timeout | undefined;
+      let continueRetriesUsed = 0;
+      let summaryRetriesUsed = 0;
+      let nextRetryKind: "continue" | "summary" | null = null;
+      let sawCompleted = false;
+      let status: Status = "running";
+      let exitCode: number | null = null;
 
-      const makeDetails = (status: Status, exitCode: number | null): DelegateDetails => ({
-        status,
+      const totalRetries = () => continueRetriesUsed + summaryRetriesUsed;
+
+      const makeDetails = (currentStatus: Status, currentExitCode: number | null): DelegateDetails => ({
+        status: currentStatus,
         limit,
         role,
         task: params.task,
@@ -407,9 +441,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
         thinking,
         turns,
         usage,
-        exitCode,
+        exitCode: currentExitCode,
         changedFiles: [...changedFiles],
         completedTools: [...completedTools],
+        retries: totalRetries(),
         ...(stderr.trim() ? { stderr: stderr.trim() } : {}),
         ...(advisory ? { advisory } : {}),
       });
@@ -438,12 +473,12 @@ export default function delegateExtension(pi: ExtensionAPI) {
         if (reason === "cancelled") cancelled = true;
         else limit = reason;
 
-        const status = reason === "cancelled" ? "cancelled" : "limited";
+        const stoppedStatus = reason === "cancelled" ? "cancelled" : "limited";
         const message =
           reason === "cancelled"
             ? "Delegate cancelled; completed filesystem work was preserved."
             : `Delegate ${reason} limit reached; stopping child and preserving completed filesystem work.`;
-        const details = makeDetails(status, null);
+        const details = makeDetails(stoppedStatus, null);
         onUpdate?.({ content: [{ type: "text", text: message }], details });
         if (reason !== "cancelled") pi.events.emit("delegate:limit", { toolCallId, ...details });
         proc?.kill("SIGTERM");
@@ -453,8 +488,6 @@ export default function delegateExtension(pi: ExtensionAPI) {
         forceKillTimer.unref();
       };
 
-      const invocation = getPiInvocation(args);
-      let stdoutBuffer = "";
       let timeout: NodeJS.Timeout | undefined;
       const abort = () => stop("cancelled");
 
@@ -467,13 +500,18 @@ export default function delegateExtension(pi: ExtensionAPI) {
           return;
         }
 
-        if (event.type === "message_end" && event.message?.role === "assistant") {
+        if (event.type === "session" && typeof event.id === "string" && !sessionId) {
+          sessionId = event.id;
+        } else if (event.type === "message_end" && event.message?.role === "assistant") {
           addUsage(usage, event.message.usage);
           latestText = getText(event.message) || latestText;
           model = event.message.model ?? model;
           provider = event.message.provider ?? provider;
           lastStopReason = event.message.stopReason ?? lastStopReason;
-          if (event.message.errorMessage) stderr = appendTail(stderr, `${event.message.errorMessage}\n`);
+          if (event.message.errorMessage) {
+            lastErrorMessage = event.message.errorMessage;
+            stderr = appendTail(stderr, `${event.message.errorMessage}\n`);
+          }
           if (params.maxCostUsd && usage.cost.total >= params.maxCostUsd) stop("cost");
           scheduleUpdate();
         } else if (event.type === "message_end" && event.message?.role === "toolResult") {
@@ -490,7 +528,8 @@ export default function delegateExtension(pi: ExtensionAPI) {
           const tool = pendingTools.get(event.toolCallId);
           pendingTools.delete(event.toolCallId);
           if (!tool || event.isError) return;
-          completedTools.push(describeTool(tool.name, tool.args));
+          const described = describeTool(tool.name, tool.args);
+          if (!completedTools.includes(described)) completedTools.push(described);
           if (tool.name === "edit" || tool.name === "write") {
             const file = String(tool.args.path ?? tool.args.file_path ?? "");
             if (file) changedFiles.add(file);
@@ -499,62 +538,155 @@ export default function delegateExtension(pi: ExtensionAPI) {
         }
       };
 
-      const exitCode = await new Promise<number | null>((done) => {
-        proc = spawn(invocation.command, invocation.args, {
-          cwd,
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
+      const sleepWithAbort = (ms: number) =>
+        new Promise<boolean>((resolve) => {
+          if (signal?.aborted || cancelled) return resolve(false);
+          const t = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve(!cancelled && !signal?.aborted);
+          }, ms);
+          const onAbort = () => {
+            clearTimeout(t);
+            signal?.removeEventListener("abort", onAbort);
+            resolve(false);
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
         });
 
-        proc.stdout?.on("data", (chunk) => {
-          stdoutBuffer += chunk.toString();
-          const lines = stdoutBuffer.split("\n");
-          stdoutBuffer = lines.pop() ?? "";
-          for (const line of lines) processLine(line);
-        });
-        proc.stderr?.on("data", (chunk) => {
-          stderr = appendTail(stderr, chunk.toString());
-        });
-        proc.on("error", (error) => {
-          spawnError = error;
-        });
-        proc.on("close", (code) => {
-          if (stdoutBuffer.trim()) processLine(stdoutBuffer);
-          done(code);
-        });
+      for (let attempt = 0; ; attempt++) {
+        let stdoutBuffer = "";
+        spawnError = undefined;
+        lastStopReason = undefined;
+        lastErrorMessage = "";
 
-        if (params.timeoutSeconds) {
-          timeout = setTimeout(() => stop("timeout"), params.timeoutSeconds * 1000);
-          timeout.unref();
+        let currentArgs = args;
+        if (attempt > 0 && sessionId) {
+          const resumeArgs = [...args];
+          resumeArgs.splice(3, 0, "--session", sessionId);
+          const promptIdx = resumeArgs.indexOf("--append-system-prompt");
+          if (promptIdx !== -1) resumeArgs.splice(promptIdx, 2);
+          const continuationText =
+            nextRetryKind === "continue"
+              ? "Your previous turn failed with an upstream API error. Continue the task from where you left off — prior work is preserved in this session and on disk. Finish the task and end with a concise final text summary."
+              : "Your previous run finished the work but ended without a final text summary. Do not redo any work. Reply with a concise summary of what you did and the results.";
+          resumeArgs[resumeArgs.length - 1] = continuationText;
+          currentArgs = resumeArgs;
         }
-        if (signal?.aborted) abort();
-        else signal?.addEventListener("abort", abort, { once: true });
-      });
 
-      if (timeout) clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
+        const invocation = getPiInvocation(currentArgs);
+
+        exitCode = await new Promise<number | null>((done) => {
+          proc = spawn(invocation.command, invocation.args, {
+            cwd,
+            shell: false,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+
+          proc.stdout?.on("data", (chunk) => {
+            stdoutBuffer += chunk.toString();
+            const lines = stdoutBuffer.split("\n");
+            stdoutBuffer = lines.pop() ?? "";
+            for (const line of lines) processLine(line);
+          });
+          proc.stderr?.on("data", (chunk) => {
+            stderr = appendTail(stderr, chunk.toString());
+          });
+          proc.on("error", (error) => {
+            spawnError = error;
+          });
+          proc.on("close", (code) => {
+            if (stdoutBuffer.trim()) processLine(stdoutBuffer);
+            done(code);
+          });
+
+          if (params.timeoutSeconds) {
+            timeout = setTimeout(() => stop("timeout"), params.timeoutSeconds * 1000);
+            timeout.unref();
+          }
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = undefined;
+        }
+        if (forceKillTimer) {
+          clearTimeout(forceKillTimer);
+          forceKillTimer = undefined;
+        }
+        signal?.removeEventListener("abort", abort);
+
+        if (cancelled) status = "cancelled";
+        else if (limit) status = "limited";
+        else if (spawnError || exitCode !== 0 || lastStopReason === "error" || lastStopReason === "aborted") status = "failed";
+        else {
+          status = "completed";
+          sawCompleted = true;
+        }
+
+        if (cancelled || limit) break;
+
+        const hasWork = completedTools.length > 0 || changedFiles.size > 0;
+        const retryDecision = decideRetry({
+          status,
+          limit,
+          sessionId,
+          lastErrorMessage,
+          latestText,
+          hasWork,
+          continueRetriesUsed,
+          summaryRetriesUsed,
+        });
+
+        if (!retryDecision) {
+          if (status === "failed" && sawCompleted) {
+            status = "completed";
+          }
+          break;
+        }
+
+        nextRetryKind = retryDecision.kind;
+        if (retryDecision.kind === "continue") {
+          const delay = continueRetriesUsed === 0 ? 3000 : 8000;
+          continueRetriesUsed++;
+          const ok = await sleepWithAbort(delay);
+          if (!ok) {
+            stop("cancelled");
+            status = "cancelled";
+            break;
+          }
+        } else {
+          summaryRetriesUsed++;
+          const ok = await sleepWithAbort(3000);
+          if (!ok) {
+            stop("cancelled");
+            status = "cancelled";
+            break;
+          }
+        }
+      }
+
       if (emitTimer) clearTimeout(emitTimer);
-      signal?.removeEventListener("abort", abort);
-
-      let status: Status;
-      if (cancelled) status = "cancelled";
-      else if (limit) status = "limited";
-      else if (spawnError || exitCode !== 0 || lastStopReason === "error" || lastStopReason === "aborted") status = "failed";
-      else status = "completed";
 
       const details = makeDetails(status, exitCode);
       const progress = [
         changedFiles.size ? `Files changed: ${[...changedFiles].join(", ")}` : "Files changed: none recorded",
         completedTools.length ? `Completed tools: ${completedTools.slice(-12).join("; ")}` : "Completed tools: none recorded",
       ].join("\n");
+      const retries = totalRetries();
       const prefix =
         status === "limited"
           ? `Delegate paused: ${limit} limit reached. Completed filesystem work is preserved.`
           : status === "cancelled"
             ? "Delegate cancelled. Completed filesystem work is preserved."
             : status === "failed"
-              ? `Delegate failed${spawnError ? `: ${spawnError.message}` : ""}. Partial filesystem work may exist.`
-              : "Delegate completed.";
+              ? retries > 0
+                ? `Delegate failed after ${retries} resume-retry(ies). Partial filesystem work may exist.`
+                : `Delegate failed${spawnError ? `: ${spawnError.message}` : ""}. Partial filesystem work may exist.`
+              : retries > 0
+                ? `Delegate completed. Delegate recovered after ${retries} resume-retry(ies).`
+                : "Delegate completed.";
       const output = await truncateOutput(
         [prefix, latestText, status === "completed" ? "" : progress, advisory, stderr.trim() ? `stderr:\n${stderr.trim()}` : ""]
           .filter(Boolean)
@@ -617,7 +749,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
       }
 
       const container = new Container();
-      container.addChild(new Text(header + (details.limit ? ` ${theme.fg("warning", `[${details.limit} limit]`)}` : ""), 0, 0));
+      const retrySuffix = details.retries > 0 ? ` (retried ${details.retries})` : "";
+      container.addChild(
+        new Text(header + retrySuffix + (details.limit ? ` ${theme.fg("warning", `[${details.limit} limit]`)}` : ""), 0, 0),
+      );
       if (details.provider || details.model)
         container.addChild(
           new Text(theme.fg("muted", `${details.provider ?? ""}${details.model ? ` / ${details.model}` : ""}`.trim()), 0, 0),
