@@ -247,6 +247,7 @@ function buildPrompt(role: Role, rolePrompt: string): string {
     "First test the assignment against its stated goal and repository evidence. If it is contradictory, unsafe, wrongly scoped, or based on a false premise, do not blindly execute it: explain why with evidence and propose a better bounded assignment. Complete a clearly safe portion only when it will not hide the blocker.",
     "Do not ask the user questions; you cannot interact. Resolve minor reversible ambiguity with the safest reasonable assumption and state it. For consequential ambiguity or a product or architecture decision, stop and return the blocker, evidence, options, and your recommendation to the parent agent.",
     "Follow repository instructions and preserve unrelated work. Use web tools only when repository evidence is insufficient. Follow Ponytail: understand first, then use the smallest solution that works.",
+    "Output style: concise caveman talk. Bullet points, direct answers, zero prose fluff.",
     "Follow any output form requested by the task. Otherwise answer free-form and concise, including only relevant results, evidence, changed files, checks, assumptions, or blockers. Do not add empty headings or speculative follow-up.",
   ].join("\n");
 }
