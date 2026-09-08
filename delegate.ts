@@ -11,64 +11,10 @@ import {
   formatSize,
   getAgentDir,
   getMarkdownTheme,
-  ModelSelectorComponent,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-
-const DEFAULT_PROVIDER = "openrouter";
-const DEFAULT_MODEL = "z-ai/glm-5.2";
-const CONFIG_PATH = join(getAgentDir(), "delegate.json");
-
-type DelegateConfigKey = "scoutChore" | "review" | "implement";
-interface DelegateRoleModelSetting {
-  provider: string;
-  model: string;
-}
-interface DelegateConfig {
-  scoutChore?: string | DelegateRoleModelSetting;
-  review?: string | DelegateRoleModelSetting;
-  implement?: string | DelegateRoleModelSetting;
-}
-
-function parseRoleSetting(v: unknown): DelegateRoleModelSetting | undefined {
-  if (typeof v === "string" && v.trim()) {
-    return { provider: DEFAULT_PROVIDER, model: v.trim() };
-  }
-  if (v && typeof v === "object") {
-    const obj = v as Record<string, unknown>;
-    if (typeof obj.provider === "string" && obj.provider.trim() && typeof obj.model === "string" && obj.model.trim()) {
-      return { provider: obj.provider.trim(), model: obj.model.trim() };
-    }
-  }
-  return undefined;
-}
-
-/** Missing or malformed config silently falls back to no saved defaults. */
-async function loadDelegateConfig(): Promise<DelegateConfig> {
-  try {
-    const parsed = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
-    if (!parsed || typeof parsed !== "object") return {};
-    const out: DelegateConfig = {};
-    for (const key of ["scoutChore", "review", "implement"] as const) {
-      const setting = parseRoleSetting((parsed as Record<string, unknown>)[key]);
-      if (setting) out[key] = setting;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-/** Persist config; caller surfaces errors as a short UI notification. */
-async function saveDelegateConfig(config: DelegateConfig): Promise<void> {
-  await writeFile(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-}
-
-function roleConfigKey(role: Role): DelegateConfigKey {
-  return role === "scout" || role === "chore" ? "scoutChore" : role;
-}
 
 const FETCH_CONTENT_EXTENSION = join(getAgentDir(), "extensions/fetch-content/index.ts");
 const PONYTAIL_EXTENSION = join(
@@ -81,7 +27,7 @@ const WRITE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", ...W
 const STDERR_LIMIT = 32 * 1024;
 
 type Role = "scout" | "implement" | "review" | "chore";
-type Limit = "timeout" | "turns" | "cost";
+type Limit = "timeout";
 type Status = "running" | "completed" | "limited" | "cancelled" | "failed";
 
 interface Usage {
@@ -114,50 +60,40 @@ interface DelegateDetails {
   changedFiles: string[];
   completedTools: string[];
   retries: number;
+  softLimitBreached?: { turns?: boolean; cost?: boolean };
   stderr?: string;
   advisory?: string;
 }
 
-const ROLE_CONFIG: Record<Role, { tools: string[]; thinking: string; prompt: string }> = {
+/** Role prompts live in ./delegate/ for easy editing; loaded per call, so edits apply without restart. */
+const DELEGATE_DIR = new URL("./delegate/", import.meta.url);
+
+async function loadRoleFile(name: string): Promise<string> {
+  return readFile(new URL(name, DELEGATE_DIR), "utf8");
+}
+
+async function loadRolePrompt(role: Role): Promise<string> {
+  const prompt = (await loadRoleFile(`${role}.md`)).trim();
+  if (!prompt) throw new Error(`Delegate prompt file is empty: delegate/${role}.md`);
+  return prompt;
+}
+
+const ROLE_CONFIG: Record<Role, { tools: string[]; thinking: string }> = {
   scout: {
     tools: READ_TOOLS,
     thinking: "medium",
-    prompt: [
-      "Primary job: reduce later agents' context cost by answering the assigned discovery question without modifying files.",
-      "Suggested approach, adapt as needed: locate narrowly -> trace relevant entry points, callers, data/control flow, tests, configuration, and repository instructions -> verify -> compress.",
-      "Return a dense handoff: direct answer, observed evidence with exact paths and symbols or lines, important relationships and constraints, uncertainties, and the smallest sensible next task when useful.",
-      "Separate evidence from inference; never invent details. Challenge a requested plan when repository evidence shows it is incomplete, unsafe, or aimed at the wrong place.",
-    ].join("\n"),
   },
   implement: {
     tools: WRITE_TOOLS,
     thinking: "high",
-    prompt: [
-      "Primary job: complete one coherent, bounded change that advances the stated goal.",
-      "Suggested approach, adapt as needed: verify scope against repository evidence -> inspect the relevant flow, callers, tests, and conventions -> make the smallest root-cause change -> run focused checks.",
-      "Reuse existing patterns and preserve unrelated work. Essential adjacent edits are allowed when correctness or validation requires them; explain material scope changes.",
-      "If the requested approach conflicts with the goal or repository evidence, stop before consequential edits, show why, and recommend a corrected bounded assignment rather than forcing the implementation.",
-    ].join("\n"),
   },
   review: {
     tools: READ_TOOLS,
     thinking: "high",
-    prompt: [
-      "Primary job: independently judge the requested artifact or diff against the stated goal, acceptance criteria, repository behavior, and expected quality without modifying files.",
-      "Suggested approach, adapt as needed: recover the intended contract -> inspect the artifact plus relevant callers and tests -> test important claims -> report only evidence-backed results.",
-      "Check correctness, regressions, security or data-loss risks, missing validation, and avoidable complexity. Report actionable findings by severity with path and line, impact, and the smallest credible fix; distinguish blockers from suggestions.",
-      "Challenge a flawed assignment or goal mismatch even when the code follows its literal wording. If there are no findings, say so and mention only material unverified or residual risks.",
-    ].join("\n"),
   },
   chore: {
     tools: WRITE_TOOLS,
     thinking: "medium",
-    prompt: [
-      "Primary job: execute bounded supporting repository work such as tests, checks, formatting, documentation, configuration, or maintenance.",
-      "Suggested approach, adapt as needed: inspect the target and relevant behavior -> perform the smallest useful support task -> run focused checks -> report exact results.",
-      "For tests, assert externally observable behavior and the relevant failure mode rather than implementation details. Do not mask a production defect or rewrite behavior merely to make a check pass.",
-      "A small adjacent correction is allowed when safe and essential to the chore; explain it. Otherwise report the defect and propose a targeted implement fix.",
-    ].join("\n"),
   },
 };
 
@@ -171,12 +107,8 @@ const DelegateParams = Type.Object({
     description: "Dominant role controlling available tools and guidance; workflows may skip or reorder roles",
   }),
   cwd: Type.Optional(Type.String({ description: "Child working directory; defaults to the current directory" })),
-  provider: Type.Optional(
-    Type.String({ description: `Pi provider override; default with no model override: ${DEFAULT_PROVIDER}` }),
-  ),
-  model: Type.Optional(
-    Type.String({ description: `Pi model override; default with no provider override: ${DEFAULT_MODEL}` }),
-  ),
+  provider: Type.Optional(Type.String({ description: "Pi provider override (required together with model; routing per AGENTS.md)" })),
+  model: Type.Optional(Type.String({ description: "Pi model override (required together with provider; routing per AGENTS.md)" })),
   thinking: Type.Optional(
     StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
       description: "Thinking override; otherwise uses the selected role default",
@@ -186,10 +118,10 @@ const DelegateParams = Type.Object({
     Type.Integer({ minimum: 1, maximum: 86400, description: "Wall-clock limit; preserves completed filesystem work" }),
   ),
   maxTurns: Type.Optional(
-    Type.Integer({ minimum: 1, maximum: 1000, description: "Stop before starting work beyond this many turns" }),
+    Type.Integer({ minimum: 1, maximum: 1000, description: "Soft limit: report when turns exceed this count; the run finishes naturally" }),
   ),
   maxCostUsd: Type.Optional(
-    Type.Number({ exclusiveMinimum: 0, description: "Best-effort cost cap based on provider-reported usage" }),
+    Type.Number({ exclusiveMinimum: 0, description: "Soft cost cap based on provider-reported usage; breach is reported, not enforced" }),
   ),
 });
 
@@ -297,11 +229,11 @@ async function truncateOutput(output: string): Promise<string> {
   return `${truncated.content}\n\n[Output truncated to ${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)}. Full output: ${outputPath}]`;
 }
 
-function buildPrompt(role: Role): string {
+function buildPrompt(role: Role, rolePrompt: string): string {
   return [
     `You are a delegated ${role} agent running non-interactively.`,
     "Your role is a center of gravity, not a rigid script. Stay focused and use only available tools. Do adjacent analysis or work that your role permits when necessary for a correct result, and explain material deviations.",
-    ROLE_CONFIG[role].prompt,
+    rolePrompt,
     "First test the assignment against its stated goal and repository evidence. If it is contradictory, unsafe, wrongly scoped, or based on a false premise, do not blindly execute it: explain why with evidence and propose a better bounded assignment. Complete a clearly safe portion only when it will not hide the blocker.",
     "Do not ask the user questions; you cannot interact. Resolve minor reversible ambiguity with the safest reasonable assumption and state it. For consequential ambiguity or a product or architecture decision, stop and return the blocker, evidence, options, and your recommendation to the parent agent.",
     "Follow repository instructions and preserve unrelated work. Use web tools only when repository evidence is insufficient. Follow Ponytail: understand first, then use the smallest solution that works.",
@@ -338,7 +270,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
     name: "delegate",
     label: "Delegate",
     description:
-      "Run one bounded repository task in an isolated non-interactive Pi subprocess. Roles are centers of gravity: scout, implement, review, chore. Supports provider/model/thinking overrides and optional timeout, turn, and best-effort cost limits. Limit events preserve completed filesystem changes and return partial progress for reassignment.",
+      "Run one bounded repository task in an isolated non-interactive Pi subprocess. Roles are centers of gravity: scout, implement, review, chore. Supports provider/model/thinking overrides, a hard timeout, and soft turn/cost limits that are reported rather than enforced. Stopped runs preserve completed filesystem changes and return partial progress for reassignment.",
     promptSnippet:
       "Delegate context-dense, bounded work to cheaper isolated Pi agents; orchestrate flexibly and avoid ritual loops",
     promptGuidelines: [
@@ -367,7 +299,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
 
       const tools = fetchContentPresent ? config.tools : config.tools.filter((t) => !WEB_TOOLS.includes(t));
       const thinking = params.thinking ?? config.thinking;
-      const savedSetting = parseRoleSetting((await loadDelegateConfig())[roleConfigKey(role)]);
+      const rolePrompt = await loadRolePrompt(role);
+      if (!params.provider || !params.model) {
+        throw new Error("provider and model are required: specify them explicitly (model routing lives in AGENTS.md)");
+      }
       const args = [
         "--mode",
         "json",
@@ -384,24 +319,9 @@ export default function delegateExtension(pi: ExtensionAPI) {
       if (fetchContentPresent) args.push("--extension", FETCH_CONTENT_EXTENSION);
       if (ponytailPresent) args.push("--extension", PONYTAIL_EXTENSION);
 
-      // Saved model names are provider-specific: never pair an explicit provider
-      // with a saved role model. Explicit model wins; saved model applies only
-      // when neither explicit model nor provider is given; defaults fill the rest.
-      let effectiveProvider = params.provider;
-      let effectiveModel = params.model;
-      if (!params.provider && !params.model) {
-        if (savedSetting) {
-          effectiveProvider = savedSetting.provider;
-          effectiveModel = savedSetting.model;
-        }
-      }
-      if (!effectiveProvider && !effectiveModel) {
-        effectiveProvider = DEFAULT_PROVIDER;
-        effectiveModel = DEFAULT_MODEL;
-      }
-      if (effectiveProvider) args.push("--provider", effectiveProvider);
-      if (effectiveModel) args.push("--model", effectiveModel);
-      args.push("--append-system-prompt", buildPrompt(role), params.task);
+      args.push("--provider", params.provider);
+      args.push("--model", params.model);
+      args.push("--append-system-prompt", buildPrompt(role, rolePrompt), params.task);
 
       const usage = emptyUsage();
       const changedFiles = new Set<string>();
@@ -427,6 +347,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
       let sawCompleted = false;
       let status: Status = "running";
       let exitCode: number | null = null;
+      let closed = false;
+      let spawnSettleTimer: NodeJS.Timeout | undefined;
+      const softLimits: { turns?: boolean; cost?: boolean } = {};
+      let lastAssistantHadText = false;
 
       const totalRetries = () => continueRetriesUsed + summaryRetriesUsed;
 
@@ -446,6 +370,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
         completedTools: [...completedTools],
         retries: totalRetries(),
         ...(stderr.trim() ? { stderr: stderr.trim() } : {}),
+        ...(Object.keys(softLimits).length ? { softLimitBreached: { ...softLimits } } : {}),
         ...(advisory ? { advisory } : {}),
       });
 
@@ -469,7 +394,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
       };
 
       const stop = (reason: Limit | "cancelled") => {
-        if (limit || cancelled) return;
+        if (closed || limit || cancelled) return;
         if (reason === "cancelled") cancelled = true;
         else limit = reason;
 
@@ -504,7 +429,9 @@ export default function delegateExtension(pi: ExtensionAPI) {
           sessionId = event.id;
         } else if (event.type === "message_end" && event.message?.role === "assistant") {
           addUsage(usage, event.message.usage);
-          latestText = getText(event.message) || latestText;
+          const assistantText = getText(event.message);
+          latestText = assistantText || latestText;
+          lastAssistantHadText = assistantText !== "";
           model = event.message.model ?? model;
           provider = event.message.provider ?? provider;
           lastStopReason = event.message.stopReason ?? lastStopReason;
@@ -512,15 +439,15 @@ export default function delegateExtension(pi: ExtensionAPI) {
             lastErrorMessage = event.message.errorMessage;
             stderr = appendTail(stderr, `${event.message.errorMessage}\n`);
           }
-          if (params.maxCostUsd && usage.cost.total >= params.maxCostUsd) stop("cost");
+          if (params.maxCostUsd && usage.cost.total >= params.maxCostUsd) softLimits.cost = true;
           scheduleUpdate();
         } else if (event.type === "message_end" && event.message?.role === "toolResult") {
           addUsage(usage, event.message.usage);
-          if (params.maxCostUsd && usage.cost.total >= params.maxCostUsd) stop("cost");
+          if (params.maxCostUsd && usage.cost.total >= params.maxCostUsd) softLimits.cost = true;
           scheduleUpdate();
         } else if (event.type === "turn_end") {
           turns += 1;
-          if (params.maxTurns && turns >= params.maxTurns && event.message?.stopReason === "toolUse") stop("turns");
+          if (params.maxTurns && turns >= params.maxTurns) softLimits.turns = true;
           flushUpdate();
         } else if (event.type === "tool_execution_start") {
           pendingTools.set(event.toolCallId, { name: event.toolName, args: event.args ?? {} });
@@ -593,8 +520,17 @@ export default function delegateExtension(pi: ExtensionAPI) {
           });
           proc.on("error", (error) => {
             spawnError = error;
+            // Some spawn failures never emit `close`; force-settle as failed.
+            proc?.kill();
+            spawnSettleTimer = setTimeout(() => done(-1), 5000);
+            spawnSettleTimer.unref();
           });
           proc.on("close", (code) => {
+            closed = true;
+            if (spawnSettleTimer) {
+              clearTimeout(spawnSettleTimer);
+              spawnSettleTimer = undefined;
+            }
             if (stdoutBuffer.trim()) processLine(stdoutBuffer);
             done(code);
           });
@@ -614,6 +550,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
         if (forceKillTimer) {
           clearTimeout(forceKillTimer);
           forceKillTimer = undefined;
+        }
+        if (spawnSettleTimer) {
+          clearTimeout(spawnSettleTimer);
+          spawnSettleTimer = undefined;
         }
         signal?.removeEventListener("abort", abort);
 
@@ -687,8 +627,16 @@ export default function delegateExtension(pi: ExtensionAPI) {
               : retries > 0
                 ? `Delegate completed. Delegate recovered after ${retries} resume-retry(ies).`
                 : "Delegate completed.";
+      const softBreaches = [softLimits.turns ? "turns" : "", softLimits.cost ? "cost" : ""].filter(Boolean);
+      const softNote = softBreaches.length
+        ? `Soft limit exceeded (${softBreaches.join(", ")}); run finished naturally.`
+        : "";
+      const staleTextNote =
+        status !== "completed" && latestText && !lastAssistantHadText
+          ? "(note: no final assistant text captured; shown text may be from an earlier message)"
+          : "";
       const output = await truncateOutput(
-        [prefix, latestText, status === "completed" ? "" : progress, advisory, stderr.trim() ? `stderr:\n${stderr.trim()}` : ""]
+        [prefix, latestText, staleTextNote, status === "completed" ? "" : progress, softNote, advisory, stderr.trim() ? `stderr:\n${stderr.trim()}` : ""]
           .filter(Boolean)
           .join("\n\n"),
       );
@@ -782,76 +730,6 @@ export default function delegateExtension(pi: ExtensionAPI) {
         container.addChild(new Text(theme.fg("error", `stderr:\n${details.stderr}`), 0, 0));
       }
       return container;
-    },
-  });
-
-  pi.registerCommand("delegate", {
-    description: "Edit persisted delegate model defaults (scout/chore, review, implement)",
-    handler: async (_args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify("/delegate requires interactive UI", "error");
-        return;
-      }
-
-      const roleGroups: { label: string; key: DelegateConfigKey }[] = [
-        { label: "Scout / Chore", key: "scoutChore" },
-        { label: "Review", key: "review" },
-        { label: "Implement", key: "implement" },
-      ];
-
-      const selectedRoleLabel = await ctx.ui.select(
-        "Select role group to configure",
-        roleGroups.map((g) => g.label),
-      );
-      if (!selectedRoleLabel) return;
-
-      const roleGroup = roleGroups.find((g) => g.label === selectedRoleLabel);
-      if (!roleGroup) return;
-
-      let availableModels: { provider: string; id: string }[];
-      try {
-        availableModels = (await ctx.modelRegistry.getAvailable()) ?? [];
-      } catch (err) {
-        ctx.ui.notify(`Failed to fetch available models: ${err instanceof Error ? err.message : String(err)}`, "error");
-        return;
-      }
-
-      if (!availableModels.length) {
-        ctx.ui.notify("No available models found", "warning");
-        return;
-      }
-
-      const chosen = await ctx.ui.custom<{ provider: string; model: string } | undefined>((tui, _theme, _kb, done) => {
-        const modelRuntimeAdapter = {
-          getAvailableSnapshot: () => availableModels,
-          getModel: (provider: string, id: string) => availableModels.find((m) => m.provider === provider && m.id === id),
-          getError: () => undefined,
-          refresh: async () => ({ models: availableModels, errors: new Map() }),
-        };
-        const settingsManagerAdapter = {
-          setDefaultModelAndProvider: () => { },
-        };
-        return new ModelSelectorComponent(
-          tui,
-          ctx.model as any,
-          settingsManagerAdapter as any,
-          modelRuntimeAdapter as any,
-          (ctx.scopedModels ?? []) as any,
-          (model) => done({ provider: model.provider, model: model.id }),
-          () => done(undefined),
-        );
-      });
-      if (!chosen) return;
-
-      const current = await loadDelegateConfig();
-      const next: DelegateConfig = { ...current, [roleGroup.key]: { provider: chosen.provider, model: chosen.model } };
-
-      try {
-        await saveDelegateConfig(next);
-        ctx.ui.notify(`Delegate default for ${roleGroup.label} saved → ${chosen.provider}/${chosen.model}`, "info");
-      } catch (err) {
-        ctx.ui.notify(`Failed to save delegate default: ${err instanceof Error ? err.message : String(err)}`, "error");
-      }
     },
   });
 }
