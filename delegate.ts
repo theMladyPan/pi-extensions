@@ -107,8 +107,8 @@ const DelegateParams = Type.Object({
     description: "Dominant role controlling available tools and guidance; workflows may skip or reorder roles",
   }),
   cwd: Type.Optional(Type.String({ description: "Child working directory; defaults to the current directory" })),
-  provider: Type.Optional(Type.String({ description: "Pi provider override (required together with model; routing per AGENTS.md)" })),
-  model: Type.Optional(Type.String({ description: "Pi model override (required together with provider; routing per AGENTS.md)" })),
+  provider: Type.Optional(Type.String({ description: "Pi provider override (required together with model; routing per delegate/orchestrator.md)" })),
+  model: Type.Optional(Type.String({ description: "Pi model override (required together with provider; routing per delegate/orchestrator.md)" })),
   thinking: Type.Optional(
     StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
       description: "Thinking override; otherwise uses the selected role default",
@@ -301,7 +301,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
       const thinking = params.thinking ?? config.thinking;
       const rolePrompt = await loadRolePrompt(role);
       if (!params.provider || !params.model) {
-        throw new Error("provider and model are required: specify them explicitly (model routing lives in AGENTS.md)");
+        throw new Error("provider and model are required: specify them explicitly (model routing lives in delegate/orchestrator.md)");
       }
       const args = [
         "--mode",

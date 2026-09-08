@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 
@@ -123,14 +124,27 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // Inject concise mode instructions and reset the per-request BOSS counter.
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     if (mode === "boss") {
       bossCount = 0;
       callIndex.clear();
       footer(ctx);
     }
     const prompt = event.systemPrompt;
-    const instruction = MODE_PROMPTS[mode];
+    let instruction = MODE_PROMPTS[mode];
+
+    if (mode === "boss") {
+      try {
+        const orchestratorPath = new URL("../delegate/orchestrator.md", import.meta.url);
+        const orchestratorPrompt = (await readFile(orchestratorPath, "utf8")).trim();
+        if (orchestratorPrompt) {
+          instruction = `${instruction}\n\n${orchestratorPrompt}`;
+        }
+      } catch (err) {
+        console.error("[mode-switch] failed to load orchestrator.md:", err);
+      }
+    }
+
     return { systemPrompt: `${prompt}\n\n${instruction}` };
   });
 
