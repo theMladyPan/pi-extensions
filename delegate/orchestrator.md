@@ -42,6 +42,8 @@ You are an orchestrator. A project manager. You are responsible for defining tas
 
 ### scoutTask pre-pass (use when delegating implement or review)
 - When delegating to `implement` or `review`, pass a `scoutTask` (pre-pass scout) alongside the main task. The scout runs as a separate read-only subprocess and its findings (exact file paths, caller sites, relevant snippets) are pasted directly into the subagent's task dossier.
+- `scoutTask` is repo-local only: pre-passes run with isolated tools and without external extensions (no web/fetch_content).
+- Set `timeoutSeconds` on the delegate call when using pre-passes so child runs remain bounded.
 - This prevents small-model discovery loops (grep/find wandering that burns turns) while keeping your own context completely clean of grep/ls clutter — you never see the raw scouting output.
 - Write the `scoutTask` as a concrete discovery question: which files, which call sites, which signatures the implementer/reviewer needs. Findings arrive as a "Pre-pass Scout Findings" section in the child's packet.
 

@@ -3,6 +3,7 @@ import { existsSync, statSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { isRetryableAssistantError, StringEnum } from "@earendil-works/pi-ai";
 import {
   DEFAULT_MAX_BYTES,
@@ -301,6 +302,8 @@ async function runPrePass(opts: {
     let stderr = "";
     let timer: NodeJS.Timeout | undefined;
     let settled = false;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
     const finish = (ok: boolean) => {
       if (settled) return;
       settled = true;
@@ -324,8 +327,8 @@ async function runPrePass(opts: {
       }, opts.timeoutSeconds * 1000);
       timer.unref();
     }
-    proc.stdout?.on("data", (chunk) => {
-      buffer += chunk.toString();
+    proc.stdout?.on("data", (chunk: Buffer | string) => {
+      buffer += typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk);
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) {
@@ -340,8 +343,9 @@ async function runPrePass(opts: {
         }
       }
     });
-    proc.stderr?.on("data", (chunk) => {
-      stderr = appendTail(stderr, chunk.toString());
+    proc.stderr?.on("data", (chunk: Buffer | string) => {
+      const decoded = typeof chunk === "string" ? chunk : stderrDecoder.write(chunk);
+      stderr = appendTail(stderr, decoded);
     });
     proc.on("error", () => finish(false));
     proc.on("close", (code) => finish(code === 0 && text.trim() !== ""));
@@ -403,6 +407,9 @@ export default function delegateExtension(pi: ExtensionAPI) {
       const rawCwd = params.cwd?.replace(/^@/, "") ?? ctx.cwd;
       const cwd = isAbsolute(rawCwd) ? resolve(rawCwd) : resolve(ctx.cwd, rawCwd);
       if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Delegate cwd is not a directory: ${cwd}`);
+      if (!params.provider || !params.model) {
+        throw new Error("provider and model are required: specify them explicitly (model routing lives in delegate/orchestrator.md)");
+      }
       const approve = ctx.isProjectTrusted() && (cwd.startsWith(`${resolve(ctx.cwd)}/`) || cwd === resolve(ctx.cwd));
 
       let mainTask = params.task;
@@ -441,6 +448,24 @@ export default function delegateExtension(pi: ExtensionAPI) {
         }
         const sections: string[] = [`## Primary Task & Context\n${params.task}`];
         const settled = await Promise.allSettled(prePasses.map((p) => p.run));
+        if (signal?.aborted) {
+          return {
+            content: [{ type: "text", text: "Delegate aborted before main task execution." }],
+            details: {
+              role,
+              task: mainTask,
+              cwd,
+              provider: params.provider,
+              model: params.model,
+              status: "cancelled",
+              turns: 0,
+              usage: emptyUsage(),
+              changedFiles: [],
+              completedTools: [],
+              durationMs: 0,
+            },
+          };
+        }
         for (let i = 0; i < prePasses.length; i++) {
           const { kind } = prePasses[i];
           const result = settled[i];
@@ -452,15 +477,12 @@ export default function delegateExtension(pi: ExtensionAPI) {
           const ok = result.status === "fulfilled" && result.value.ok;
           sections.push(ok ? `## ${title}\n${body}` : `## ${title}\n(pre-pass ${kind} failed; findings unavailable)\n\n${body}`);
         }
-        mainTask = sections.join("\n\n");
+        mainTask = await truncateOutput(sections.join("\n\n"));
       }
 
       const tools = fetchContentPresent ? config.tools : config.tools.filter((t) => !WEB_TOOLS.includes(t));
       const thinking = params.thinking ?? config.thinking;
       const rolePrompt = await loadRolePrompt(role);
-      if (!params.provider || !params.model) {
-        throw new Error("provider and model are required: specify them explicitly (model routing lives in delegate/orchestrator.md)");
-      }
       const args = [
         "--mode",
         "json",
@@ -667,14 +689,18 @@ export default function delegateExtension(pi: ExtensionAPI) {
             stdio: ["ignore", "pipe", "pipe"],
           });
 
-          proc.stdout?.on("data", (chunk) => {
-            stdoutBuffer += chunk.toString();
+          const stdoutDecoder = new StringDecoder("utf8");
+          const stderrDecoder = new StringDecoder("utf8");
+
+          proc.stdout?.on("data", (chunk: Buffer | string) => {
+            stdoutBuffer += typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk);
             const lines = stdoutBuffer.split("\n");
             stdoutBuffer = lines.pop() ?? "";
             for (const line of lines) processLine(line);
           });
-          proc.stderr?.on("data", (chunk) => {
-            stderr = appendTail(stderr, chunk.toString());
+          proc.stderr?.on("data", (chunk: Buffer | string) => {
+            const decoded = typeof chunk === "string" ? chunk : stderrDecoder.write(chunk);
+            stderr = appendTail(stderr, decoded);
           });
           proc.on("error", (error) => {
             spawnError = error;
