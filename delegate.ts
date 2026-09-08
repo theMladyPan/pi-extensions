@@ -26,7 +26,7 @@ const READ_TOOLS = ["read", "bash", "grep", "find", "ls", ...WEB_TOOLS];
 const WRITE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", ...WEB_TOOLS];
 const STDERR_LIMIT = 32 * 1024;
 
-type Role = "scout" | "implement" | "review" | "chore";
+type Role = "scout" | "implement" | "review" | "chore" | "architect";
 type Limit = "timeout";
 type Status = "running" | "completed" | "limited" | "cancelled" | "failed";
 
@@ -95,6 +95,10 @@ const ROLE_CONFIG: Record<Role, { tools: string[]; thinking: string }> = {
     tools: WRITE_TOOLS,
     thinking: "medium",
   },
+  architect: {
+    tools: ["read", "grep", "find", "ls"],
+    thinking: "high",
+  },
 };
 
 const DelegateParams = Type.Object({
@@ -103,7 +107,7 @@ const DelegateParams = Type.Object({
     description:
       "A self-contained task packet with the relevant goal, bounded scope or question, known context, acceptance criteria, constraints, checks, and desired output",
   }),
-  role: StringEnum(["scout", "implement", "review", "chore"] as const, {
+  role: StringEnum(["scout", "implement", "review", "chore", "architect"] as const, {
     description: "Dominant role controlling available tools and guidance; workflows may skip or reorder roles",
   }),
   cwd: Type.Optional(Type.String({ description: "Child working directory; defaults to the current directory" })),
@@ -123,6 +127,12 @@ const DelegateParams = Type.Object({
   maxCostUsd: Type.Optional(
     Type.Number({ exclusiveMinimum: 0, description: "Soft cost cap based on provider-reported usage; breach is reported, not enforced" }),
   ),
+  scoutTask: Type.Optional(Type.String({ description: "Optional pre-pass scout task. If provided, runs scout first (or in parallel with review) and feeds findings directly into the main task without returning them to parent context." })),
+  reviewTask: Type.Optional(Type.String({ description: "Optional pre-pass review task. If provided, runs review first (or in parallel with scout) and feeds findings directly into the main task without returning them to parent context." })),
+  scoutProvider: Type.Optional(Type.String({ description: "Provider override for pre-pass scout" })),
+  scoutModel: Type.Optional(Type.String({ description: "Model override for pre-pass scout" })),
+  reviewProvider: Type.Optional(Type.String({ description: "Provider override for pre-pass review" })),
+  reviewModel: Type.Optional(Type.String({ description: "Model override for pre-pass review" })),
 });
 
 function emptyUsage(): Usage {
@@ -241,6 +251,102 @@ function buildPrompt(role: Role, rolePrompt: string): string {
   ].join("\n");
 }
 
+interface PrePassResult {
+  ok: boolean;
+  output: string;
+}
+
+// ponytail: single-shot runner without the main runner's resume-retry; re-delegate manually if a pre-pass flakes.
+async function runPrePass(opts: {
+  role: Role;
+  task: string;
+  provider: string;
+  model: string;
+  cwd: string;
+  approve: boolean;
+  timeoutSeconds?: number;
+  signal?: AbortSignal;
+}): Promise<PrePassResult> {
+  const config = ROLE_CONFIG[opts.role];
+  // Pre-passes always run with --no-extensions, so web tools are never mountable; strip them unconditionally.
+  const tools = config.tools.filter((t) => !WEB_TOOLS.includes(t));
+  const args = [
+    "--mode",
+    "json",
+    "-p",
+    "--no-extensions",
+    "--tools",
+    tools.join(","),
+    "--thinking",
+    config.thinking,
+    opts.approve ? "--approve" : "--no-approve",
+    "--provider",
+    opts.provider,
+    "--model",
+    opts.model,
+    "--append-system-prompt",
+    buildPrompt(opts.role, await loadRolePrompt(opts.role)),
+    opts.task,
+  ];
+  const invocation = getPiInvocation(args);
+  return new Promise<PrePassResult>((resolve) => {
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd: opts.cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let buffer = "";
+    let text = "";
+    let stderr = "";
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      const output = ok
+        ? text.trim()
+        : [text.trim(), stderr.trim() ? `stderr:\n${stderr.trim()}` : ""].filter(Boolean).join("\n\n") || `pre-pass ${opts.role} produced no output`;
+      resolve({ ok, output });
+    };
+    const onAbort = () => {
+      proc.kill("SIGKILL");
+      finish(false);
+    };
+    if (opts.signal?.aborted) return onAbort();
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.timeoutSeconds) {
+      timer = setTimeout(() => {
+        proc.kill("SIGKILL");
+        finish(false);
+      }, opts.timeoutSeconds * 1000);
+      timer.unref();
+    }
+    proc.stdout?.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "message_end" && event.message?.role === "assistant") {
+            const assistantText = getText(event.message);
+            if (assistantText) text = assistantText;
+          }
+        } catch {
+          // ignore non-JSON lines
+        }
+      }
+    });
+    proc.stderr?.on("data", (chunk) => {
+      stderr = appendTail(stderr, chunk.toString());
+    });
+    proc.on("error", () => finish(false));
+    proc.on("close", (code) => finish(code === 0 && text.trim() !== ""));
+  });
+}
+
 export function decideRetry(opts: {
   status: "completed" | "failed" | "limited" | "cancelled";
   limit?: string;
@@ -270,7 +376,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
     name: "delegate",
     label: "Delegate",
     description:
-      "Run one bounded repository task in an isolated non-interactive Pi subprocess. Roles are centers of gravity: scout, implement, review, chore. Supports provider/model/thinking overrides, a hard timeout, and soft turn/cost limits that are reported rather than enforced. Stopped runs preserve completed filesystem changes and return partial progress for reassignment.",
+      "Run one bounded repository task in an isolated non-interactive Pi subprocess. Roles are centers of gravity: scout, implement, review, chore, architect. Supports provider/model/thinking overrides, a hard timeout, and soft turn/cost limits that are reported rather than enforced. Stopped runs preserve completed filesystem changes and return partial progress for reassignment. Optional scoutTask/reviewTask pre-passes run read-only scout/review subprocesses in parallel and fold their findings into the main agent's task packet without returning them to parent context.",
     promptSnippet:
       "Delegate context-dense, bounded work to cheaper isolated Pi agents; orchestrate flexibly and avoid ritual loops",
     promptGuidelines: [
@@ -296,6 +402,57 @@ export default function delegateExtension(pi: ExtensionAPI) {
       const rawCwd = params.cwd?.replace(/^@/, "") ?? ctx.cwd;
       const cwd = isAbsolute(rawCwd) ? resolve(rawCwd) : resolve(ctx.cwd, rawCwd);
       if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Delegate cwd is not a directory: ${cwd}`);
+      const approve = ctx.isProjectTrusted() && (cwd.startsWith(`${resolve(ctx.cwd)}/`) || cwd === resolve(ctx.cwd));
+
+      let mainTask = params.task;
+      if (params.scoutTask || params.reviewTask) {
+        // allSettled: if one pre-pass rejects during setup (e.g. role file loading), the other child still gets awaited, not orphaned.
+        const prePasses: { kind: string; run: Promise<PrePassResult> }[] = [];
+        if (params.scoutTask) {
+          prePasses.push({
+            kind: "scout",
+            run: runPrePass({
+              role: "scout",
+              task: params.scoutTask,
+              provider: params.scoutProvider ?? "swan",
+              model: params.scoutModel ?? "deepseek-ai/DeepSeek-V4-Flash-0731",
+              cwd,
+              approve,
+              timeoutSeconds: params.timeoutSeconds,
+              signal,
+            }),
+          });
+        }
+        if (params.reviewTask) {
+          prePasses.push({
+            kind: "review",
+            run: runPrePass({
+              role: "review",
+              task: params.reviewTask,
+              provider: params.reviewProvider ?? "swan",
+              model: params.reviewModel ?? "Qwen/Qwen3.8-27B-FP8",
+              cwd,
+              approve,
+              timeoutSeconds: params.timeoutSeconds,
+              signal,
+            }),
+          });
+        }
+        const sections: string[] = [`## Primary Task & Context\n${params.task}`];
+        const settled = await Promise.allSettled(prePasses.map((p) => p.run));
+        for (let i = 0; i < prePasses.length; i++) {
+          const { kind } = prePasses[i];
+          const result = settled[i];
+          const title = kind === "scout" ? "Pre-pass Scout Findings" : "Pre-pass Review Audit";
+          const body =
+            result.status === "fulfilled"
+              ? await truncateOutput(result.value.output)
+              : `pre-pass ${kind} failed during setup: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`;
+          const ok = result.status === "fulfilled" && result.value.ok;
+          sections.push(ok ? `## ${title}\n${body}` : `## ${title}\n(pre-pass ${kind} failed; findings unavailable)\n\n${body}`);
+        }
+        mainTask = sections.join("\n\n");
+      }
 
       const tools = fetchContentPresent ? config.tools : config.tools.filter((t) => !WEB_TOOLS.includes(t));
       const thinking = params.thinking ?? config.thinking;
@@ -312,7 +469,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
         tools.join(","),
         "--thinking",
         thinking,
-        ctx.isProjectTrusted() && (cwd.startsWith(`${resolve(ctx.cwd)}/`) || cwd === resolve(ctx.cwd))
+        approve
           ? "--approve"
           : "--no-approve",
       ];
@@ -321,7 +478,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
 
       args.push("--provider", params.provider);
       args.push("--model", params.model);
-      args.push("--append-system-prompt", buildPrompt(role, rolePrompt), params.task);
+      args.push("--append-system-prompt", buildPrompt(role, rolePrompt), mainTask);
 
       const usage = emptyUsage();
       const changedFiles = new Set<string>();
@@ -358,7 +515,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
         status: currentStatus,
         limit,
         role,
-        task: params.task,
+        task: mainTask,
         cwd,
         provider,
         model,
