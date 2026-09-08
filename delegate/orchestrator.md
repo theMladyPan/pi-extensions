@@ -68,7 +68,7 @@ The plan is the default path, not a contract. Plans are written without full kno
   - If execution reveals facts the Architect lacked, re-escalate with those facts rather than improvising a new design.
 
 ## Model selection policy
-Use role-based routing. Prefer free, local `swan/` models for high-volume, bounded work, but do not force local-first for orchestration, architecture, or high-risk review.
+Use role-based routing. Prefer free, local `swan/` models for high-volume, bounded subagent work, but do not force local-first for orchestration, architecture, or high-risk review.
 
 ### Scout and summarization
 - Primary: **`swan/deepseek-ai/DeepSeek-V4-Flash-0731`**. Use only for scouting, repository/document reading, and summarization; its 1M context is suited to large inputs.
@@ -92,7 +92,7 @@ Use role-based routing. Prefer free, local `swan/` models for high-volume, bound
 - Bound Gemini tightly: provide the exact file, failing test or finding, expected behavior, and acceptance check. Stop and reassign if it repeats tool calls without progress.
 
 ### Architect
-- Primary: **`gpt-5.6-sol`** for consequential architecture, decomposition, and trade-off analysis.
+- Primary: **`gpt-5.6-sol`** for consequential architecture, decomposition, and trade-off analysis. High precision on TerminalBench (88.8%) and Coding Agent Index (77.4) makes it ideal for surgical, high-stakes decisions.
 - Fallback: **`openrouter/z-ai/glm-5.3`**.
 - The orchestrator remains accountable for final architecture decisions; do not delegate them blindly.
 
@@ -101,8 +101,9 @@ Use role-based routing. Prefer free, local `swan/` models for high-volume, bound
 - Fallback: **`z-ai/glm-5.3-flash`**.
 
 ### Other model notes
-- **`fable-5`**: reserve for exceptional SOTA escalation only; high cost makes routine use uneconomical.
-- **`gpt-5.6-terra`**: advanced fallback, not automatically the budget choice; compare live input, output, and cache pricing with Sol.
+- **`fable-5`**: skip / deprecated for architecture and orchestration; Sol delivers comparable reasoning (AA Index ~60.9 vs 61) at 40% of the cost ($4/$20 vs $10/$50).
+- **`grok-4.6`**: primary orchestrator choice; high intelligence (AA 61), 
+- **`gpt-5.6-terra`**: advanced fallback for architect or high-risk review; compare live input, output, and cache pricing with Sol.
 - **`openrouter/z-ai/glm-5.3`**: strong security reviewer; may end abruptly and has no vision.
 - **`github-copilot/gemini-3.8-flash`**: strong coder and precise fixer, but prone to tool loops when the task is vague (can burn 50+ turns on grep/find); self-contained packets + maxTurns cap required (see Task packet & execution bounds).
 
