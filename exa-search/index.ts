@@ -104,16 +104,17 @@ async function searchExa(
 	});
 
 	if (!response.ok) {
-		let detail = "";
+		let detail = response.statusText;
 		try {
-			const errJson = await response.json();
-			detail = extractErrorMessage(errJson, response.statusText);
-		} catch {
+			const raw = (await response.text()).trim();
+			if (!raw) throw new Error();
 			try {
-				detail = (await response.text()).trim();
+				detail = extractErrorMessage(JSON.parse(raw), detail);
 			} catch {
-				detail = response.statusText;
+				detail = raw;
 			}
+		} catch {
+			// keep statusText
 		}
 		throw new Error(`Exa search failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}
@@ -229,16 +230,17 @@ ${evidenceText}`;
 	});
 
 	if (!response.ok) {
-		let detail = "";
+		let detail = response.statusText;
 		try {
-			const errJson = await response.json();
-			detail = extractErrorMessage(errJson, response.statusText);
-		} catch {
+			const raw = (await response.text()).trim();
+			if (!raw) throw new Error();
 			try {
-				detail = (await response.text()).trim();
+				detail = extractErrorMessage(JSON.parse(raw), detail);
 			} catch {
-				detail = response.statusText;
+				detail = raw;
 			}
+		} catch {
+			// keep statusText
 		}
 		throw new Error(`Gemini synthesis failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}

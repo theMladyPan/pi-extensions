@@ -20,6 +20,9 @@ const FetchContentParameters = Type.Object({
 			Type.String({
 				description: "One or more http:// or https:// URLs to fetch in parallel.",
 			}),
+			{
+				maxItems: 10,
+			},
 		),
 	),
 	mode: Type.Optional(
@@ -112,9 +115,26 @@ async function fetchAndClean(rawUrl: string, parentSignal?: AbortSignal): Promis
 			signal: controller.signal,
 		});
 	} catch (err) {
+		clearTimeout(timeout);
 		throw new Error(`Fetch failed for ${rawUrl}: ${extractErrorMessage(err, "network error")}`);
+	}
+
+	// Keep the timeout armed until the full body is read, not just the headers.
+	const contentType = response.headers.get("content-type") ?? "";
+	let body: string;
+	try {
+		body = await response.text();
 	} finally {
 		clearTimeout(timeout);
+	}
+
+	// Reject non-text payloads (images, PDFs, etc.) — binary would become garbage.
+	if (
+		contentType &&
+		!/^text\//i.test(contentType) &&
+		!/(json|xml|x?html|javascript|csv)/i.test(contentType)
+	) {
+		throw new Error(`Unsupported content type for ${rawUrl}: ${contentType}`);
 	}
 
 	if (!response.ok) {
@@ -133,9 +153,6 @@ async function fetchAndClean(rawUrl: string, parentSignal?: AbortSignal): Promis
 		}
 		throw new Error(`Fetch failed for ${rawUrl} (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}
-
-	const contentType = response.headers.get("content-type") ?? "";
-	const body = await response.text();
 
 	// Non-HTML payloads are returned as-is (truncated), no tag stripping needed.
 	if (!/text\/html|application\/xhtml/i.test(contentType)) {

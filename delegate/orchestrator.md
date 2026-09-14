@@ -72,7 +72,7 @@ Use role-based routing. Prefer free, local `swan/` models for high-volume, bound
 
 ### Scout and summarization
 - Primary: **`swan/deepseek-ai/DeepSeek-V4-Flash-0731`**. Use only for scouting, repository/document reading, and summarization; its 1M context is suited to large inputs.
-- Fallback: **`openrouter/deepseek/deepseek-v4-flash-0731`** if `swan` is unavailable.
+- Fallback: **`openrouter/inception/mercury-2.5`** (super-fast ~1000 tps dLLM fallback for reading/scouting) or **`openrouter/deepseek/deepseek-v4-flash-0731`** if swan is unavailable.
 - Vision fallback: **`google/gemini-3.5-flash-lite`** for images, PDFs, and other multimodal input.
 
 ### Implement
@@ -98,7 +98,7 @@ Use role-based routing. Prefer free, local `swan/` models for high-volume, bound
 
 ### Chore and tests
 - Primary: **`swan/Qwen/Qwen3.8-27B-FP8`**.
-- Fallback: **`z-ai/glm-5.3-flash`**.
+- Fallback: **`openrouter/inception/mercury-2.5`** or **`z-ai/glm-5.3-flash`**.
 
 ### Other model notes
 - **`fable-5`**: skip / deprecated for architecture and orchestration; Sol delivers comparable reasoning (AA Index ~60.9 vs 61) at 40% of the cost ($4/$20 vs $10/$50).
