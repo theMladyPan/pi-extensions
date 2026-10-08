@@ -42,7 +42,14 @@ Run the relevant test before publishing:
 ```bash
 (cd browser-screenshot && uv run test_runner.py)
 node --experimental-strip-types --test next-steps/queue.test.ts
+(cd mdrender && node test/test_runner.mjs)
 pi --list-models >/dev/null
+```
+
+`mdrender` needs its own dependencies on a fresh clone:
+
+```bash
+(cd mdrender && npm install)
 ```
 
 ## Notes for Pi agents

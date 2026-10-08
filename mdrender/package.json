@@ -1,0 +1,23 @@
+{
+  "name": "pi-mdrender",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Markdown to HTML/PDF rendering tool for Pi (offline: bundled mermaid, katex, shiki, system Chrome).",
+  "scripts": {
+    "test": "node test/test_runner.mjs"
+  },
+  "dependencies": {
+    "katex": "^0.16.11",
+    "markdown-it": "^14.1.0",
+    "markdown-it-deflist": "^3.0.0",
+    "markdown-it-footnote": "^4.0.0",
+    "markdown-it-mark": "^4.0.0",
+    "markdown-it-sub": "^2.0.0",
+    "markdown-it-sup": "^2.0.0",
+    "markdown-it-task-lists": "^2.1.1",
+    "mermaid": "^11.4.1",
+    "puppeteer-core": "^24.1.1",
+    "shiki": "^1.29.2"
+  }
+}
