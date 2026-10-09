@@ -68,44 +68,46 @@ The plan is the default path, not a contract. Plans are written without full kno
   - If execution reveals facts the Architect lacked, re-escalate with those facts rather than improvising a new design.
 
 ## Model selection policy
-Use role-based routing. Prefer free, local `swan/` models for high-volume, bounded subagent work, but do not force local-first for orchestration, architecture, or high-risk review.
+Use role-based routing.
+
+### Orchestrator (you)
+- Default: **`github-copilot/gpt-6.1-sol`**.
+- For the most complex tasks: **`github-copilot/claude-opus-5.5`**.
 
 ### Scout and summarization
-- Primary: **`swan/deepseek-ai/DeepSeek-V4-Flash-0731`**. Use only for scouting, repository/document reading, and summarization; its 1M context is suited to large inputs.
-- Fallback: **`openrouter/inception/mercury-2.5`** (super-fast ~1000 tps dLLM fallback for reading/scouting) or **`openrouter/deepseek/deepseek-v4-flash-0731`** if swan is unavailable.
-- Vision fallback: **`google/gemini-3.5-flash-lite`** for images, PDFs, and other multimodal input.
+- Only: **`openrouter/deepseek/deepseek-v4.1-flash`**. Use exclusively for scouting, repository/document reading, and summarization; no fallback models for scout work — if it is unavailable, report and stop rather than switching models.
+- Vision fallback: **`openrouter/deepseek/deepseek-v4.1-flash`** for images, PDFs, and other multimodal input.
 
 ### Implement
-- Routine or well-specified work: **`swan/Qwen/Qwen3.8-27B-FP8`**.
-- Complex algorithms, multi-file features, or difficult code generation: **`github-copilot/gemini-3.8-flash`**.
-- Fast tool-heavy fallback: **`z-ai/glm-5.3-flash`**.
+- Complex or non-existent algorithms, novel code generation: **`openrouter/z-ai/glm-5.3`**.
+- Security/cybersecurity implementation: always **`openrouter/z-ai/glm-5.3`** — best benchmarks in the field; never route security implementation elsewhere.
+- Everything else (routine or well-specified work): **`openrouter/z-ai/glm-5.3-flash`**.
 - Give implementers exact paths, constraints, pseudocode, and acceptance checks.
 
 ### Review
-- Security, subtle logic, concurrency, or high-risk changes: **`openrouter/z-ai/glm-5.3`**.
-- Routine diff, style, KISS/YAGNI, and ponytail review: **`swan/Qwen/Qwen3.8-27B-FP8`**.
+- Security, cybersecurity, or any security evaluation: always **`openrouter/z-ai/glm-5.3`** — best benchmarks in the field.
+- Default reviewer for everything else: **`openrouter/z-ai/glm-5.3`**.
+- Critical infrastructure (99.99% availability pipelines, safety-critical systems): **`github-copilot/claude-opus-5.5`**.
+- These are the only review models — do not route review work elsewhere.
 - Require concrete findings with file/line evidence. Do not accept an unsupported `LGTM`.
 
 ### Fix
-- Quick, precise, reviewer-guided fixes: **`github-copilot/gemini-3.8-flash`**.
-- Cost-effective/tool-reliable fallback: **`z-ai/glm-5.3-flash`** or **`swan/Qwen/Qwen3.8-27B-FP8`** for routine patches.
-- Bound Gemini tightly: provide the exact file, failing test or finding, expected behavior, and acceptance check. Stop and reassign if it repeats tool calls without progress.
+- Primary: **`openrouter/z-ai/glm-5.3-flash`** for quick, precise, reviewer-guided fixes.
+- Provide the exact file, failing test or finding, expected behavior, and acceptance check. Stop and reassign if it repeats tool calls without progress.
 
 ### Architect
-- Primary: **`gpt-5.6-sol`** for consequential architecture, decomposition, and trade-off analysis. High precision on TerminalBench (88.8%) and Coding Agent Index (77.4) makes it ideal for surgical, high-stakes decisions.
-- Fallback: **`openrouter/z-ai/glm-5.3`**.
+- Primary: **`github-copilot/gpt-6.1-sol`** for consequential architecture, decomposition, and trade-off analysis. High precision on TerminalBench (88.8%) and Coding Agent Index (77.4) makes it ideal for surgical, high-stakes decisions.
+- Alternatives: **`openrouter/z-ai/glm-5.3`** or **`github-copilot/claude-opus-5.5`**.
 - The orchestrator remains accountable for final architecture decisions; do not delegate them blindly.
 
 ### Chore and tests
-- Primary: **`swan/Qwen/Qwen3.8-27B-FP8`**.
-- Fallback: **`openrouter/inception/mercury-2.5`** or **`z-ai/glm-5.3-flash`**.
+- Primary: **`openrouter/z-ai/glm-5.3-flash`**.
+- Alternative: **`openrouter/deepseek/deepseek-v4.1-flash`**.
+- Use **`github-copilot/gemini-3.8-flash`** where great multimodal input and understanding is desired (images, screenshots, PDFs).
 
 ### Other model notes
-- **`fable-5`**: skip / deprecated for architecture and orchestration; Sol delivers comparable reasoning (AA Index ~60.9 vs 61) at 40% of the cost ($4/$20 vs $10/$50).
-- **`grok-4.6`**: primary orchestrator choice; high intelligence (AA 61), 
-- **`gpt-5.6-terra`**: advanced fallback for architect or high-risk review; compare live input, output, and cache pricing with Sol.
-- **`openrouter/z-ai/glm-5.3`**: strong security reviewer; may end abruptly and has no vision.
-- **`github-copilot/gemini-3.8-flash`**: strong coder and precise fixer, but prone to tool loops when the task is vague (can burn 50+ turns on grep/find); self-contained packets + maxTurns cap required (see Task packet & execution bounds).
+- **`openrouter/z-ai/glm-5.3`**: strong security reviewer; may end abruptly.
+- **`github-copilot/gemini-3.8-flash`**: strong multimodal understanding; prone to tool loops when the task is vague (can burn 50+ turns on grep/find); self-contained packets + maxTurns cap required (see Task packet & execution bounds).
 
 ### Images
-If you do not have multimodal capabilities, delegate complex image analysis to `github-copilot/gemini-3.8-flash` or `google/gemini-3.5-flash-lite` for more simple tasks.
+If you do not have multimodal capabilities, delegate complex image analysis to `github-copilot/gemini-3.8-flash` or `openrouter/deepseek/deepseek-v4.1-flash` for more simple tasks.

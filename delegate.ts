@@ -422,8 +422,8 @@ export default function delegateExtension(pi: ExtensionAPI) {
             run: runPrePass({
               role: "scout",
               task: params.scoutTask,
-              provider: params.scoutProvider ?? "swan",
-              model: params.scoutModel ?? "deepseek-ai/DeepSeek-V4-Flash-0731",
+              provider: params.scoutProvider ?? "openrouter",
+              model: params.scoutModel ?? "deepseek/deepseek-v4.1-flash",
               cwd,
               approve,
               timeoutSeconds: params.timeoutSeconds,
@@ -437,8 +437,8 @@ export default function delegateExtension(pi: ExtensionAPI) {
             run: runPrePass({
               role: "review",
               task: params.reviewTask,
-              provider: params.reviewProvider ?? "swan",
-              model: params.reviewModel ?? "Qwen/Qwen3.8-27B-FP8",
+              provider: params.reviewProvider ?? "openrouter",
+              model: params.reviewModel ?? "z-ai/glm-5.3",
               cwd,
               approve,
               timeoutSeconds: params.timeoutSeconds,

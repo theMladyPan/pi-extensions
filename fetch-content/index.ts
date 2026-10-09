@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const GEMINI_GENERATE_URL =
-	"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
+const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash";
 
 const FETCH_TIMEOUT_MS = 30_000;
 const BROWSER_USER_AGENT =
@@ -74,7 +74,7 @@ function isValidHttpUrl(raw: string): boolean {
 
 // Strip noise tags and decode HTML entities into a plain text-ish blob.
 // ponytail: regex-based HTML scrubbing is lossy but good enough to cut tokens
-// before Gemini re-cleans it; upgrade to a DOM parser if structure matters.
+// before the LLM re-cleans it; upgrade to a DOM parser if structure matters.
 function cleanHtml(html: string): string {
 	const stripped = html
 		.replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -163,7 +163,7 @@ async function fetchAndClean(rawUrl: string, parentSignal?: AbortSignal): Promis
 	return cleanHtml(body);
 }
 
-async function processWithGemini(
+async function processWithDeepseek(
 	text: string,
 	mode: "summary" | "verbatim",
 	prompt: string,
@@ -186,15 +186,16 @@ ${
 Raw scraped content:
 ${text}`;
 
-	const response = await fetch(GEMINI_GENERATE_URL, {
+	const response = await fetch(OPENROUTER_CHAT_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			"x-goog-api-key": apiKey,
+			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify({
-			contents: [{ role: "user", parts: [{ text: instructions }] }],
-			generationConfig: { temperature: 0.2 },
+			model: OPENROUTER_MODEL,
+			messages: [{ role: "user", content: instructions }],
+			temperature: 0.2,
 		}),
 		signal,
 	});
@@ -213,23 +214,21 @@ ${text}`;
 		} catch {
 			// keep statusText
 		}
-		throw new Error(`Gemini processing failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
+		throw new Error(`DeepSeek processing failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}
 
 	let data: unknown;
 	try {
 		data = await response.json();
 	} catch {
-		throw new Error("Malformed JSON response from Gemini API");
+		throw new Error("Malformed JSON response from OpenRouter API");
 	}
 
-	const candidateText = (data as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> })
-		?.candidates?.[0]?.content?.parts?.map((part) => (typeof part?.text === "string" ? part.text : ""))
-		.join("")
-		.trim();
+	const candidateText = (data as { choices?: Array<{ message?: { content?: string } }> })
+		?.choices?.[0]?.message?.content?.trim();
 
 	if (!candidateText) {
-		throw new Error("Gemini returned empty content");
+		throw new Error("DeepSeek returned empty content");
 	}
 
 	return candidateText;
@@ -250,10 +249,10 @@ export default function (pi: ExtensionAPI) {
 		name: "fetch_content",
 		label: "Fetch Content",
 		description:
-			"Fetch one or more http(s) URLs and extract clean, structured content via Gemini gemini-3.5-flash-lite. Use summary mode for concise extraction or verbatim mode for full substantive content.",
+			"Fetch one or more http(s) URLs and extract clean, structured content via DeepSeek deepseek-v4.1-flash. Use summary mode for concise extraction or verbatim mode for full substantive content.",
 		parameters: FetchContentParameters,
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const geminiKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY)?.trim();
+			const openrouterKey = process.env.OPENROUTER_API_KEY?.trim();
 
 			const mode: "summary" | "verbatim" =
 				params.mode === "verbatim" ? "verbatim" : "summary";
@@ -330,19 +329,19 @@ export default function (pi: ExtensionAPI) {
 			const results: FetchResult[] = [];
 			const processFailures: Array<{ url: string; error: string }> = [];
 
-			if (!geminiKey) {
+			if (!openrouterKey) {
 				for (const item of cleaned) {
 					results.push({
 						url: item.url,
-						content: `${item.cleaned}\n\n> Note: GEMINI_API_KEY (or GOOGLE_API_KEY) not set; returning locally cleaned text without Gemini processing.`,
+						content: `${item.cleaned}\n\n> Note: OPENROUTER_API_KEY not set; returning locally cleaned text without LLM processing.`,
 					});
 				}
 			} else {
-				onUpdate?.({ content: [{ type: "text", text: "Processing with Gemini..." }] });
+				onUpdate?.({ content: [{ type: "text", text: "Processing with DeepSeek..." }] });
 
 				const processSettled = await Promise.allSettled(
 					cleaned.map((item) =>
-						processWithGemini(item.cleaned, mode, prompt, geminiKey, signal).then(
+						processWithDeepseek(item.cleaned, mode, prompt, openrouterKey, signal).then(
 							(content): FetchResult => ({ url: item.url, content }),
 						),
 					),
@@ -389,7 +388,7 @@ export default function (pi: ExtensionAPI) {
 					fetchedCount: results.length,
 					failedCount: failures.length,
 					invalidUrls,
-					geminiUsed: Boolean(geminiKey),
+					llmUsed: Boolean(openrouterKey),
 				},
 			};
 		},

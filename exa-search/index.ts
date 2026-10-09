@@ -2,8 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const EXA_SEARCH_URL = "https://api.exa.ai/search";
-const GEMINI_GENERATE_URL =
-	"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
+const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash";
 
 const MAX_HIGHLIGHT_LENGTH = 500;
 const MAX_TOTAL_EVIDENCE_LENGTH = 12000;
@@ -169,10 +169,10 @@ async function searchExa(
 	return items;
 }
 
-async function synthesizeWithGemini(
+async function synthesizeWithDeepseek(
 	question: string,
 	evidence: NormalizedEvidence[],
-	geminiApiKey: string,
+	apiKey: string,
 	signal?: AbortSignal,
 ): Promise<string> {
 	let evidenceText = "";
@@ -209,22 +209,16 @@ ${question}
 Evidence:
 ${evidenceText}`;
 
-	const response = await fetch(GEMINI_GENERATE_URL, {
+	const response = await fetch(OPENROUTER_CHAT_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			"x-goog-api-key": geminiApiKey,
+			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify({
-			contents: [
-				{
-					role: "user",
-					parts: [{ text: prompt }],
-				},
-			],
-			generationConfig: {
-				temperature: 0.2,
-			},
+			model: OPENROUTER_MODEL,
+			messages: [{ role: "user", content: prompt }],
+			temperature: 0.2,
 		}),
 		signal,
 	});
@@ -242,25 +236,21 @@ ${evidenceText}`;
 		} catch {
 			// keep statusText
 		}
-		throw new Error(`Gemini synthesis failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
+		throw new Error(`DeepSeek synthesis failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}
 
 	let data: unknown;
 	try {
 		data = await response.json();
 	} catch {
-		throw new Error("Malformed JSON response from Gemini API");
+		throw new Error("Malformed JSON response from OpenRouter API");
 	}
 
-	const candidates = (data as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> })
-		?.candidates;
-	const candidateText = candidates?.[0]?.content?.parts
-		?.map((part) => (typeof part?.text === "string" ? part.text : ""))
-		.join("")
-		.trim();
+	const choices = (data as { choices?: Array<{ message?: { content?: string } }> })?.choices;
+	const candidateText = choices?.[0]?.message?.content?.trim();
 
 	if (!candidateText) {
-		throw new Error("Gemini returned empty synthesis text");
+		throw new Error("DeepSeek returned empty synthesis text");
 	}
 
 	return candidateText;
@@ -271,11 +261,11 @@ export default function (pi: ExtensionAPI) {
 		name: "exa_search",
 		label: "Exa Search",
 		description:
-			"Search the web using Exa's neural/auto search across multiple ranked query angles and synthesize a direct answer with Gemini gemini-3.5-flash-lite. Always provide 1-5 varied query angles in queries for comprehensive coverage.",
+			"Search the web using Exa's neural/auto search across multiple ranked query angles and synthesize a direct answer with DeepSeek deepseek-v4.1-flash. Always provide 1-5 varied query angles in queries for comprehensive coverage.",
 		parameters: ExaSearchParameters,
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const exaKey = process.env.EXA_API_KEY?.trim();
-			const geminiKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY)?.trim();
+			const openrouterKey = process.env.OPENROUTER_API_KEY?.trim();
 
 			if (!exaKey) {
 				return {
@@ -289,15 +279,15 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (!geminiKey) {
+			if (!openrouterKey) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: "Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable. Please set GEMINI_API_KEY to use exa_search.",
+							text: "Missing OPENROUTER_API_KEY environment variable. Please set OPENROUTER_API_KEY to use exa_search.",
 						},
 					],
-					details: { error: "MISSING_GEMINI_API_KEY" },
+					details: { error: "MISSING_OPENROUTER_API_KEY" },
 				};
 			}
 
@@ -389,7 +379,7 @@ export default function (pi: ExtensionAPI) {
 				],
 			});
 
-			const summary = await synthesizeWithGemini(targetQuestion, dedupedSources, geminiKey, signal);
+			const summary = await synthesizeWithDeepseek(targetQuestion, dedupedSources, openrouterKey, signal);
 
 			const sourcesList = dedupedSources.map((s) => `- ${s.title}: ${s.url}`).join("\n");
 			const finalOutput = `${summary}\n\nSources:\n${sourcesList}`;
