@@ -8,6 +8,7 @@ Prerequisites: `git`, Pi, and GitHub SSH access to this repository.
 
 ```bash
 git clone git@github.com:theMladyPan/pi-extensions.git "$HOME/.pi/agent/extensions"
+cd "$HOME/.pi/agent/extensions" && npm install   # root deps (e.g. `ignore`)
 ```
 
 If that directory already exists, do **not** clone over it. Inspect it first:
@@ -45,6 +46,10 @@ node --experimental-strip-types --test next-steps/queue.test.ts
 (cd mdrender && node test/test_runner.mjs)
 pi --list-models >/dev/null
 ```
+
+Note: `pi --list-models` does not load extensions. To verify extension
+loading without an LLM call, run `pi --mode rpc </dev/null` and check that
+it exits cleanly with no stderr output.
 
 `mdrender` needs its own dependencies on a fresh clone:
 

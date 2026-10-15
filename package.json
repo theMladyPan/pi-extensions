@@ -1,0 +1,8 @@
+{
+  "name": "pi-extensions",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ignore": "^7.0.8"
+  }
+}
