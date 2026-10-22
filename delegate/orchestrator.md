@@ -75,8 +75,8 @@ Use role-based routing.
 - For the most complex tasks: **`github-copilot/claude-opus-5.5`**.
 
 ### Scout and summarization
-- Only: **`openrouter/deepseek/deepseek-v4.1-flash`**. Use exclusively for scouting, repository/document reading, and summarization; no fallback models for scout work — if it is unavailable, report and stop rather than switching models.
-- Vision fallback: **`openrouter/deepseek/deepseek-v4.1-flash`** for images, PDFs, and other multimodal input.
+- Only: **`openrouter/deepseek/deepseek-v4.1-flash-1017`**. Use exclusively for scouting, repository/document reading, and summarization; no fallback models for scout work — if it is unavailable, report and stop rather than switching models.
+- Vision fallback: **`openrouter/deepseek/deepseek-v4.1-flash-1017`** for images, PDFs, and other multimodal input.
 
 ### Implement
 - Complex or non-existent algorithms, novel code generation: **`openrouter/z-ai/glm-5.3`**.
@@ -102,7 +102,7 @@ Use role-based routing.
 
 ### Chore and tests
 - Primary: **`openrouter/z-ai/glm-5.3-flash`**.
-- Alternative: **`openrouter/deepseek/deepseek-v4.1-flash`**.
+- Alternative: **`openrouter/deepseek/deepseek-v4.1-flash-1017`**.
 - Use **`github-copilot/gemini-3.8-flash`** where great multimodal input and understanding is desired (images, screenshots, PDFs).
 
 ### Other model notes
@@ -110,4 +110,4 @@ Use role-based routing.
 - **`github-copilot/gemini-3.8-flash`**: strong multimodal understanding; prone to tool loops when the task is vague (can burn 50+ turns on grep/find); self-contained packets + maxTurns cap required (see Task packet & execution bounds).
 
 ### Images
-If you do not have multimodal capabilities, delegate complex image analysis to `github-copilot/gemini-3.8-flash` or `openrouter/deepseek/deepseek-v4.1-flash` for more simple tasks.
+If you do not have multimodal capabilities, delegate complex image analysis to `github-copilot/gemini-3.8-flash` or `openrouter/deepseek/deepseek-v4.1-flash-1017` for more simple tasks.

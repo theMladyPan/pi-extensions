@@ -3,7 +3,7 @@ import { Type } from "typebox";
 
 const EXA_SEARCH_URL = "https://api.exa.ai/search";
 const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
-const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash";
+const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 
 const MAX_HIGHLIGHT_LENGTH = 500;
 const MAX_TOTAL_EVIDENCE_LENGTH = 12000;
@@ -261,7 +261,7 @@ export default function (pi: ExtensionAPI) {
 		name: "exa_search",
 		label: "Exa Search",
 		description:
-			"Search the web using Exa's neural/auto search across multiple ranked query angles and synthesize a direct answer with DeepSeek deepseek-v4.1-flash. Always provide 1-5 varied query angles in queries for comprehensive coverage.",
+			"Search the web using Exa's neural/auto search across multiple ranked query angles and synthesize a direct answer with DeepSeek deepseek-v4.1-flash-1017. Always provide 1-5 varied query angles in queries for comprehensive coverage.",
 		parameters: ExaSearchParameters,
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const exaKey = process.env.EXA_API_KEY?.trim();

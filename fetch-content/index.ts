@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
-const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash";
+const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 
 const FETCH_TIMEOUT_MS = 30_000;
 const BROWSER_USER_AGENT =
@@ -249,7 +249,7 @@ export default function (pi: ExtensionAPI) {
 		name: "fetch_content",
 		label: "Fetch Content",
 		description:
-			"Fetch one or more http(s) URLs and extract clean, structured content via DeepSeek deepseek-v4.1-flash. Use summary mode for concise extraction or verbatim mode for full substantive content.",
+			"Fetch one or more http(s) URLs and extract clean, structured content via DeepSeek deepseek-v4.1-flash-1017. Use summary mode for concise extraction or verbatim mode for full substantive content.",
 		parameters: FetchContentParameters,
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const openrouterKey = process.env.OPENROUTER_API_KEY?.trim();

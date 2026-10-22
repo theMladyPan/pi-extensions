@@ -423,7 +423,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
               role: "scout",
               task: params.scoutTask,
               provider: params.scoutProvider ?? "openrouter",
-              model: params.scoutModel ?? "deepseek/deepseek-v4.1-flash",
+              model: params.scoutModel ?? "deepseek/deepseek-v4.1-flash-1017",
               cwd,
               approve,
               timeoutSeconds: params.timeoutSeconds,
