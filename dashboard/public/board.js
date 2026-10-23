@@ -429,12 +429,13 @@
 
     head.querySelector(".close").addEventListener("click", (event) => {
       event.stopPropagation();
-      card.remove();
-      cards.splice(cards.indexOf(card), 1);
-      byId.delete(entry.id);
-      clearFresh();
-      releaseSpot(card);
-      updateEmpty();
+      dropCard(entry);
+      // Closing has to reach the server, otherwise a refresh brings the card back.
+      void fetch(`/close?token=${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cardId: entry.id }),
+      }).catch(() => {});
     });
 
     head.addEventListener("pointerdown", (event) => {
@@ -528,6 +529,19 @@
     freshCount = 0;
     paintPill();
     sawFirstCard = false;
+    updateEmpty();
+  }
+
+  /** Remove a card from the board and let later cards fill the space it held. */
+  function dropCard(entry) {
+    const record = byId.get(entry.id);
+    if (!record) return;
+    record.card.remove();
+    const at = cards.indexOf(record.card);
+    if (at >= 0) cards.splice(at, 1);
+    byId.delete(record.id);
+    releaseSpot(record.card);
+    recomputePill();
     updateEmpty();
   }
 
@@ -870,6 +884,8 @@
         for (const card of payload.cards || []) applyMessage(card);
         sawFirstCard = (payload.cards || []).length > 0;
         if (cards.length) fitAll();
+      } else if (payload.type === "remove") {
+        dropCard({ id: payload.id });
       } else if (payload.type === "activity") {
         applyActivity(payload.row);
       } else if (payload.type === "card" || payload.type === "update") {

@@ -385,6 +385,32 @@ function startBoard(): Board {
 				res.end(JSON.stringify({ stopped: true }));
 				return;
 			}
+			if (req.method === "POST" && url.pathname === "/close") {
+				const body = await readBody(req);
+				let payload: { cardId?: string } = {};
+				try {
+					payload = JSON.parse(body) as { cardId?: string };
+				} catch {
+					res.writeHead(400, { "Content-Type": "text/plain" });
+					res.end("bad json");
+					return;
+				}
+				const at = cards.findIndex((candidate) => candidate.id === payload.cardId);
+				if (at < 0) {
+					res.writeHead(404, { "Content-Type": "text/plain" });
+					res.end("no such card");
+					return;
+				}
+				// A closed card leaves the board for good; only a later update with the same key
+				// brings it back, and then it arrives as a fresh card.
+				const [closed] = cards.splice(at, 1);
+				const waiting = awaitingStickies.indexOf(closed.id);
+				if (waiting >= 0) awaitingStickies.splice(waiting, 1);
+				broadcast(board ?? ({ clients } as Board), { type: "remove", id: closed.id });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ closed: closed.id }));
+				return;
+			}
 			if (req.method === "POST" && url.pathname === "/answer") {
 				const body = await readBody(req);
 				let payload: { cardId?: string; answer?: string } = {};
