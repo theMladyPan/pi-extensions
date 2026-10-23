@@ -391,8 +391,10 @@
     const isSource = data.type === "source";
     const isQuestion = data.type === "question";
     const kind = data.type;
+    const isNote = data.type === "note";
     const width = data.rect ? data.rect.w : defaultWidth(kind);
-    const height = data.rect ? data.rect.h : isSource ? 430 : isQuestion ? 300 : 300;
+    const defaultHeight = isSource ? 430 : isQuestion ? 300 : isNote ? 420 : 300;
+    const height = data.rect ? data.rect.h : defaultHeight;
 
     // The server remembers where a card was put, so a refresh and other tabs agree. A card
     // without a place goes in the nearest free area to the middle of what you are looking at.
@@ -556,7 +558,7 @@
     const { node, cls } = bodyFor(data, entry);
     entry.body.className = cls ? `body ${cls}` : "body";
     entry.body.replaceChildren(node);
-    growSticky(entry, data);
+    fitContent(entry, data);
     renumberQueue();
   }
 
@@ -564,10 +566,30 @@
    * An answered sticky holds the question and the reply, so it grows to fit them instead of
    * hiding the answer behind an inner scrollbar. Height stays put once the user resizes it.
    */
-  function growSticky(entry, data) {
-    if (data.type !== "sticky" || !data.reply || entry.card.dataset.sized === "user") return;
-    // Letting the card size itself beats guessing pixels: no inner scrollbar, no clipping.
-    entry.card.classList.add("auto-height");
+  /**
+   * A note holds whatever was written in it, and a short answer should not sit in a tall
+   * empty card. The card therefore sizes itself to its content, up to the CSS limit, unless
+   * the user picked a size by hand. An answered sticky does the same for its reply.
+   */
+  function fitContent(entry, data) {
+    if (entry.card.dataset.sized === "user") return;
+    const answeredSticky = data.type === "sticky" && Boolean(data.reply);
+    if (data.type !== "note" && !answeredSticky) return;
+    requestAnimationFrame(() => {
+      if (entry.card.dataset.sized === "user") return;
+      if (entry.body.scrollHeight <= entry.body.clientHeight + 2) return;
+      entry.card.classList.add("auto-height");
+      requestAnimationFrame(() => {
+        const rect = {
+          x: Math.round(parseFloat(entry.card.style.left)),
+          y: Math.round(parseFloat(entry.card.style.top)),
+          w: entry.card.offsetWidth,
+          h: entry.card.offsetHeight,
+        };
+        entry.card.dataset.rect = JSON.stringify(rect);
+        void saveLayout(entry.id, rect);
+      });
+    });
   }
 
   /**
