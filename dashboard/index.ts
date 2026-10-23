@@ -93,6 +93,8 @@ interface ActivityRow {
 	id: string;
 	kind: "tool" | "reply";
 	tool?: string;
+	/** Two or three words saying what the call does, shown instead of the tool name. */
+	label?: string;
 	target?: string;
 	status: "running" | "ok" | "error";
 	startedAt: number;
@@ -189,6 +191,111 @@ function repeatsAnswer(note: string, answer: string): boolean {
 const MAX_ACTIVITY = 300;
 /** Which argument of a tool call names the thing the user cares about. */
 const TARGET_KEYS = ["path", "file_path", "filePath", "command", "pattern", "query", "url", "target", "cmd"];
+
+const baseName = (value: string) => value.split("/").filter(Boolean).pop() ?? value;
+
+const words = (value: string, limit = 5) => {
+	const parts = value.trim().split(/\s+/).filter(Boolean);
+	if (parts.length <= limit) return parts.join(" ");
+	return `${parts.slice(0, limit).join(" ")}…`;
+};
+
+const unquote = (value: string) => value.replace(/^['"]|['"]$/g, "");
+
+const hostOf = (value: string) => {
+	try {
+		return new URL(value).host.replace(/^www\./, "");
+	} catch {
+		return baseName(value);
+	}
+};
+
+/** The shell command says more about intent than the word "bash" ever will. */
+function commandPhrase(command: string): string {
+	const cleaned = command
+		.replace(/^\s*(cd\s+[^&;]+&&\s*)/, "")
+		.replace(/^\s*(sudo\s+|env\s+\S+\s+)*/, "")
+		.trim();
+	const parts = cleaned.split(/\s+/).filter(Boolean);
+	const head = baseName(parts[0] ?? "");
+	const rest = parts.slice(1);
+	const firstArg = rest.find((part) => !part.startsWith("-")) ?? "";
+	const sub = rest[0] ?? "";
+
+	const table: Record<string, () => string> = {
+		rg: () => `searching for ${words(unquote(firstArg) || "a pattern", 3)}`,
+		grep: () => `searching for ${words(unquote(firstArg) || "a pattern", 3)}`,
+		find: () => `finding ${words(firstArg || "files", 3)}`,
+		git: () => `git ${sub || "status"}`.trim(),
+		npm: () => `npm ${sub || "run"}`.trim(),
+		pnpm: () => `pnpm ${sub || "run"}`.trim(),
+		yarn: () => `yarn ${sub || "run"}`.trim(),
+		pytest: () => "running the tests",
+		tsc: () => "type checking",
+		ruff: () => "linting",
+		eslint: () => "linting",
+		sleep: () => "waiting",
+		curl: () => `fetching ${hostOf(firstArg || sub)}`,
+		wget: () => `fetching ${hostOf(firstArg || sub)}`,
+		python: () => "running python",
+		python3: () => "running python",
+		uv: () => "running uv",
+		node: () => "running node",
+		make: () => "building",
+		sed: () => "editing text",
+		awk: () => "editing text",
+		tmux: () => "driving the terminal",
+		docker: () => "container work",
+		podman: () => "container work",
+		mkdir: () => "making folders",
+		rm: () => "deleting files",
+		cp: () => "copying files",
+		mv: () => "moving files",
+		code: () => "opening the editor",
+		ls: () => "listing files",
+		cat: () => "reading a file",
+		head: () => "peeking at a file",
+		tail: () => "peeking at a file",
+		wc: () => "counting lines",
+		pwd: () => "checking the folder",
+		which: () => "locating a program",
+	};
+
+	const known = table[head];
+	if (known) return known();
+	return `running ${words(head || command, 3)}`;
+}
+
+/**
+ * A rail row reads better as a phrase than as a tool name, so every call gets two or three
+ * words saying what it does. Deterministic on purpose: the row appears the moment the tool
+ * starts, with no extra model call and no waiting.
+ */
+function toolLabel(tool: string, args: unknown): string {
+	const record = (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+	const text = (key: string) => (typeof record[key] === "string" ? (record[key] as string).trim() : "");
+	const firstQuery = Array.isArray(record.queries) ? String(record.queries[0] ?? "") : "";
+	const name = tool.toLowerCase();
+
+	if (name.includes("board_note") || name === "note") return "writing a note";
+	if (name.includes("board_source") || name.includes("source")) return `opening ${baseName(text("path")) || "a file"}`;
+	if (name.includes("board_ask") || name === "ask") return "asking you";
+	if (name.includes("board_clear")) return "clearing the board";
+	if (name === "read" || name.includes("read_file")) return `reading ${baseName(text("path") || text("file_path")) || "a file"}`;
+	if (name === "edit" || name === "write" || name.includes("patch") || name.includes("multi_edit"))
+		return `editing ${baseName(text("path") || text("file_path")) || "a file"}`;
+	if (name.includes("grep") || name === "rg" || name.includes("search_file"))
+		return `searching for ${words(text("pattern") || text("query") || "a pattern", 3)}`;
+	if (name.includes("glob") || name === "find" || name === "ls") return `finding ${words(text("pattern") || text("path") || "files", 3)}`;
+	if (name.includes("_search") || name === "search")
+		return `searching the web for ${words(text("query") || text("q") || text("question") || firstQuery || "an answer", 3)}`;
+	if (name.includes("fetch") || name === "url") return `reading ${hostOf(text("url") || text("target"))}`;
+	if (name === "bash" || name === "shell" || name.includes("exec")) return commandPhrase(text("command") || text("cmd"));
+	if (name.includes("todo")) return "updating the plan";
+	if (name === "delegate" || name.includes("task")) return `delegating ${words(text("role") || "work", 2)}`;
+	if (name.includes("image") || name.includes("vision")) return "looking at an image";
+	return `running ${words(tool, 3)}`;
+}
 
 function toolTarget(args: unknown): string {
 	if (!args || typeof args !== "object") return "";
@@ -876,6 +983,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			id: event.toolCallId,
 			kind: "tool",
 			tool: event.toolName,
+			label: toolLabel(event.toolName, event.args),
 			target: toolTarget(event.args),
 			status: "running",
 			startedAt: Date.now(),

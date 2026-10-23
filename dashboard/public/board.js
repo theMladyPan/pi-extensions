@@ -926,7 +926,9 @@
     const top = el("div", "top");
     top.appendChild(el("span", "dot"));
     const name = el("span", "name");
-    name.textContent = row.kind === "reply" ? "answer" : row.tool || "tool";
+    // The phrase says what the call does; the tool name stays available on hover.
+    name.textContent = row.kind === "reply" ? "answer" : row.label || row.tool || "tool";
+    if (row.tool) name.title = row.tool;
     top.appendChild(name);
     const timing = el("span", "ms");
     timing.textContent = row.durationMs
