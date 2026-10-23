@@ -217,9 +217,18 @@ function startBoard(): Board {
 	return created;
 }
 
+let enabled = process.env.PI_BOARD_DISABLED !== "1";
+
 function ensureBoard(): Board {
 	if (!board) board = startBoard();
 	return board;
+}
+
+/** Tools answer politely instead of resurrecting a board the user switched off. */
+const OFF_MESSAGE = "The board is off. Turn it on with /board on.";
+
+function boardForTool(): Board | undefined {
+	return enabled ? ensureBoard() : undefined;
 }
 
 /** Announce the URL once the port is actually bound, which can happen after fallback. */
@@ -269,7 +278,8 @@ const noteTool = defineTool({
 	}),
 	async execute(_id, params, _signal, _onUpdate, ctx) {
 		currentCtx = ctx ?? currentCtx;
-		const target = ensureBoard();
+		const target = boardForTool();
+		if (!target) return { content: [{ type: "text", text: OFF_MESSAGE }], details: undefined };
 		const card: NoteCard = {
 			id: nextId(),
 			type: "note",
@@ -308,7 +318,8 @@ const sourceTool = defineTool({
 		const absolute = confinedPath(params.path);
 		const raw = await readFile(absolute, "utf8");
 		if (raw.length > MAX_SOURCE_BYTES) throw new Error(`${params.path} is too large for the board`);
-		const target = ensureBoard();
+		const target = boardForTool();
+		if (!target) return { content: [{ type: "text", text: OFF_MESSAGE }], details: undefined };
 		const card: SourceCard = {
 			id: nextId(),
 			type: "source",
@@ -347,7 +358,8 @@ const askTool = defineTool({
 	}),
 	async execute(_id, params, signal, _onUpdate, ctx) {
 		currentCtx = ctx ?? currentCtx;
-		const target = ensureBoard();
+		const target = boardForTool();
+		if (!target) return { content: [{ type: "text", text: OFF_MESSAGE }], details: undefined };
 		const card: QuestionCard = {
 			id: nextId(),
 			type: "question",
@@ -398,7 +410,8 @@ const clearTool = defineTool({
 	parameters: Type.Object({}),
 	async execute(_id, _params, _signal, _onUpdate, ctx) {
 		currentCtx = ctx ?? currentCtx;
-		const target = ensureBoard();
+		const target = boardForTool();
+		if (!target) return { content: [{ type: "text", text: OFF_MESSAGE }], details: undefined };
 		target.cards.length = 0;
 		broadcast(target, { type: "clear" });
 		return { content: [{ type: "text", text: "Board cleared." }], details: undefined };
@@ -414,11 +427,27 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	pi.registerTool(clearTool);
 
 	pi.registerCommand("board", {
-		description: "Show the board URL, or clear it: /board [clear]",
+		description: "Show the board URL: /board [on|off|clear]",
 		handler: async (args, ctx) => {
 			currentCtx = ctx;
-			if (args.trim() === "clear") {
-				const target = ensureBoard();
+			const verb = args.trim().toLowerCase();
+			if (verb === "off") {
+				enabled = false;
+				stopBoard();
+				ctx.ui.notify("Board off. Cards and tools are gone until /board on.", "info");
+				return;
+			}
+			if (verb === "on") {
+				enabled = true;
+				announceBoard(ensureBoard(), ctx);
+				return;
+			}
+			if (verb === "clear") {
+				const target = boardForTool();
+				if (!target) {
+					ctx.ui.notify(OFF_MESSAGE, "warning");
+					return;
+				}
 				target.cards.length = 0;
 				broadcast(target, { type: "clear" });
 				ctx.ui.notify("Board cleared", "info");
@@ -440,7 +469,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		// Only the interactive session owns a port; print and subagent runs stay headless.
-		if (ctx.mode === "tui") announceBoard(ensureBoard(), ctx);
+		if (enabled && ctx.mode === "tui") announceBoard(ensureBoard(), ctx);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
