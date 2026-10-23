@@ -567,9 +567,9 @@
    * hiding the answer behind an inner scrollbar. Height stays put once the user resizes it.
    */
   /**
-   * A note holds whatever was written in it, and a short answer should not sit in a tall
-   * empty card. The card therefore sizes itself to its content, up to the CSS limit, unless
-   * the user picked a size by hand. An answered sticky does the same for its reply.
+   * A note that holds more than its default height grows to fit, up to the CSS limit, so
+   * nothing hides behind an inner scrollbar. It never shrinks on its own, and a card the user
+   * resized keeps that size. An answered sticky does the same for its reply.
    */
   function fitContent(entry, data) {
     if (entry.card.dataset.sized === "user") return;
