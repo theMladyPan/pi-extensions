@@ -24,10 +24,11 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -35,6 +36,37 @@ import { spawn } from "node:child_process";
 
 const PUBLIC_DIR = fileURLToPath(new URL("./public/", import.meta.url));
 const PREFERRED_PORT = Number(process.env.PI_BOARD_PORT ?? 7374);
+
+/**
+ * A board keeps its port and token across restarts, so a tab left open keeps working after
+ * pi is restarted in the same folder instead of failing every request it makes.
+ */
+const STATE_FILE = join(homedir(), ".pi", "agent", "state", "dashboard.json");
+
+function readRemembered(cwd: string): { port?: number; token?: string } {
+	try {
+		const all = JSON.parse(readFileSync(STATE_FILE, "utf8")) as Record<string, { port?: number; token?: string }>;
+		return all[cwd] ?? {};
+	} catch {
+		return {};
+	}
+}
+
+function rememberBoard(cwd: string, port: number, token: string): void {
+	try {
+		let all: Record<string, { port?: number; token?: string }> = {};
+		try {
+			all = JSON.parse(readFileSync(STATE_FILE, "utf8")) as Record<string, { port: number; token: string }>;
+		} catch {
+			all = {};
+		}
+		all[cwd] = { port, token };
+		mkdirSync(dirname(STATE_FILE), { recursive: true, mode: 0o700 });
+		writeFileSync(STATE_FILE, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+	} catch {
+		// A board that cannot remember itself is still a working board.
+	}
+}
 const MAX_SOURCE_BYTES = 2_000_000;
 const ASK_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -426,7 +458,8 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
 }
 
 function startBoard(): Board {
-	const token = randomBytes(16).toString("hex");
+	const remembered = readRemembered(process.cwd());
+	const token = remembered.token ?? randomBytes(16).toString("hex");
 	const clients = new Set<ServerResponse>();
 	const cards: Card[] = [];
 	const activity: ActivityRow[] = [];
@@ -647,13 +680,14 @@ function startBoard(): Board {
 
 	// Parallel sessions each need their own board, so walk upward from the preferred port
 	// before giving up on a predictable number and letting the kernel pick one.
-	let candidate = PREFERRED_PORT;
+	let candidate = remembered.port ?? PREFERRED_PORT;
+	const lastPort = candidate + 20;
 	const attempt = () => {
 		server.listen(candidate, "127.0.0.1");
 	};
 	server.on("error", () => {
 		server.close();
-		if (candidate < PREFERRED_PORT + 20) {
+		if (candidate < lastPort) {
 			candidate += 1;
 			attempt();
 			return;
@@ -662,6 +696,7 @@ function startBoard(): Board {
 	});
 	server.on("listening", () => {
 		created.port = (server.address() as { port: number }).port;
+		rememberBoard(process.cwd(), created.port, token);
 	});
 	attempt();
 	return created;

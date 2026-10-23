@@ -18,6 +18,8 @@
   let z = 1;
   const occupied = [];
   let sawFirstCard = false;
+  // A snapshot is what is already on the board, so nothing in it is new to the reader.
+  let replaying = false;
   let freshCount = 0;
 
   const GAP = 18;
@@ -426,9 +428,10 @@
     cards.push(card);
 
     const badge = el("span", "new-badge");
+    if (replaying) badge.style.visibility = "hidden";
     badge.textContent = "new";
     head.insertBefore(badge, head.querySelector(".close"));
-    card.classList.add("fresh");
+    if (!replaying) card.classList.add("fresh");
     const clearFresh = () => {
       if (!card.classList.contains("fresh")) return;
       card.classList.remove("fresh");
@@ -1047,7 +1050,10 @@
       drawAttachments();
       composerHint.textContent = sendMode === "steer" ? "steered" : "queued";
     } catch (error) {
-      composerHint.textContent = `failed: ${error.message || error}`;
+      const gone = error instanceof TypeError; // fetch rejects like this when nothing answers
+      composerHint.textContent = gone
+        ? "board connection lost — reload the page"
+        : `failed: ${error.message || error}`;
     } finally {
       sendBtn.disabled = false;
     }
@@ -1166,8 +1172,10 @@
       } else if (payload.type === "snapshot") {
         applyMeta(payload.meta);
         clearBoard();
+        replaying = true;
         for (const row of payload.activity || []) applyActivity(row);
         for (const card of payload.cards || []) applyMessage(card);
+        replaying = false;
         sawFirstCard = (payload.cards || []).length > 0;
         if (cards.length) fitAll();
       } else if (payload.type === "move") {
