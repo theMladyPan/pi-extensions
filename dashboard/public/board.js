@@ -18,6 +18,8 @@
   let z = 1;
   const occupied = [];
   let sawFirstCard = false;
+  /** The card the composer is currently replying into, or null for a fresh message. */
+  let replyTarget = null;
   // A snapshot is what is already on the board, so nothing in it is new to the reader.
   let replaying = false;
   let freshCount = 0;
@@ -167,6 +169,53 @@
       .replace(/javascript:/gi, "");
   }
 
+  /** `|---|:--:|` under a header row is what makes the block above it a table. */
+  function isTableRule(line) {
+    return typeof line === "string" && line.includes("-") && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line);
+  }
+
+  function tableCells(line) {
+    return line
+      .replace(/^\s*\|/, "")
+      .replace(/\|\s*$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+  }
+
+  function renderTable(headerLine, ruleLine, bodyLines) {
+    const wrap = el("div", "table-wrap");
+    const table = el("table");
+    const align = tableCells(ruleLine).map((spec) =>
+      spec.startsWith(":") && spec.endsWith(":") ? "center" : spec.endsWith(":") ? "right" : spec.startsWith(":") ? "left" : "",
+    );
+    const head = el("thead");
+    const headRow = el("tr");
+    tableCells(headerLine).forEach((cell, column) => {
+      const th = el("th");
+      th.innerHTML = inlineMd(cell);
+      if (align[column]) th.style.textAlign = align[column];
+      headRow.appendChild(th);
+    });
+    head.appendChild(headRow);
+    const body = el("tbody");
+    for (const line of bodyLines) {
+      const row = el("tr");
+      const cells = tableCells(line);
+      // Rows shorter than the header still line up, and extra cells are kept rather than lost.
+      const width = Math.max(cells.length, headRow.childElementCount);
+      for (let column = 0; column < width; column += 1) {
+        const td = el("td");
+        td.innerHTML = inlineMd(cells[column] ?? "");
+        if (align[column]) td.style.textAlign = align[column];
+        row.appendChild(td);
+      }
+      body.appendChild(row);
+    }
+    table.append(head, body);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
   function renderMarkdown(markdown) {
     const holder = el("div");
     const fences = [];
@@ -197,8 +246,27 @@
       }
       // Lines are walked one by one, so a list can be followed by a paragraph with no blank
       // line between them, which is what typing under a list produces.
+      const lines = block.split("\n");
       let ul = null;
-      for (const line of block.split("\n")) {
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        // A table is a header row, a separator row, then body rows until something else.
+        // The separator needs a pipe of its own and must line up with the header, otherwise a
+        // paragraph that ends in a pipe and is followed by `---` would become a table.
+        if (
+          /\|/.test(line) &&
+          isTableRule(lines[index + 1]) &&
+          lines[index + 1].includes("|") &&
+          tableCells(line).length === tableCells(lines[index + 1]).length
+        ) {
+          const rows = [];
+          let cursor = index + 2;
+          while (cursor < lines.length && /\|/.test(lines[cursor])) rows.push(lines[cursor++]);
+          holder.appendChild(renderTable(line, lines[index + 1], rows));
+          ul = null;
+          index = cursor - 1;
+          continue;
+        }
         const item = line.match(/^\s*[-*+]\s+(.*)$/);
         if (item) {
           if (!ul) {
@@ -225,6 +293,36 @@
         }
         if (/^\s*(---|\*\*\*)\s*$/.test(line)) {
           holder.appendChild(el("hr"));
+          continue;
+        }
+        // `>` lines group into one quote; a bare `>` splits it into paragraphs.
+        const quoted = line.match(/^\s*>\s?(.*)$/);
+        if (quoted) {
+          const pieces = [];
+          let cursor = index;
+          while (cursor < lines.length) {
+            const next = lines[cursor].match(/^\s*>\s?(.*)$/);
+            if (!next) break;
+            pieces.push(next[1]);
+            cursor += 1;
+          }
+          const quote = el("blockquote");
+          const para = [];
+          const flush = () => {
+            if (!para.length) return;
+            const p = el("p");
+            p.innerHTML = inlineMd(para.join(" "));
+            quote.appendChild(p);
+            para.length = 0;
+          };
+          for (const piece of pieces) {
+            if (piece.trim()) para.push(piece.trim());
+            else flush();
+          }
+          flush();
+          holder.appendChild(quote);
+          ul = null;
+          index = cursor - 1;
           continue;
         }
         const p = el("p");
@@ -352,6 +450,45 @@
     }
   }
 
+  /** One follow-up exchange: your question, what happened to it, then the answer. */
+  function turnNode(turn) {
+    const wrap = el("div", `turn ${turn.status || "queued"}`);
+    const question = el("div", "turn-q");
+    question.textContent = turn.text || "";
+    wrap.appendChild(question);
+    const status = el("div", `turn-status ${turn.status || "queued"}`);
+    status.textContent =
+      turn.status === "answered"
+        ? "answered"
+        : turn.status === "stopped"
+          ? "stopped"
+          : turn.status === "sent"
+            ? "running"
+            : `queued · ${turn.mode === "steer" ? "steer" : "queue"}`;
+    wrap.appendChild(status);
+    if (turn.images) {
+      const shot = el("div", "turn-status");
+      shot.textContent = `${turn.images} image${turn.images > 1 ? "s" : ""} attached`;
+      wrap.appendChild(shot);
+    }
+    if (turn.reply) {
+      const answer = el("div", "turn-a note-body");
+      answer.appendChild(renderMarkdown(turn.reply));
+      wrap.appendChild(answer);
+    }
+    return wrap;
+  }
+
+  /**
+   * Follow-ups live in the card they are about, below its body, so asking again never pushes a
+   * new card onto the canvas.
+   */
+  function paintThread(entry, data) {
+    const turns = Array.isArray(data.turns) ? data.turns : [];
+    entry.thread.hidden = turns.length === 0;
+    entry.thread.replaceChildren(...turns.map(turnNode));
+  }
+
   /** A message from the user, with the agent's answer attached once it arrives. */
   function stickyBody(data) {
     const holder = el("div", "sticky-body");
@@ -389,13 +526,15 @@
   }
 
   // ---------- cards --------------------------------------------------------
-  function makeCard(data) {
+  function makeCard(data, quiet = false) {
     const isSource = data.type === "source";
     const isQuestion = data.type === "question";
     const kind = data.type;
     const isNote = data.type === "note";
     const width = data.rect ? data.rect.w : defaultWidth(kind);
-    const defaultHeight = isSource ? 430 : isQuestion ? 300 : isNote ? 420 : 300;
+    // A delegate card opens small and grows as the run reports; a normal note wants the room.
+    const delegate = typeof data.key === "string" && data.key.startsWith("delegate-");
+    const defaultHeight = isSource ? 430 : isQuestion ? 300 : isNote ? (delegate ? 220 : 420) : 300;
     const height = data.rect ? data.rect.h : defaultHeight;
 
     // The server remembers where a card was put, so a refresh and other tabs agree. A card
@@ -419,16 +558,21 @@
       <span class="sub"></span>
       <span class="spacer"></span>
       <span class="chip"></span>
+      <button class="min" title="minimize this card">▾</button>
+      <button class="reply" title="ask a follow-up about this card">↩</button>
       <button class="edit" title="edit this note">✎</button>
       <button class="close" title="close">×</button>`;
     const body = el("div", "body");
+    const thread = el("div", "thread");
+    thread.hidden = true;
     const grip = el("div", "resize");
-    card.append(head, body, grip);
+    card.append(head, body, thread, grip);
     world.appendChild(card);
     cards.push(card);
 
     const badge = el("span", "new-badge");
-    if (replaying) badge.style.visibility = "hidden";
+    // A restored card is one you already had, so it does not carry a "new" tag.
+    if (replaying || quiet) badge.style.visibility = "hidden";
     badge.textContent = "new";
     head.insertBefore(badge, head.querySelector(".close"));
     if (!replaying) card.classList.add("fresh");
@@ -446,18 +590,33 @@
       card,
       head,
       body,
+      thread,
       titleEl: head.querySelector(".title"),
       subEl: head.querySelector(".sub"),
       chipEl: head.querySelector(".chip"),
       data,
     };
     byId.set(data.id, entry);
+    if (data.mini) setMini(card, true);
     paintCard(entry, data);
 
     card.addEventListener("pointerdown", () => {
       card.style.zIndex = z++;
       cards.forEach((c) => c.classList.toggle("active", c === card));
     }, true);
+
+    head.querySelector(".min").addEventListener("click", (event) => {
+      event.stopPropagation();
+      const mini = !card.classList.contains("mini");
+      setMini(card, mini);
+      const rect = JSON.parse(card.dataset.rect || "{}");
+      void saveLayout(entry.id, rect, mini);
+    });
+
+    head.querySelector(".reply").addEventListener("click", (event) => {
+      event.stopPropagation();
+      setReplyTarget(entry);
+    });
 
     head.querySelector(".edit").addEventListener("click", (event) => {
       event.stopPropagation();
@@ -477,7 +636,7 @@
 
     head.addEventListener("pointerdown", (event) => {
       // Buttons in the header are for clicking, not for dragging the card.
-      if (event.target.closest(".close, .edit")) return;
+      if (event.target.closest(".close, .edit, .reply, .min")) return;
       event.preventDefault();
       card.classList.add("dragging");
       const sx = event.clientX;
@@ -561,6 +720,7 @@
     const { node, cls } = bodyFor(data, entry);
     entry.body.className = cls ? `body ${cls}` : "body";
     entry.body.replaceChildren(node);
+    paintThread(entry, data);
     fitContent(entry, data);
     renumberQueue();
   }
@@ -575,12 +735,16 @@
    * resized keeps that size. An answered sticky does the same for its reply.
    */
   function fitContent(entry, data) {
-    if (entry.card.dataset.sized === "user") return;
+    if (entry.card.dataset.sized === "user" || entry.card.classList.contains("mini")) return;
     const answeredSticky = data.type === "sticky" && Boolean(data.reply);
-    if (data.type !== "note" && !answeredSticky) return;
+    const threaded = Array.isArray(data.turns) && data.turns.length > 0;
+    if (data.type !== "note" && !answeredSticky && !threaded) return;
     requestAnimationFrame(() => {
       if (entry.card.dataset.sized === "user") return;
-      if (entry.body.scrollHeight <= entry.body.clientHeight + 2) return;
+      const bodyTight = entry.body.scrollHeight > entry.body.clientHeight + 2;
+      // A thread is clipped by its own max-height, so ask it directly whether it is hiding rows.
+      const threadTight = !entry.thread.hidden && entry.thread.scrollHeight > entry.thread.clientHeight + 2;
+      if (!bodyTight && !threadTight) return;
       entry.card.classList.add("auto-height");
       requestAnimationFrame(() => {
         const rect = {
@@ -619,13 +783,13 @@
     }
   }
 
-  function applyMessage(data) {
+  function applyMessage(data, quiet = false) {
     const existing = byId.get(data.id);
     if (existing) {
       paintCard(existing, data);
       return;
     }
-    const entry = makeCard(data);
+    const entry = makeCard(data, quiet);
     recomputePill();
     if (!sawFirstCard) {
       sawFirstCard = true;
@@ -649,6 +813,7 @@
   function dropCard(entry) {
     const record = byId.get(entry.id);
     if (!record) return;
+    if (replyTarget === entry) setReplyTarget(null);
     record.card.remove();
     const at = cards.indexOf(record.card);
     if (at >= 0) cards.splice(at, 1);
@@ -725,12 +890,29 @@
    * Panning the board is drag-only, because a stray scroll should never move the layout.
    */
   /** Tell the server where a card sits, so placement survives a refresh. */
-  function saveLayout(cardId, rect) {
+  function saveLayout(cardId, rect, mini) {
+    const body = { cardId, rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } };
+    // Only sent when it is asked for, so an ordinary move never clears a folded card.
+    if (typeof mini === "boolean") body.mini = mini;
     return fetch(`/layout?token=${encodeURIComponent(token)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cardId, rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } }),
+      body: JSON.stringify(body),
     }).catch(() => {});
+  }
+
+  /**
+   * Folding keeps the card's real height on the server, so restoring it puts the card back
+   * exactly as it was. Only the header stays on the canvas.
+   */
+  function setMini(card, mini) {
+    card.classList.toggle("mini", mini);
+    card.dataset.mini = mini ? "1" : "0";
+    const button = card.querySelector(".min");
+    if (button) {
+      button.textContent = mini ? "▸" : "▾";
+      button.title = mini ? "restore this card" : "minimize this card";
+    }
   }
 
   /** Move a card locally and take the space it now holds into account. */
@@ -922,7 +1104,65 @@
   const railNow = document.getElementById("railNow");
   const railLog = document.getElementById("railLog");
   const railRunning = document.getElementById("railRunning");
+  const railOpenCount = document.getElementById("railOpenCount");
   const actEls = new Map();
+
+  // The rail is the user's furniture: its width and whether it is showing survive a reload.
+  const RAIL_MIN = 160;
+  const RAIL_MAX = 720;
+  const root = document.documentElement;
+
+  function railWidth(px) {
+    const width = Math.max(RAIL_MIN, Math.min(RAIL_MAX, Math.round(px)));
+    root.style.setProperty("--rail", `${width}px`);
+    try {
+      localStorage.setItem("board.railWidth", String(width));
+    } catch {}
+    return width;
+  }
+
+  function railShown(shown) {
+    document.body.classList.toggle("rail-off", !shown);
+    try {
+      localStorage.setItem("board.railOff", shown ? "0" : "1");
+    } catch {}
+  }
+
+  function restoreRail() {
+    let saved = 0;
+    let off = "0";
+    try {
+      saved = Number(localStorage.getItem("board.railWidth")) || 0;
+      off = localStorage.getItem("board.railOff") || "0";
+    } catch {}
+    if (saved) railWidth(saved);
+    if (off === "1") railShown(false);
+  }
+  restoreRail();
+  document.getElementById("railToggle").onclick = () => railShown(false);
+  document.getElementById("railOpen").onclick = () => railShown(true);
+
+  (() => {
+    const grip = document.getElementById("railGrip");
+    let dragging = false;
+    grip.addEventListener("pointerdown", (event) => {
+      dragging = true;
+      grip.setPointerCapture(event.pointerId);
+      document.body.classList.add("rail-resizing");
+      event.preventDefault();
+    });
+    grip.addEventListener("pointermove", (event) => {
+      if (dragging) railWidth(event.clientX);
+    });
+    const stop = (event) => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove("rail-resizing");
+      if (grip.hasPointerCapture?.(event.pointerId)) grip.releasePointerCapture(event.pointerId);
+    };
+    grip.addEventListener("pointerup", stop);
+    grip.addEventListener("pointercancel", stop);
+  })();
 
   function actRow(row) {
     const node = el("div", `act ${row.kind === "reply" ? "reply" : ""} ${row.status}`);
@@ -967,15 +1207,45 @@
         last.remove();
       }
     }
-    railRunning.textContent = railNow.childElementCount ? String(railNow.childElementCount) : "";
+    const running = railNow.childElementCount ? String(railNow.childElementCount) : "";
+    railRunning.textContent = running;
+    railOpenCount.textContent = running;
   }
 
   // ---------- composer -----------------------------------------------------
   const msgBox = document.getElementById("msg");
   const sendBtn = document.getElementById("send");
   const composerHint = document.getElementById("composerHint");
+  const replyChip = document.getElementById("replyChip");
+  const replyChipText = document.getElementById("replyChipText");
   let sendMode = "queue";
   composerHint.textContent = "waits for this run to finish";
+
+  /**
+   * A reply is aimed at one card, so the composer shows which until it is sent or cleared.
+   * Without this the follow-up would arrive as a new sticky and the thread would be lost.
+   */
+  function setReplyTarget(entry) {
+    replyTarget = entry && byId.has(entry.id) ? entry : null;
+    for (const record of byId.values()) record.card.classList.toggle("replying", record === replyTarget);
+    dockComposer(replyTarget);
+    replyChip.hidden = !replyTarget;
+    if (replyTarget) {
+      // A sticky is titled "you", so it is named by its own words instead.
+      const name =
+        replyTarget.data.type === "sticky"
+          ? (replyTarget.data.text || "message").replace(/\s+/g, " ").trim().slice(0, 40)
+          : replyTarget.titleEl.textContent;
+      replyChipText.textContent = `in “${name}”`;
+      msgBox.placeholder = "ask a follow-up about this card…  (esc to send to the board instead)";
+      msgBox.focus();
+    } else {
+      msgBox.placeholder = "message the agent…  (enter sends, shift+enter for a new line, paste an image to attach it)";
+    }
+    composerHint.textContent = sendMode === "steer" ? "interrupts the run" : "waits for this run to finish";
+  }
+
+  document.getElementById("replyChipClear").addEventListener("click", () => setReplyTarget(null));
 
   for (const button of document.querySelectorAll("#composer .modes button")) {
     button.addEventListener("click", () => {
@@ -1011,19 +1281,42 @@
     }
   }
 
+  // A screenshot is several megabytes once base64 encoded, which is slow to push and slow to
+  // replay. Shrinking it to a size that still reads well keeps the message small.
+  const MAX_IMAGE_EDGE = 1568;
+  function shrinkImage(dataUrl, mimeType) {
+    const original = { dataUrl, mimeType, data: dataUrl.slice(dataUrl.indexOf(",") + 1) };
+    return new Promise((resolve) => {
+      const image = new Image();
+      image.addEventListener("load", () => {
+        const width = image.naturalWidth;
+        const height = image.naturalHeight;
+        if (Math.max(width, height) <= MAX_IMAGE_EDGE && dataUrl.length < 400_000) {
+          resolve(original);
+          return;
+        }
+        const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(width, height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+        const shrunk = canvas.toDataURL("image/jpeg", 0.85);
+        resolve({ dataUrl: shrunk, mimeType: "image/jpeg", data: shrunk.slice(shrunk.indexOf(",") + 1) });
+      });
+      // Anything the browser cannot decode travels untouched rather than disappearing.
+      image.addEventListener("error", () => resolve(original));
+      image.src = dataUrl;
+    });
+  }
+
   msgBox.addEventListener("paste", (event) => {
     const files = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith("image/"));
     if (files.length === 0) return;
     event.preventDefault();
     for (const file of files.slice(0, 4)) {
       const reader = new FileReader();
-      reader.addEventListener("load", () => {
-        const dataUrl = String(reader.result);
-        pendingImages.push({
-          dataUrl,
-          mimeType: file.type,
-          data: dataUrl.slice(dataUrl.indexOf(",") + 1),
-        });
+      reader.addEventListener("load", async () => {
+        pendingImages.push(await shrinkImage(String(reader.result), file.type));
         drawAttachments();
       });
       reader.readAsDataURL(file);
@@ -1034,20 +1327,35 @@
     const text = msgBox.value.trim();
     if (!text && pendingImages.length === 0) return;
     sendBtn.disabled = true;
+    // Both attempts carry the same id, so a retry after a reset cannot deliver twice.
+    const body = JSON.stringify({
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      cardId: replyTarget ? replyTarget.id : undefined,
+      text,
+      mode: sendMode,
+      images: pendingImages.map((image) => ({ data: image.data, mimeType: image.mimeType })),
+    });
     try {
-      const response = await fetch(`/message?token=${encodeURIComponent(token)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          mode: sendMode,
-          images: pendingImages.map((image) => ({ data: image.data, mimeType: image.mimeType })),
-        }),
-      });
+      let response;
+      // A socket the browser thought was alive can be closed under it, which loses the
+      // request silently. One retry turns that into a delivered message.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          response = await fetch(`/message?token=${encodeURIComponent(token)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          break;
+        } catch (error) {
+          if (attempt === 1 || !(error instanceof TypeError)) throw error;
+        }
+      }
       if (!response.ok) throw new Error((await response.text()).slice(0, 80) || response.statusText);
       msgBox.value = "";
       pendingImages.length = 0;
       drawAttachments();
+      setReplyTarget(null);
       composerHint.textContent = sendMode === "steer" ? "steered" : "queued";
     } catch (error) {
       const gone = error instanceof TypeError; // fetch rejects like this when nothing answers
@@ -1072,7 +1380,46 @@
       stopBtn.textContent = "stop";
     }
   });
+  const composer = document.getElementById("composer");
+  const composerHome = composer.parentElement;
+  let composerAt = composer.nextElementSibling;
+
+  /**
+   * The composer is a view of one piece of state, so it moves rather than being copied: while a
+   * card is the reply target the field sits at the bottom of that card, and `esc` puts it back.
+   */
+  function dockComposer(entry) {
+    if (entry) {
+      // A folded card has no room for a field, so replying unfolds it.
+      if (entry.card.classList.contains("mini")) setMini(entry.card, false);
+      entry.card.insertBefore(composer, entry.card.querySelector(".resize"));
+      composer.classList.add("docked");
+      return;
+    }
+    if (composer.parentElement !== composerHome) {
+      composer.classList.remove("docked");
+      composerHome.insertBefore(composer, composerAt);
+    }
+  }
+
+  // `r` opens a thread on the card you last clicked, whichever kind it is. The composer keeps
+  // its own keys, so a message being typed is never cut short.
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "r" || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.target.closest("textarea, input, [contenteditable=true]")) return;
+    const active = document.querySelector(".card.active");
+    const record = active ? byId.get(active.dataset.id) : null;
+    if (!record) return;
+    event.preventDefault();
+    setReplyTarget(record);
+  });
+
   msgBox.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && replyTarget) {
+      event.preventDefault();
+      setReplyTarget(null);
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void sendMessage();
@@ -1158,8 +1505,18 @@
 
   function connect() {
     const source = new EventSource(`/events?token=${encodeURIComponent(token)}`);
-    source.onopen = () => setLive(true);
-    source.onerror = () => setLive(false);
+    let refusals = 0;
+    source.onopen = () => {
+      setLive(true);
+      refusals = 0;
+    };
+    source.onerror = () => {
+      // A refused stream keeps retrying forever, so say what actually happened: the token in
+      // this address bar is not the one the board now knows.
+      refusals += 1;
+      setLive(false);
+      if (refusals >= 3) liveText.textContent = "token refused — reopen the link pi printed";
+    };
     source.onmessage = (event) => {
       let payload;
       try {
@@ -1181,12 +1538,13 @@
       } else if (payload.type === "move") {
         const record = byId.get(payload.id);
         if (record && payload.rect) placeCard(record, payload.rect);
+        if (record && typeof payload.mini === "boolean") setMini(record.card, payload.mini);
       } else if (payload.type === "remove") {
         dropCard({ id: payload.id });
       } else if (payload.type === "activity") {
         applyActivity(payload.row);
       } else if (payload.type === "card" || payload.type === "update") {
-        applyMessage(payload.card);
+        applyMessage(payload.card, payload.quiet === true);
         startFlash();
       } else if (payload.type === "clear") {
         clearBoard();

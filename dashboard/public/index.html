@@ -13,7 +13,10 @@
     --green: #3fb950; --amber: #d29922; --pink: #db61a2; --red: #f85149;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     --lh: 20px;
+    /* One number the rail, the canvas and the composer all agree on. */
+    --rail: 252px;
   }
+  body.rail-off { --rail: 0px; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); }
   /* Thin dark scrollbars, so the rail and a long card look like part of the board. */
@@ -27,7 +30,7 @@
   body { font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
 
   #viewport {
-    position: fixed; inset: 44px 0 96px 252px; overflow: hidden;
+    position: fixed; inset: 44px 0 96px var(--rail); overflow: hidden;
     background-color: var(--bg);
     background-image: radial-gradient(circle at 1px 1px, #21262d 1px, transparent 0);
     background-size: 24px 24px;
@@ -78,6 +81,40 @@
   .close { border: 0; background: transparent; color: var(--muted); font-size: 16px;
     line-height: 1; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
   .close:hover { background: #21262d; color: var(--text); }
+  .reply { border: 0; background: transparent; color: var(--muted); font: 13px/1 system-ui;
+    cursor: pointer; padding: 3px 5px; border-radius: 4px; }
+  .reply:hover { background: #21262d; color: var(--accent); }
+  .min { border: 0; background: transparent; color: var(--muted); font: 12px/1 system-ui;
+    cursor: pointer; padding: 3px 5px; border-radius: 4px; }
+  .min:hover { background: #21262d; color: var(--text); }
+  /* Folded: the head is the whole card, and the real height stays saved for restoring. */
+  .card.mini { height: auto !important; min-height: 0; }
+  .card.mini .body, .card.mini .thread, .card.mini .resize { display: none; }
+  .card.mini .head { border-bottom: none; }
+  .card.replying { border-color: #d29922; box-shadow: 0 0 0 1px rgba(210,153,34,.45), 0 12px 32px rgba(1,4,9,.5); }
+
+  /* Follow-ups live under the card body, in the order they were asked. */
+  .thread { flex: none; max-height: 62%; overflow: auto; border-top: 1px solid var(--border);
+    background: #0f141b; padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .thread[hidden] { display: none; }
+  .turn { display: flex; flex-direction: column; gap: 5px; }
+  .turn + .turn { border-top: 1px dashed #21262d; padding-top: 8px; }
+  .turn-q { color: #f0e6d2; background: #2a2415; border-left: 3px solid #d29922;
+    padding: 6px 9px; border-radius: 4px; white-space: pre-wrap; font-size: 12.5px; }
+  .turn-status { font: 10px var(--mono); color: var(--muted); text-transform: uppercase;
+    letter-spacing: .5px; }
+  .turn-status.answered { color: var(--green); }
+  .turn-status.stopped { color: #f85149; }
+  .turn-status.sent { color: var(--accent); }
+  .turn-a { padding: 0; color: #c9d1d9; font-size: 12.5px; }
+
+  /* Markdown tables: a wide one scrolls sideways instead of bursting the card. */
+  .table-wrap { overflow-x: auto; margin: 6px 0 10px; }
+  .table-wrap table { border-collapse: collapse; font-size: 12.5px; }
+  .table-wrap th, .table-wrap td { border: 1px solid #30363d; padding: 4px 9px;
+    text-align: left; vertical-align: top; }
+  .table-wrap th { background: #161b22; color: #e6edf3; font-weight: 600; white-space: nowrap; }
+  .table-wrap tr:nth-child(even) td { background: rgba(22,27,34,.55); }
 
   .body { flex: 1; overflow: auto; position: relative; }
   .note-body { padding: 10px 12px; color: #c9d1d9; word-wrap: break-word; }
@@ -95,6 +132,10 @@
   .note-body .svg-wrap svg { max-width: 100%; height: auto; display: block; }
   .note-body ul { margin: 0 0 8px; padding-left: 18px; list-style: none; }
   .note-body li { margin: 1px 0; }
+  .note-body blockquote, .sticky-reply blockquote { margin: 0 0 8px; padding: 2px 0 2px 10px;
+    border-left: 2px solid var(--border-bright); color: var(--muted); }
+  .note-body blockquote p, .sticky-reply blockquote p { margin: 0 0 4px; }
+  .note-body blockquote p:last-child, .sticky-reply blockquote p:last-child { margin-bottom: 0; }
   .note-body .tick { color: var(--green); cursor: pointer; }
   .card .edit { border: 0; background: transparent; color: var(--muted); font-size: 14px;
     line-height: 1; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
@@ -170,13 +211,31 @@
 
   /* activity rail */
   #rail {
-    position: fixed; top: 44px; left: 0; bottom: 0; width: 252px; z-index: 8;
+    position: fixed; top: 44px; left: 0; bottom: 0; width: var(--rail); z-index: 8;
     background: #0a0f16; border-right: 1px solid var(--border);
     display: flex; flex-direction: column; font: 12px var(--mono); overflow: hidden;
   }
+  body.rail-off #rail { display: none; }
+  /* A collapsed rail leaves a small tab, so activity is never more than one click away. */
+  #railOpen { display: none; position: fixed; top: 52px; left: 0; z-index: 8;
+    background: #0a0f16; border: 1px solid var(--border); border-left: none;
+    border-radius: 0 6px 6px 0; color: var(--muted); font: 11px var(--mono);
+    text-transform: uppercase; letter-spacing: .6px; padding: 8px 6px; cursor: pointer;
+    writing-mode: vertical-rl; }
+  #railOpen:hover { color: var(--text); }
+  #railOpen b { color: var(--accent); }
+  body.rail-off #railOpen { display: block; }
+  /* Drag handle. Six invisible pixels that turn into a line under the cursor. */
+  #railGrip { position: absolute; top: 0; bottom: 0; right: 0; width: 6px;
+    cursor: col-resize; background: transparent; z-index: 2; }
+  #railGrip:hover, body.rail-resizing #railGrip { background: var(--accent-dim); }
+  body.rail-resizing { cursor: col-resize; user-select: none; }
   #rail .rail-head { padding: 8px 12px 4px; color: var(--muted); font-size: 11px;
     text-transform: uppercase; letter-spacing: .6px; display: flex; gap: 6px; align-items: center; }
   #rail .rail-head b { color: var(--accent); font-weight: 600; }
+  #railToggle { margin-left: auto; background: none; border: none; color: var(--muted);
+    cursor: pointer; font: 12px var(--mono); padding: 0 2px; line-height: 1; }
+  #railToggle:hover { color: var(--text); }
   #railNow { padding: 0 8px 6px; display: flex; flex-direction: column; gap: 4px; }
   #railLog { flex: 1; overflow-y: auto; padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 4px; }
   .act { border-radius: 6px; padding: 5px 7px; background: #0f141b; border: 1px solid #1c2128;
@@ -197,11 +256,26 @@
 
   /* composer */
   #composer {
-    position: fixed; left: 252px; right: 0; bottom: 0; z-index: 9; height: 96px;
+    position: fixed; left: var(--rail); right: 0; bottom: 0; z-index: 9; height: 96px;
     display: flex; gap: 10px; padding: 10px 14px; background: rgba(10,15,22,.96);
     border-top: 1px solid var(--border); backdrop-filter: blur(8px);
   }
   #composer .type { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  /* Docked: the same field, living at the bottom of the card it is replying to. */
+  #composer.docked {
+    position: relative; left: auto; right: auto; bottom: auto; top: auto;
+    height: auto; flex: none; padding: 8px 10px; gap: 8px;
+    background: #0f141b; border-top: 1px solid var(--border); backdrop-filter: none;
+  }
+  #composer.docked textarea { min-height: 54px; max-height: 150px; font-size: 13px; }
+  /* A narrow card cannot hold the field and the buttons side by side, so they stack: buttons
+     on the right of the first row, the chip and the field filling the second. */
+  #composer.docked { flex-wrap: wrap; }
+  #composer.docked .side { order: 1; flex: 1 1 100%; flex-direction: row;
+    justify-content: flex-end; align-items: center; gap: 8px; }
+  #composer.docked .type { order: 2; flex: 1 1 100%; }
+  #composer.docked .hintline { display: none; }
+  .card.replying .resize { display: none; }
   /* Floating above the composer, so attachments never squeeze the textarea. */
   #attachments { position: absolute; bottom: 100%; left: 14px; display: flex; gap: 6px; padding-bottom: 6px; }
   #attachments:empty { display: none; }
@@ -224,6 +298,16 @@
     border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
   #composer #send:disabled { opacity: .5; cursor: default; }
   #composer .hintline { color: var(--muted); font: 11px var(--mono); }
+  /* Which card the next message answers, shown above the box until it is sent or cleared. */
+  #replyChip { display: flex; align-items: center; gap: 6px; align-self: flex-start;
+    font: 11px var(--mono); color: #e3b341; background: rgba(210,153,34,.12);
+    border: 1px solid rgba(210,153,34,.4); border-radius: 999px; padding: 2px 4px 2px 9px;
+    max-width: 100%; }
+  #replyChip[hidden] { display: none; }
+  #replyChipText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #replyChip button { border: 0; background: transparent; color: #e3b341; cursor: pointer;
+    font: 12px var(--mono); line-height: 1; padding: 1px 4px; border-radius: 50%; }
+  #replyChip button:hover { background: rgba(210,153,34,.25); }
 
   /* sticky card */
   .sticky-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -260,13 +344,16 @@
 </header>
 
 <aside id="rail">
-  <div class="rail-head">activity <b id="railRunning"></b></div>
+  <div class="rail-head">activity <b id="railRunning"></b><button id="railToggle" title="hide the activity rail">«</button></div>
   <div id="railNow"></div>
   <div id="railLog"></div>
+  <div id="railGrip" title="drag to resize"></div>
 </aside>
+<button id="railOpen" title="show activity">activity <b id="railOpenCount"></b></button>
 
 <div id="composer">
   <div class="type">
+    <div id="replyChip" hidden><span id="replyChipText"></span><button id="replyChipClear" title="ask on the board instead of in this card">×</button></div>
     <div id="attachments"></div>
     <textarea id="msg" placeholder="message the agent…  (enter sends, shift+enter for a new line, paste an image to attach it)"></textarea>
   </div>

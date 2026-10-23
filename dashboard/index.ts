@@ -24,7 +24,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -62,12 +62,18 @@ function rememberBoard(cwd: string, port: number, token: string): void {
 		}
 		all[cwd] = { port, token };
 		mkdirSync(dirname(STATE_FILE), { recursive: true, mode: 0o700 });
-		writeFileSync(STATE_FILE, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+		// Two sessions start at once often enough that a half-written state file would lose
+		// both URLs, so the new version replaces the old one in a single step.
+		const temp = `${STATE_FILE}.${process.pid}.tmp`;
+		writeFileSync(temp, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+		renameSync(temp, STATE_FILE);
 	} catch {
 		// A board that cannot remember itself is still a working board.
 	}
 }
 const MAX_SOURCE_BYTES = 2_000_000;
+/** Pasted screenshots travel as base64 inside a message, so the body limit has to be generous. */
+const MAX_BODY_BYTES = 24 * 1024 * 1024;
 const ASK_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Where a card sits on the canvas. The server keeps it so a refresh and other tabs agree. */
@@ -84,6 +90,23 @@ interface CardBase {
 	title?: string;
 	at: number;
 	rect?: CardRect;
+	/** Folded down to its header. The rect keeps the real size, so restoring is exact. */
+	mini?: boolean;
+	/** Follow-up questions and their answers, oldest first. */
+	turns?: Turn[];
+}
+
+/**
+ * One follow-up exchange about a card. The question lives in the card it belongs to, so the
+ * thread travels with whatever it is about instead of filling the canvas with reply cards.
+ */
+interface Turn {
+	text: string;
+	status: "queued" | "sent" | "answered" | "stopped";
+	mode: "queue" | "steer";
+	images?: number;
+	reply?: string;
+	at: number;
 }
 
 interface NoteCard extends CardBase {
@@ -180,12 +203,28 @@ let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
 /** Set by the extension so the HTTP handler can hand a board message to the session. */
 type InboundImage = { data: string; mimeType: string };
-let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[]) => Promise<void> = async () => {};
-/** Stickies waiting for an answer, oldest first, so replies land on the right question. */
-const awaitingStickies: string[] = [];
+let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[], preamble: string) => Promise<void> =
+	async () => {};
+
+/**
+ * An exchange waiting for its answer. Turn -1 is the sticky's own message; anything else is a
+ * follow-up stored in the card's `turns`. Keeping the queue in arrival order is what makes a
+ * reply land in the right thread when several are waiting.
+ */
+type Pending = { cardId: string; turn: number };
+const awaitingTurns: Pending[] = [];
+
+/** What the session is sent for one exchange: the words and the context they refer to. */
+type Outgoing = Pending & { text: string; images: InboundImage[]; mode: "queue" | "steer"; preamble: string };
 
 /** Messages accepted but not yet handed to the session, oldest first. */
-const outbox: { id: string; text: string; images: InboundImage[] }[] = [];
+const outbox: Outgoing[] = [];
+/** Sends already accepted, so a retried POST does not deliver the same message twice. */
+const recentSends = new Map<string, Pending>();
+function rememberSend(sendId: string, receipt: Pending): void {
+	recentSends.set(sendId, receipt);
+	if (recentSends.size > 100) recentSends.delete(recentSends.keys().next().value as string);
+}
 let pumping = false;
 
 const BOARD_PROMPT = [
@@ -198,7 +237,8 @@ const BOARD_PROMPT = [
 	"A question with a short answer gets no artefacts at all. Answer, and stop.",
 	"Keep a card current by passing the same key again: a todo list grows, a source card refreshes after an edit.",
 	"When a decision is genuinely the user's, ask with board_ask instead of guessing; it blocks until they click.",
-	"Your transcript reply stays a couple of lines, because the substance belongs on the cards.",
+	"Your transcript reply is not where the user reads. Write nothing there beyond the answer itself: no preamble, no plan, no 'let me check', no account of what you changed, no restatement of a card. Everything else belongs on a card.",
+	'A card the user closed comes back with the answer on it, so never mention a card being missing.',
 ].join("\n");
 
 const totals = { tokensIn: 0, tokensOut: 0, cost: 0 };
@@ -589,18 +629,108 @@ function pushMeta(): void {
 	broadcast(board, { type: "meta", meta: board.meta });
 }
 
-/** Hand one message to the session and keep the sticky showing what happened to it. */
-async function sendNow(sticky: StickyCard, text: string, images: InboundImage[], mode: "queue" | "steer"): Promise<void> {
-	try {
-		await deliver(text, mode, images);
-		sticky.status = "sent";
-	} catch {
-		sticky.status = "answered";
-		sticky.reply = "could not deliver this message";
-		const at = awaitingStickies.indexOf(sticky.id);
-		if (at >= 0) awaitingStickies.splice(at, 1);
+/**
+ * A follow-up is a question about one card, so the session is told which card and given a short
+ * quote. The quote is capped because the conversation already holds the rest: repeating it would
+ * pay twice for the same words and would not survive the cache that a plain append keeps.
+ */
+function replyContext(card: Card): string {
+	// A sticky's title is just "you", so its own words name it instead.
+	const title =
+		card.type === "sticky"
+			? card.text.replace(/\s+/g, " ").trim().slice(0, 60)
+			: (card.title ?? (card.type === "source" ? card.path : card.type));
+	// A source card points at a place in a file, so the quote is those lines. The first five
+	// hundred characters of the file say nothing about the line the user is asking about.
+	if (card.type === "source") {
+		const lines = card.content.split("\n");
+		const focus = Math.max(1, Math.min(card.line ?? 1, lines.length));
+		const from = Math.max(1, focus - 8);
+		const to = Math.min(lines.length, focus + 12);
+		const numbered = lines
+			.slice(from - 1, to)
+			.map((line, index) => `${from + index}| ${line}`)
+			.join("\n")
+			.slice(0, 500);
+		return `[board reply · card ${card.id} · "${title}"]\nThe card shows ${card.path}, lines ${from}-${to}:\n${numbered || "(empty)"}\n\n`;
 	}
-	if (board) broadcast(board, { type: "update", card: sticky });
+	const body = (() => {
+		switch (card.type) {
+			case "note":
+				return card.markdown;
+			case "question":
+				return [card.question, card.answer ?? ""].join("\n");
+			case "sticky":
+				return [card.text, card.reply ?? "", ...(card.turns ?? []).flatMap((turn) => [turn.text, turn.reply ?? ""])].join("\n");
+		}
+	})();
+	const quote = body.replace(/\s+/g, " ").trim().slice(0, 500);
+	return `[board reply · card ${card.id} · "${title}"]\nThe card says: ${quote || "(empty)"}\n\n`;
+}
+
+/** A closed card that still has an answer coming, kept whole so it can come back where it was. */
+const closedCards = new Map<string, Card>();
+
+/**
+ * Point one exchange at a new state and keep the card the user is watching current. Returns
+ * false when the card is gone, which is what lets the caller keep the answer instead of losing it.
+ */
+function setPending(pending: Pending, status: Turn["status"], reply?: string): boolean {
+	const card = board?.cards.find((candidate) => candidate.id === pending.cardId);
+	if (!card) return false;
+	if (pending.turn < 0) {
+		if (card.type !== "sticky") return false;
+		card.status = status;
+		if (reply !== undefined) card.reply = reply;
+	} else {
+		const turn = card.turns?.[pending.turn];
+		if (!turn) return false;
+		turn.status = status;
+		if (reply !== undefined) turn.reply = reply;
+	}
+	if (board) broadcast(board, { type: "update", card });
+	return true;
+}
+
+/**
+ * The card was closed while its answer was being written. The answer belongs on that card, so
+ * the card itself is put back: same id, same place, same thread, with the reply on it.
+ */
+function restoreClosedCard(cardId: string): void {
+	const target = board;
+	const closed = closedCards.get(cardId);
+	if (!target || !closed) return;
+	closedCards.delete(cardId);
+	if (target.cards.some((card) => card.id === cardId)) return;
+	target.cards.push(closed);
+	// Quiet: the user has seen this card before, so it comes back without a "new" tag.
+	broadcast(target, { type: "card", card: closed, quiet: true });
+}
+
+/**
+ * Drop a closed card's queued messages, but keep an exchange that already reached the session:
+ * its answer is still coming and has nowhere else to land.
+ */
+function forgetCard(cardId: string): void {
+	for (let index = outbox.length - 1; index >= 0; index -= 1) {
+		if (outbox[index].cardId === cardId) outbox.splice(index, 1);
+	}
+}
+
+/** True while some exchange is waiting for the answer being written now. */
+function awaitingAnswer(cardId: string): boolean {
+	return awaitingTurns.some((pending) => pending.cardId === cardId);
+}
+
+/** Hand one exchange to the session and keep its card showing what happened to it. */
+async function sendNow(job: Outgoing): Promise<void> {
+	const pending: Pending = { cardId: job.cardId, turn: job.turn };
+	try {
+		await deliver(job.text, job.mode, job.images, job.preamble);
+		setPending(pending, "sent");
+	} catch {
+		setPending(pending, "answered", "could not deliver this message");
+	}
 }
 
 /** Send the oldest waiting message once the session is free. */
@@ -610,10 +740,10 @@ async function pumpOutbox(): Promise<void> {
 	try {
 		const next = outbox.shift();
 		if (!next) return;
-		const sticky = board.cards.find((card) => card.id === next.id);
-		if (!sticky || sticky.type !== "sticky") return; // closed while waiting
-		awaitingStickies.push(sticky.id);
-		await sendNow(sticky, next.text, next.images, "queue");
+		const card = board.cards.find((candidate) => candidate.id === next.cardId);
+		if (!card) return; // closed while waiting
+		awaitingTurns.push({ cardId: next.cardId, turn: next.turn });
+		await sendNow(next);
 	} finally {
 		pumping = false;
 	}
@@ -625,7 +755,15 @@ function urlFor(target: Board): string {
 
 function broadcast(target: Board, message: unknown): void {
 	const payload = `data: ${JSON.stringify(message)}\n\n`;
-	for (const client of target.clients) client.write(payload);
+	for (const client of target.clients) {
+		// A tab that closed or reloaded is still in the list for a moment. Writing to its dead
+		// socket would raise an error nobody is listening for.
+		if (client.writableEnded || client.destroyed) {
+			target.clients.delete(client);
+			continue;
+		}
+		client.write(payload);
+	}
 }
 
 /** Insert or replace by key, so a repeated key refreshes the existing card. */
@@ -635,6 +773,10 @@ function upsert(target: Board, card: Card): boolean {
 		const previous = target.cards[existing];
 		card.id = previous.id; // keep identity stable so the browser updates in place
 		card.rect = previous.rect; // and keep the place the user put it
+		// The card was refreshed, not replaced: the conversation hanging off it belongs to the
+		// user and survives the rewrite.
+		card.turns = previous.turns;
+		card.mini = previous.mini;
 		target.cards[existing] = card;
 		broadcast(target, { type: "update", card });
 		return false;
@@ -656,20 +798,47 @@ function serveStatic(res: ServerResponse, file: string, type: string): void {
 	}
 }
 
-function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+/**
+ * Read a request body up to a limit. The old version destroyed the socket once the body
+ * passed 64 KB, which reaches the browser as a connection reset with no explanation, and a
+ * pasted screenshot is several times that size. Oversized bodies are refused instead.
+ */
+function readBody(req: import("node:http").IncomingMessage, limit = MAX_BODY_BYTES): Promise<string | undefined> {
 	return new Promise((done) => {
-		let body = "";
-		req.on("data", (chunk) => {
-			body += chunk;
-			if (body.length > 64 * 1024) req.destroy();
+		const chunks: Buffer[] = [];
+		let size = 0;
+		let oversized = false;
+		req.on("data", (chunk: Buffer) => {
+			size += chunk.length;
+			if (size > limit) oversized = true;
+			else chunks.push(chunk);
 		});
-		req.on("end", () => done(body));
+		req.on("end", () => done(oversized ? undefined : Buffer.concat(chunks).toString("utf8")));
+		req.on("error", () => done(undefined));
 	});
+}
+
+/** Read and parse a JSON body, answering 400 or 413 itself and returning nothing. */
+async function readJson<T>(req: import("node:http").IncomingMessage, res: ServerResponse): Promise<T | undefined> {
+	const body = await readBody(req);
+	if (body === undefined) {
+		res.writeHead(413, { "Content-Type": "text/plain" });
+		res.end("body too large");
+		return undefined;
+	}
+	try {
+		return JSON.parse(body) as T;
+	} catch {
+		res.writeHead(400, { "Content-Type": "text/plain" });
+		res.end("bad json");
+		return undefined;
+	}
 }
 
 function startBoard(): Board {
 	const remembered = readRemembered(process.cwd());
-	const token = remembered.token ?? randomBytes(16).toString("hex");
+	const freshToken = () => randomBytes(16).toString("hex");
+	let token = remembered.token ?? freshToken();
 	const clients = new Set<ServerResponse>();
 	const cards: Card[] = [];
 	const activity: ActivityRow[] = [];
@@ -687,7 +856,10 @@ function startBoard(): Board {
 				return;
 			}
 			if (url.searchParams.get("token") !== token) {
-				res.writeHead(403, { "Content-Type": "text/plain" });
+				// A refused POST has to have its body taken off the wire, otherwise the client's next
+				// request rides the same socket into the leftovers and reads as a reset.
+				req.resume();
+				res.writeHead(403, { "Content-Type": "text/plain", Connection: "close" });
 				res.end("forbidden");
 				return;
 			}
@@ -707,59 +879,105 @@ function startBoard(): Board {
 				);
 				clients.add(res);
 				const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20_000);
-				req.on("close", () => {
+				const forget = () => {
 					clearInterval(keepAlive);
 					clients.delete(res);
-				});
+				};
+				req.on("close", forget);
+				res.on("error", forget);
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/message") {
-				if (url.searchParams.get("token") !== token) {
-					res.writeHead(403, { "Content-Type": "text/plain" });
-					res.end("bad token");
-					return;
-				}
-				const body = await readBody(req);
-				let payload: { text?: string; mode?: string; images?: { data?: string; mimeType?: string }[] } = {};
-				try {
-					payload = JSON.parse(body) as { text?: string; mode?: string; images?: { data?: string; mimeType?: string }[] };
-				} catch {
-					res.writeHead(400, { "Content-Type": "text/plain" });
-					res.end("bad json");
+				const payload = await readJson<{
+					id?: string;
+					cardId?: string;
+					text?: string;
+					mode?: string;
+					images?: { data?: string; mimeType?: string }[];
+				}>(req, res);
+				if (!payload) return;
+				// A send that lost its answer may be retried, so the browser tags it. The same tag
+				// twice means the message already exists and must not be delivered again.
+				const sendId = typeof payload.id === "string" ? payload.id.slice(0, 64) : "";
+				const accepted = sendId ? recentSends.get(sendId) : undefined;
+				if (accepted) {
+					res.writeHead(200, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ ...accepted, duplicate: true }));
 					return;
 				}
 				const text = (payload.text ?? "").trim();
-				if (!text) {
-					res.writeHead(400, { "Content-Type": "text/plain" });
-					res.end("empty message");
-					return;
-				}
 				const images = (payload.images ?? [])
 					.filter((image) => typeof image.data === "string" && /^image\//.test(image.mimeType ?? ""))
 					.slice(0, 4)
 					.map((image) => ({ data: image.data as string, mimeType: image.mimeType as string }));
+				// A pasted screenshot on its own is a message too, so empty text is allowed when
+				// an image carries the question.
+				if (!text && images.length === 0) {
+					res.writeHead(400, { "Content-Type": "text/plain" });
+					res.end("empty message");
+					return;
+				}
 				const mode = payload.mode === "steer" ? "steer" : "queue";
-				const sticky: StickyCard = {
-					id: nextId(),
-					type: "sticky",
-					text: text.slice(0, 4000),
-					status: "queued",
-					mode,
-					images: images.length,
-					title: "you",
-					at: Date.now(),
-				};
-				cards.push(sticky);
-				broadcast(board ?? ({ clients } as Board), { type: "card", card: sticky });
+
+				// A message with a card behind it is a follow-up and lands in that card's thread;
+				// one without a card is a new message and becomes a sticky.
+				const parent = payload.cardId ? cards.find((candidate) => candidate.id === payload.cardId) : undefined;
+				if (payload.cardId && !parent) {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end("no such card");
+					return;
+				}
+
+				let job: Outgoing;
+				if (parent) {
+					// The preamble describes the card as it was asked, so the new question is not
+					// quoted back at the agent along with the rest of the thread.
+					const preamble = replyContext(parent);
+					const turns = parent.turns ?? [];
+					turns.push({
+						text: text.slice(0, 4000),
+						status: "queued",
+						mode,
+						at: Date.now(),
+						...(images.length ? { images: images.length } : {}),
+					});
+					parent.turns = turns;
+					broadcast(board ?? ({ clients } as Board), { type: "update", card: parent });
+					job = {
+						cardId: parent.id,
+						turn: turns.length - 1,
+						text,
+						images,
+						mode,
+						preamble,
+					};
+				} else {
+					const sticky: StickyCard = {
+						id: nextId(),
+						type: "sticky",
+						text: text.slice(0, 4000),
+						status: "queued",
+						mode,
+						images: images.length,
+						title: "you",
+						at: Date.now(),
+					};
+					cards.push(sticky);
+					broadcast(board ?? ({ clients } as Board), { type: "card", card: sticky });
+					job = { cardId: sticky.id, turn: -1, text, images, mode, preamble: "" };
+				}
+
+				const receipt = JSON.stringify({ id: job.cardId, turn: job.turn });
+				if (sendId) rememberSend(sendId, { id: job.cardId, turn: job.turn });
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ id: sticky.id }));
+				res.end(receipt);
 				if (mode === "steer") {
-					awaitingStickies.push(sticky.id);
-					void sendNow(sticky, text, images, "steer");
+					awaitingTurns.push({ cardId: job.cardId, turn: job.turn });
+					void sendNow(job);
 				} else {
 					// Queued messages wait here rather than in pi's own queue, so closing the card
 					// can take the message back before the agent ever sees it.
-					outbox.push({ id: sticky.id, text, images });
+					outbox.push(job);
 					void pumpOutbox();
 				}
 				return;
@@ -779,15 +997,8 @@ function startBoard(): Board {
 			if (req.method === "POST" && url.pathname === "/layout") {
 				// The browser owns placement; the server only remembers it. Storing it means a
 				// closed card frees its space and a refresh reproduces the board exactly.
-				const body = await readBody(req);
-				let payload: { cardId?: string; rect?: Partial<CardRect> } = {};
-				try {
-					payload = JSON.parse(body) as { cardId?: string; rect?: Partial<CardRect> };
-				} catch {
-					res.writeHead(400, { "Content-Type": "text/plain" });
-					res.end("bad json");
-					return;
-				}
+				const payload = await readJson<{ cardId?: string; rect?: Partial<CardRect>; mini?: unknown }>(req, res);
+				if (!payload) return;
 				const card = cards.find((candidate) => candidate.id === payload.cardId);
 				const rect = payload.rect;
 				if (!card || !rect) {
@@ -798,7 +1009,13 @@ function startBoard(): Board {
 				const clamp = (value: unknown) =>
 					Math.max(0, Math.min(40000, Math.round(Number.isFinite(Number(value)) ? Number(value) : 0)));
 				card.rect = { x: clamp(rect.x), y: clamp(rect.y), w: clamp(rect.w), h: clamp(rect.h) };
-				broadcast(board ?? ({ clients } as Board), { type: "move", id: card.id, rect: card.rect });
+				if (typeof payload.mini === "boolean") card.mini = payload.mini;
+				broadcast(board ?? ({ clients } as Board), {
+					type: "move",
+					id: card.id,
+					rect: card.rect,
+					mini: card.mini === true,
+				});
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ placed: card.id }));
 				return;
@@ -806,15 +1023,8 @@ function startBoard(): Board {
 			if (req.method === "POST" && url.pathname === "/edit") {
 				// The user owns the words in a note. A later board_note with the same key still
 				// wins, which is the agent's way of refreshing its own card.
-				const body = await readBody(req);
-				let payload: { cardId?: string; markdown?: string } = {};
-				try {
-					payload = JSON.parse(body) as { cardId?: string; markdown?: string };
-				} catch {
-					res.writeHead(400, { "Content-Type": "text/plain" });
-					res.end("bad json");
-					return;
-				}
+				const payload = await readJson<{ cardId?: string; markdown?: string }>(req, res);
+				if (!payload) return;
 				const card = cards.find((candidate) => candidate.id === payload.cardId);
 				if (!card || card.type !== "note") {
 					res.writeHead(409, { "Content-Type": "text/plain" });
@@ -828,15 +1038,8 @@ function startBoard(): Board {
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/close") {
-				const body = await readBody(req);
-				let payload: { cardId?: string } = {};
-				try {
-					payload = JSON.parse(body) as { cardId?: string };
-				} catch {
-					res.writeHead(400, { "Content-Type": "text/plain" });
-					res.end("bad json");
-					return;
-				}
+				const payload = await readJson<{ cardId?: string }>(req, res);
+				if (!payload) return;
 				const at = cards.findIndex((candidate) => candidate.id === payload.cardId);
 				if (at < 0) {
 					res.writeHead(404, { "Content-Type": "text/plain" });
@@ -846,26 +1049,19 @@ function startBoard(): Board {
 				// A closed card leaves the board for good; only a later update with the same key
 				// brings it back, and then it arrives as a fresh card.
 				const [closed] = cards.splice(at, 1);
-				const waiting = awaitingStickies.indexOf(closed.id);
-				if (waiting >= 0) awaitingStickies.splice(waiting, 1);
-				// Closing a message that has not been handed over yet cancels it outright.
-				const queued = outbox.findIndex((item) => item.id === closed.id);
-				if (queued >= 0) outbox.splice(queued, 1);
+				// Closing a message that has not been handed over yet cancels it outright. An
+				// exchange already inside the session still has an answer coming, so the card is
+				// kept aside and put back when that answer arrives.
+				forgetCard(closed.id);
+				if (awaitingAnswer(closed.id)) closedCards.set(closed.id, closed);
 				broadcast(board ?? ({ clients } as Board), { type: "remove", id: closed.id });
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ closed: closed.id }));
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/answer") {
-				const body = await readBody(req);
-				let payload: { cardId?: string; answer?: string } = {};
-				try {
-					payload = JSON.parse(body) as { cardId?: string; answer?: string };
-				} catch {
-					res.writeHead(400, { "Content-Type": "text/plain" });
-					res.end("bad json");
-					return;
-				}
+				const payload = await readJson<{ cardId?: string; answer?: string }>(req, res);
+				if (!payload) return;
 				const card = cards.find((candidate) => candidate.id === payload.cardId);
 				if (!card || card.type !== "question" || card.status !== "open") {
 					res.writeHead(409, { "Content-Type": "text/plain" });
@@ -884,8 +1080,19 @@ function startBoard(): Board {
 			}
 			res.writeHead(404, { "Content-Type": "text/plain" });
 			res.end("not found");
-		})();
+		})().catch((error: unknown) => {
+			// A handler that throws used to leave the request unanswered, which the browser shows
+			// as a reset. Answer something and keep the board serving.
+			if (process.env.PI_BOARD_DEBUG === "1") console.error("[board]", error);
+			if (!res.headersSent) res.writeHead(500, { "Content-Type": "text/plain" });
+			res.end("board error");
+		});
 	});
+
+	// Chromium happily reuses a socket for minutes while Node closes an idle one after five
+	// seconds, so a send that lands in that gap fails as a reset. Meeting halfway avoids it.
+	server.keepAliveTimeout = 65_000;
+	server.headersTimeout = 70_000;
 
 	const created: Board = { server, token, port: 0, clients, cards, meta: EMPTY_META, activity };
 
@@ -898,6 +1105,10 @@ function startBoard(): Board {
 	};
 	server.on("error", () => {
 		server.close();
+		// The remembered port belongs to another live board now, so the remembered token is no
+		// longer ours: a tab still holding it would get a 403 from whoever answers there.
+		token = freshToken();
+		created.token = token;
 		if (candidate < lastPort) {
 			candidate += 1;
 			attempt();
@@ -920,8 +1131,9 @@ function ensureBoard(): Board {
 	return board;
 }
 
-/** Tools answer politely instead of resurrecting a board the user switched off. */
+/** Tools that answer politely instead of resurrecting a board the user switched off. */
 const OFF_MESSAGE = "The board is off. Turn it on with /board on.";
+const BOARD_TOOLS = new Set(["board_note", "board_source", "board_ask", "board_clear"]);
 
 function boardForTool(): Board | undefined {
 	return enabled ? ensureBoard() : undefined;
@@ -1203,15 +1415,16 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	});
 
 	// The composer hands messages straight to the session: a steer lands mid-run, a queue
-	// waits for the agent to finish what it is doing.
-	deliver = async (text, mode, images) => {
+	// waits for the agent to finish what it is doing. A follow-up carries the card it is about.
+	deliver = async (text, mode, images, preamble) => {
+		const words = preamble ? `${preamble}${text}` : text;
 		// An image pasted into the composer reaches the agent as an image part, exactly as if
 		// it had been pasted into the terminal.
 		const content =
 			images.length === 0
-				? text
+				? words
 				: [
-						{ type: "text" as const, text },
+						{ type: "text" as const, text: words },
 						...images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
 					];
 		await pi.sendUserMessage(content, { deliverAs: mode === "steer" ? "steer" : "followUp" });
@@ -1276,6 +1489,92 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		callArgs.delete(event.toolCallId);
 	});
 
+	// A delegate run lasts minutes and ends in a report the user reads. The rail can only show one
+	// line of it, so the run gets a card that states where it is and then holds the outcome.
+	interface DelegateRun {
+		role: string;
+		task: string;
+		tools: string[];
+		toolCount: number;
+		fileCount: number;
+		cost: number;
+		startedAt: number;
+		status?: string;
+		summary?: string;
+	}
+	const delegateRuns = new Map<string, DelegateRun>();
+
+	const elapsed = (ms: number): string => {
+		const total = Math.max(0, Math.round(ms / 1000));
+		if (total < 60) return `${total}s`;
+		const minutes = Math.floor(total / 60);
+		if (minutes < 60) return `${minutes}m ${total % 60}s`;
+		return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+	};
+
+	function delegateMarkdown(run: DelegateRun, durationMs: number): string {
+		const finished = run.status && run.status !== "running";
+		const facts = [
+			`**${finished ? run.status : "running"}** · ${elapsed(durationMs)}`,
+			`${run.toolCount} tool${run.toolCount === 1 ? "" : "s"}`,
+			run.fileCount ? `${run.fileCount} file${run.fileCount === 1 ? "" : "s"} changed` : "",
+			run.cost > 0 ? `$${run.cost.toFixed(2)}` : "",
+		].filter(Boolean);
+		// The task's first line is the assignment; the rest is detail the card has no room for.
+		const brief = (run.task.split("\n")[0] ?? "").replace(/\s+/g, " ").trim();
+		const shown = brief.length > 160 ? `${brief.slice(0, 157)}…` : brief;
+		const lines = [facts.join(" · "), "", `> ${shown}`];
+		if (finished && run.summary) lines.push("", run.summary);
+		if (run.tools.length) lines.push("", ...run.tools.slice(-6).map((tool) => `- \`${tool}\``));
+		return lines.join("\n");
+	}
+
+	pi.events.on("delegate:progress", (data) => {
+		const event = data as {
+			toolCallId?: string;
+			role?: string;
+			task?: string;
+			tools?: string[];
+			toolCount?: number;
+			fileCount?: number;
+			cost?: number;
+			durationMs?: number;
+			status?: string;
+			summary?: string;
+		};
+		const target = board;
+		if (!target || !event.toolCallId) return;
+		const run = delegateRuns.get(event.toolCallId) ?? {
+			role: event.role ?? "delegate",
+			task: event.task ?? "",
+			tools: [],
+			toolCount: 0,
+			fileCount: 0,
+			cost: 0,
+			startedAt: Date.now() - (event.durationMs ?? 0),
+		};
+		run.tools = event.tools ?? run.tools;
+		run.toolCount = event.toolCount ?? run.toolCount;
+		run.fileCount = event.fileCount ?? run.fileCount;
+		run.cost = event.cost ?? run.cost;
+		if (event.status) run.status = event.status;
+		if (event.summary) run.summary = event.summary;
+		delegateRuns.set(event.toolCallId, run);
+		// A long session can run hundreds of these; the card is what matters, not the memory.
+		if (delegateRuns.size > 40) {
+			const oldest = delegateRuns.keys().next().value;
+			if (oldest) delegateRuns.delete(oldest);
+		}
+		upsert(target, {
+			id: nextId(),
+			type: "note",
+			key: `delegate-${event.toolCallId}`,
+			title: `delegate · ${run.role}`,
+			markdown: delegateMarkdown(run, event.durationMs ?? Date.now() - run.startedAt),
+			at: run.startedAt,
+		});
+	});
+
 	// A finished turn closes with its answer text, which is what keeps the console closed.
 	pi.on("turn_end", async (event) => {
 		if (!board) return;
@@ -1290,12 +1589,12 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			startedAt: Date.now(),
 			text: text.slice(0, 4000),
 		});
-		const waitingId = awaitingStickies.shift();
-		const sticky = waitingId ? board.cards.find((card) => card.id === waitingId) : undefined;
-		if (sticky && sticky.type === "sticky") {
-			sticky.status = "answered";
-			sticky.reply = text.slice(0, 4000);
-			broadcast(board, { type: "update", card: sticky });
+		const waiting = awaitingTurns.shift();
+		if (waiting) {
+			// A card closed mid-run comes back holding the answer, rather than the answer landing
+			// on a new card the user never asked for.
+			restoreClosedCard(waiting.cardId);
+			setPending(waiting, "answered", text.slice(0, 4000));
 			// The answer belongs in the sticky. A note that copied it is noise, so it goes.
 			for (const note of turnNotes.splice(0)) {
 				if (!repeatsAnswer(note.text, text)) continue;
@@ -1339,7 +1638,8 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		currentCtx = ctx;
 		running = true;
 		pushMeta();
-		if (board && ctx.mode === "tui") {
+		const live = Boolean(enabled && board) && ctx.mode === "tui";
+		if (live) {
 			pushMeta();
 			event.systemPromptOptions.sections.dashboard = BOARD_PROMPT;
 			if (event.messageType === "user") {
@@ -1347,6 +1647,12 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			}
 		} else {
 			delete event.systemPromptOptions.sections.dashboard;
+			// With no board there is nothing to draw on, so the model is not offered the tools
+			// and never has to discover that they are a dead end.
+			const tools = event.systemPromptOptions.selectedTools;
+			if (Array.isArray(tools)) {
+				event.systemPromptOptions.selectedTools = tools.filter((name) => !BOARD_TOOLS.has(name));
+			}
 		}
 	});
 
@@ -1363,12 +1669,12 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 				}
 			}
 			if (event.aborted) {
-				const waitingId = awaitingStickies.shift();
-				const sticky = waitingId ? board.cards.find((card) => card.id === waitingId) : undefined;
-				if (sticky && sticky.type === "sticky") {
-					sticky.status = "stopped";
-					sticky.reply = "stopped before this answer arrived";
-					broadcast(board, { type: "update", card: sticky });
+				const waiting = awaitingTurns.shift();
+				// A stopped run answers nothing, so a remembered question has no use left.
+				if (waiting) {
+					if (!setPending(waiting, "stopped", "stopped before this answer arrived")) {
+						closedCards.delete(waiting.cardId);
+					}
 				}
 			}
 		}
