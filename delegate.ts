@@ -507,6 +507,37 @@ export default function delegateExtension(pi: ExtensionAPI) {
       const changedFiles = new Set<string>();
       const completedTools: string[] = [];
       const pendingTools = new Map<string, { name: string; args: Record<string, unknown> }>();
+      const runStartedAt = Date.now();
+      // The board shows the run as a card, so it needs the shape of the work as it happens. Once
+      // every five seconds is enough for a human to follow and cheap enough to ignore.
+      const PROGRESS_MS = 5000;
+      let progressTimer: NodeJS.Timeout | undefined;
+      let lastProgressAt = 0;
+      const emitProgress = (extra: Record<string, unknown> = {}) => {
+        lastProgressAt = Date.now();
+        pi.events.emit("delegate:progress", {
+          toolCallId,
+          role,
+          task: mainTask.slice(0, 240),
+          tools: completedTools.slice(-8),
+          toolCount: completedTools.length,
+          changedFiles: [...changedFiles].slice(-8),
+          fileCount: changedFiles.size,
+          turns,
+          cost: usage.cost.total,
+          durationMs: Date.now() - runStartedAt,
+          ...extra,
+        });
+      };
+      const scheduleProgress = () => {
+        if (progressTimer) return;
+        const wait = Math.max(0, PROGRESS_MS - (Date.now() - lastProgressAt));
+        progressTimer = setTimeout(() => {
+          progressTimer = undefined;
+          emitProgress();
+        }, wait);
+        progressTimer.unref();
+      };
       let turns = 0;
       let latestText = "";
       let stderr = "";
@@ -520,6 +551,8 @@ export default function delegateExtension(pi: ExtensionAPI) {
       let spawnError: Error | undefined;
       let proc: ChildProcess | undefined;
       let forceKillTimer: NodeJS.Timeout | undefined;
+      // Show the card as soon as the run starts, before the first tool call lands.
+      emitProgress();
       let emitTimer: NodeJS.Timeout | undefined;
       let continueRetriesUsed = 0;
       let summaryRetriesUsed = 0;
@@ -641,6 +674,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
             const file = String(tool.args.path ?? tool.args.file_path ?? "");
             if (file) changedFiles.add(file);
           }
+          scheduleProgress();
           scheduleUpdate();
         }
       };
@@ -792,6 +826,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
       }
 
       if (emitTimer) clearTimeout(emitTimer);
+      if (progressTimer) clearTimeout(progressTimer);
+      // One last tick carries the outcome, so the card settles on the result instead of on the
+      // last tool it happened to run.
+      emitProgress({ status, summary: latestText.slice(0, 800) });
 
       const details = makeDetails(status, exitCode);
       const progress = [
