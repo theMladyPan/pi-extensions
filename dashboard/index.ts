@@ -31,6 +31,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { spawn } from "node:child_process";
 
 const PUBLIC_DIR = fileURLToPath(new URL("./public/", import.meta.url));
 const PREFERRED_PORT = Number(process.env.PI_BOARD_PORT ?? 7374);
@@ -240,6 +241,26 @@ function announceBoard(target: Board, ctx?: ExtensionContext): void {
 	else target.server.once("listening", show);
 }
 
+/** Opening the board is a desktop convenience, so a headless box just skips it. */
+function openInBrowser(target: Board): void {
+	const opener =
+		process.env.PI_BOARD_OPENER ??
+		(process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer" : "xdg-open");
+	try {
+		const child = spawn(opener, [urlFor(target)], { detached: true, stdio: "ignore" });
+		child.on("error", () => undefined);
+		child.unref();
+	} catch {
+		// No browser on this machine; the printed URL is still enough.
+	}
+}
+
+/** Run once the port is really bound, which can happen after the fallback bind. */
+function whenListening(target: Board, run: () => void): void {
+	if (target.port) run();
+	else target.server.once("listening", run);
+}
+
 function stopBoard(): void {
 	if (!board) return;
 	for (const client of board.clients) client.end();
@@ -426,6 +447,24 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	pi.registerTool(askTool);
 	pi.registerTool(clearTool);
 
+	// alt+d is already pi's delete-word-forward, so the board takes alt+o for "open".
+	pi.registerShortcut("alt+o", {
+		description: "Toggle the board, opening it in the browser when switched on",
+		handler: async (ctx) => {
+			currentCtx = ctx;
+			if (enabled) {
+				enabled = false;
+				stopBoard();
+				ctx.ui.notify("Board off", "info");
+				return;
+			}
+			enabled = true;
+			const target = ensureBoard();
+			announceBoard(target, ctx);
+			whenListening(target, () => openInBrowser(target));
+		},
+	});
+
 	pi.registerCommand("board", {
 		description: "Show the board URL: /board [on|off|clear]",
 		handler: async (args, ctx) => {
@@ -439,7 +478,9 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			}
 			if (verb === "on") {
 				enabled = true;
-				announceBoard(ensureBoard(), ctx);
+				const target = ensureBoard();
+				announceBoard(target, ctx);
+				whenListening(target, () => openInBrowser(target));
 				return;
 			}
 			if (verb === "clear") {
