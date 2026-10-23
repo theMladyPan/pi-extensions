@@ -68,13 +68,37 @@ interface QuestionCard extends CardBase {
 
 type Card = NoteCard | SourceCard | QuestionCard;
 
+/** What the header shows: which session this board belongs to and what it has spent. */
+interface BoardMeta {
+	folder: string;
+	cwd: string;
+	port: number;
+	model: string;
+	tokensIn: number;
+	tokensOut: number;
+	cost: number;
+	contextPercent: number | null;
+}
+
 interface Board {
 	server: Server;
 	token: string;
 	port: number;
 	clients: Set<ServerResponse>;
 	cards: Card[];
+	meta: BoardMeta;
 }
+
+const EMPTY_META: BoardMeta = {
+	folder: "",
+	cwd: "",
+	port: 0,
+	model: "",
+	tokensIn: 0,
+	tokensOut: 0,
+	cost: 0,
+	contextPercent: null,
+};
 
 let board: Board | undefined;
 let currentCtx: ExtensionContext | undefined;
@@ -90,6 +114,39 @@ const BOARD_PROMPT = [
 	"Inside a note, a fenced svg block renders as a picture and a fenced block renders as monospace text; use them for diagrams, palettes, graphs and file trees.",
 	"Your normal reply still goes to the transcript: keep it to a few lines, because the substance belongs on the board.",
 ].join("\n");
+
+const totals = { tokensIn: 0, tokensOut: 0, cost: 0 };
+
+/** Fold a finished assistant message into the running totals the header reports. */
+function addUsage(message: { usage?: { input?: number; output?: number; cost?: { total?: number } } }): boolean {
+	const usage = message.usage;
+	if (!usage) return false;
+	totals.tokensIn += usage.input ?? 0;
+	totals.tokensOut += usage.output ?? 0;
+	totals.cost += usage.cost?.total ?? 0;
+	return true;
+}
+
+function currentMeta(target: Board): BoardMeta {
+	const cwd = currentCtx?.cwd ?? process.cwd();
+	const model = currentCtx?.model;
+	return {
+		folder: cwd.split("/").filter(Boolean).pop() ?? cwd,
+		cwd,
+		port: target.port,
+		model: model ? `${model.id}` : "",
+		tokensIn: totals.tokensIn,
+		tokensOut: totals.tokensOut,
+		cost: totals.cost,
+		contextPercent: currentCtx?.getContextUsage()?.percent ?? null,
+	};
+}
+
+function pushMeta(): void {
+	if (!board) return;
+	board.meta = currentMeta(board);
+	broadcast(board, { type: "meta", meta: board.meta });
+}
 
 function urlFor(target: Board): string {
 	return `http://127.0.0.1:${target.port}/?token=${target.token}`;
@@ -165,7 +222,9 @@ function startBoard(): Board {
 					"Cache-Control": "no-store",
 					Connection: "keep-alive",
 				});
-				res.write(`data: ${JSON.stringify({ type: "snapshot", cards })}\n\n`);
+				res.write(
+					`data: ${JSON.stringify({ type: "snapshot", cards, meta: currentMeta(board ?? ({ port: 0 } as Board)) })}\n\n`,
+				);
 				clients.add(res);
 				const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20_000);
 				req.on("close", () => {
@@ -205,16 +264,27 @@ function startBoard(): Board {
 		})();
 	});
 
-	const created: Board = { server, token, port: 0, clients, cards };
-	// The listen error arrives asynchronously, so port 0 is the fallback rather than a try/catch.
+	const created: Board = { server, token, port: 0, clients, cards, meta: EMPTY_META };
+
+	// Parallel sessions each need their own board, so walk upward from the preferred port
+	// before giving up on a predictable number and letting the kernel pick one.
+	let candidate = PREFERRED_PORT;
+	const attempt = () => {
+		server.listen(candidate, "127.0.0.1");
+	};
 	server.on("error", () => {
 		server.close();
+		if (candidate < PREFERRED_PORT + 20) {
+			candidate += 1;
+			attempt();
+			return;
+		}
 		server.listen(0, "127.0.0.1");
 	});
 	server.on("listening", () => {
 		created.port = (server.address() as { port: number }).port;
 	});
-	server.listen(PREFERRED_PORT, "127.0.0.1");
+	attempt();
 	return created;
 }
 
@@ -507,15 +577,30 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		upsert(board, { id: nextId(), type: "note", title: "spoken", markdown: line, at: Date.now() });
 	});
 
+	// The header is the user's only view of the session, so keep it current on every turn.
+	pi.on("message_end", async (event) => {
+		if (event.message.role === "assistant" && addUsage(event.message as { usage?: { input?: number; output?: number; cost?: { total?: number } } })) {
+			pushMeta();
+		}
+	});
+
+	pi.on("model_select", async () => {
+		pushMeta();
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		// Only the interactive session owns a port; print and subagent runs stay headless.
-		if (enabled && ctx.mode === "tui") announceBoard(ensureBoard(), ctx);
+		if (enabled && ctx.mode === "tui") {
+			announceBoard(ensureBoard(), ctx);
+			pushMeta();
+		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		currentCtx = ctx;
 		if (board && ctx.mode === "tui") {
+			pushMeta();
 			event.systemPromptOptions.sections.dashboard = BOARD_PROMPT;
 			if (event.messageType === "user") {
 				return { message: { customType: "dashboard-reminder", content: BOARD_PROMPT, display: false } };

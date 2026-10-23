@@ -131,6 +131,12 @@
   header .live.down { color: var(--red); }
   header .live.down b { background: var(--red); box-shadow: 0 0 0 3px rgba(248,81,73,.15); }
   header .hint { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header .sess { font: 12px var(--mono); color: var(--text); }
+  header .sess b { color: var(--accent); font-weight: 600; }
+  header .stat { font: 11px var(--mono); color: var(--muted); background: #161b22;
+    border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
+  header .stat:empty { display: none; }
+  header .stat em { color: var(--text); font-style: normal; }
   header .grow { flex: 1; }
   header button { font: 11px var(--mono); color: var(--muted); background: #161b22;
     border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; cursor: pointer; }
@@ -141,10 +147,14 @@
 </head>
 <body>
 <header>
-  <span class="brand">pi board</span>
+  <span class="brand" title="wheel: zoom · drag background: pan · drag header: move · corner: resize">pi</span>
+  <span class="sess" id="sess"></span>
   <span class="live" id="live"><b></b> <span id="liveText">connecting</span></span>
-  <span class="hint">wheel: zoom · drag background: pan · drag header: move · corner: resize</span>
   <span class="grow"></span>
+  <span class="stat" id="statModel"></span>
+  <span class="stat" id="statTokens"></span>
+  <span class="stat" id="statCost"></span>
+  <span class="stat" id="statCtx"></span>
   <button id="newPill" style="display:none">0 new</button>
   <button id="tidy">tidy</button>
   <button id="fit">fit all</button>

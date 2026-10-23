@@ -586,6 +586,39 @@
   });
 
   // ---------- transport ----------------------------------------------------
+  // ---------- session header -----------------------------------------------
+  const shortNum = (value) => {
+    if (value >= 1e6) return `${(value / 1e6).toFixed(1)}m`;
+    if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
+    return String(value);
+  };
+
+  function applyMeta(meta) {
+    if (!meta) return;
+    const folder = meta.folder || "session";
+    const sess = document.getElementById("sess");
+    sess.innerHTML = "";
+    sess.append("board of ");
+    const name = document.createElement("b");
+    name.textContent = folder;
+    sess.append(name);
+    sess.title = `${meta.cwd || folder} · port ${meta.port}`;
+    document.title = `pi - ${folder}`;
+    const model = document.getElementById("statModel");
+    if (meta.model) {
+      model.innerHTML = `<em>${meta.model.split("/").pop()}</em>`;
+      model.title = meta.model;
+    } else {
+      model.innerHTML = "";
+    }
+    document.getElementById("statTokens").innerHTML =
+      meta.tokensIn || meta.tokensOut ? `↑${shortNum(meta.tokensIn)} ↓${shortNum(meta.tokensOut)}` : "";
+    document.getElementById("statCost").innerHTML =
+      meta.cost > 0 ? `$${meta.cost < 0.01 ? meta.cost.toFixed(4) : meta.cost.toFixed(3)}` : "";
+    document.getElementById("statCtx").innerHTML =
+      typeof meta.contextPercent === "number" ? `ctx ${Math.round(meta.contextPercent)}%` : "";
+  }
+
   function setLive(up) {
     live.classList.toggle("down", !up);
     liveText.textContent = up ? "connected" : "reconnecting";
@@ -602,7 +635,10 @@
       } catch {
         return;
       }
-      if (payload.type === "snapshot") {
+      if (payload.type === "meta") {
+        applyMeta(payload.meta);
+      } else if (payload.type === "snapshot") {
+        applyMeta(payload.meta);
         clearBoard();
         for (const card of payload.cards || []) applyMessage(card);
         sawFirstCard = (payload.cards || []).length > 0;
