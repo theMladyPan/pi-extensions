@@ -70,7 +70,7 @@ interface QuestionCard extends CardBase {
 interface StickyCard extends CardBase {
 	type: "sticky";
 	text: string;
-	status: "queued" | "sent" | "answered";
+	status: "queued" | "sent" | "answered" | "stopped";
 	mode: "queue" | "steer";
 	reply?: string;
 }
@@ -100,6 +100,8 @@ interface BoardMeta {
 	tokensOut: number;
 	cost: number;
 	contextPercent: number | null;
+	/** True while the agent is working, so the board can offer a stop button. */
+	running: boolean;
 }
 
 interface Board {
@@ -121,10 +123,14 @@ const EMPTY_META: BoardMeta = {
 	tokensOut: 0,
 	cost: 0,
 	contextPercent: null,
+	running: false,
 };
 
 let board: Board | undefined;
 let currentCtx: ExtensionContext | undefined;
+/** Whether a run is in flight. `agent_end` can be followed by more work, so this clears
+ *  only when the whole run settles. */
+let running = false;
 let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
 /** Set by the extension so the HTTP handler can hand a board message to the session. */
@@ -218,6 +224,7 @@ function currentMeta(target: Board): BoardMeta {
 		tokensOut: totals.tokensOut,
 		cost: totals.cost,
 		contextPercent: currentCtx?.getContextUsage()?.percent ?? null,
+		running,
 	};
 }
 
@@ -364,6 +371,18 @@ function startBoard(): Board {
 						sticky.reply = "could not deliver this message";
 						broadcast(board ?? ({ clients } as Board), { type: "update", card: sticky });
 					});
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/stop") {
+				// Stop is the same interrupt as Escape, so nothing is left half-run.
+				if (!running || !currentCtx) {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end("no run in progress");
+					return;
+				}
+				currentCtx.abort();
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ stopped: true }));
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/answer") {
@@ -784,6 +803,8 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		currentCtx = ctx;
+		running = true;
+		pushMeta();
 		if (board && ctx.mode === "tui") {
 			pushMeta();
 			event.systemPromptOptions.sections.dashboard = BOARD_PROMPT;
@@ -793,6 +814,31 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		} else {
 			delete event.systemPromptOptions.sections.dashboard;
 		}
+	});
+
+	// A stopped run leaves rows spinning in the rail, so close them and tell the sticky
+	// that asked what happened to it.
+	pi.on("agent_settled", async (event) => {
+		running = false;
+		if (board) {
+			for (const row of board.activity) {
+				if (row.kind === "tool" && row.status === "running") {
+					row.status = "error";
+					row.summary = "stopped";
+					broadcast(board, { type: "activity", row });
+				}
+			}
+			if (event.aborted) {
+				const waitingId = awaitingStickies.shift();
+				const sticky = waitingId ? board.cards.find((card) => card.id === waitingId) : undefined;
+				if (sticky && sticky.type === "sticky") {
+					sticky.status = "stopped";
+					sticky.reply = "stopped before this answer arrived";
+					broadcast(board, { type: "update", card: sticky });
+				}
+			}
+		}
+		pushMeta();
 	});
 
 	pi.on("session_shutdown", async () => {

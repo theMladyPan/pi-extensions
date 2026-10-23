@@ -345,9 +345,11 @@
     status.textContent =
       data.status === "answered"
         ? "answered"
-        : data.status === "sent"
-          ? "delivered"
-          : `queued · ${data.mode === "steer" ? "steer" : "queue"}`;
+        : data.status === "stopped"
+          ? "stopped"
+          : data.status === "sent"
+            ? "delivered"
+            : `queued · ${data.mode === "steer" ? "steer" : "queue"}`;
     holder.appendChild(status);
     if (data.reply) {
       const reply = el("div", "sticky-reply note-body");
@@ -593,25 +595,14 @@
 
   // ---------- view ---------------------------------------------------------
   /**
-   * Ctrl (or Cmd) plus wheel zooms around the pointer; a plain wheel pans the board.
-   * Keeping zoom behind the modifier stops an accidental scroll from losing the layout.
+   * Ctrl (or Cmd) plus wheel zooms around the pointer. A plain wheel is left alone so the
+   * browser scrolls whatever sits under the cursor: a card's body, a code view, the rail.
+   * Panning the board is drag-only, because a stray scroll should never move the layout.
    */
-  function wheelIntent(event) {
-    if (event.ctrlKey || event.metaKey) return { kind: "zoom", factor: Math.exp(-event.deltaY * 0.0015) };
-    const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1;
-    return { kind: "pan", dx: -event.deltaX * scale, dy: -event.deltaY * scale };
-  }
-
   viewport.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey && !event.metaKey) return;
     event.preventDefault();
-    const intent = wheelIntent(event);
-    if (intent.kind === "pan") {
-      view.x += intent.dx;
-      view.y += intent.dy;
-      applyView();
-      return;
-    }
-    const k = Math.min(3, Math.max(0.25, view.k * intent.factor));
+    const k = Math.min(3, Math.max(0.25, view.k * Math.exp(-event.deltaY * 0.0015)));
     const rect = viewport.getBoundingClientRect();
     const px = event.clientX - rect.left;
     const py = event.clientY - rect.top;
@@ -677,6 +668,7 @@
   });
 
   // ---------- activity rail ------------------------------------------------
+  const stopBtn = document.getElementById("stop");
   const railNow = document.getElementById("railNow");
   const railLog = document.getElementById("railLog");
   const railRunning = document.getElementById("railRunning");
@@ -764,6 +756,18 @@
   }
 
   sendBtn.addEventListener("click", () => void sendMessage());
+
+  // Stop asks the server to abort the run, then waits for meta to confirm it settled.
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.disabled = true;
+    stopBtn.textContent = "stopping…";
+    try {
+      await fetch(`/stop?token=${encodeURIComponent(token)}`, { method: "POST" });
+    } catch {
+      stopBtn.disabled = false;
+      stopBtn.textContent = "stop";
+    }
+  });
   msgBox.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -781,6 +785,12 @@
 
   function applyMeta(meta) {
     if (!meta) return;
+    // The stop button exists only while there is something to stop.
+    stopBtn.style.display = meta.running ? "" : "none";
+    if (!meta.running) {
+      stopBtn.disabled = false;
+      stopBtn.textContent = "stop";
+    }
     const folder = meta.folder || "session";
     const sess = document.getElementById("sess");
     sess.innerHTML = "";
