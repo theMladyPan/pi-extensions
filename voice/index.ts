@@ -512,6 +512,8 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	let active = false;
 	let muted = false;
 	let wrapUpEnabled = process.env.PI_VOICE_WRAP !== "0";
+	// The dashboard extension is independent; when both run, notes spoken on the board are read aloud too.
+	let mirrorBoardNotes = process.env.PI_VOICE_BOARD !== "0";
 	let lang: Lang = LANGS[initialLang] ? initialLang : "en";
 	const voice = DEFAULT_VOICE;
 
@@ -610,11 +612,29 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		if (!answer) return;
 		const short = toSpeakable(answer, WRAP_MAX_CHARS);
 		const spoken = answer.length <= WRAP_MAX_CHARS ? short : await summarizeForSpeech(answer, lang);
-		if (spoken && active) enqueueSentence(spoken, "wrap");
+		if (spoken && active) {
+			enqueueSentence(spoken, "wrap");
+			// The ear must not hear anything the eye cannot see: echo the spoken line to the console
+			// and to the board, so a condensed summary never reads as a contradiction.
+			if (ctx.hasUI) ctx.ui.notify(`🔊 ${spoken}`, "info");
+			pi.events.emit("voice:spoken", { text: spoken });
+		}
+	};
+
+	// A board note and the agent's breadcrumb often carry the same sentence; speak it once.
+	const recentlySpoken = new Map<string, number>();
+	const isRepeat = (text: string) => {
+		const key = text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 120);
+		const now = Date.now();
+		for (const [seen, at] of recentlySpoken) if (now - at > 60_000) recentlySpoken.delete(seen);
+		if (recentlySpoken.has(key)) return true;
+		recentlySpoken.set(key, now);
+		return false;
 	};
 
 	const enqueueSentence = (sentence: string, kind: "breadcrumb" | "wrap" = "breadcrumb") => {
 		if (!active) return;
+		if (isRepeat(sentence)) return;
 		if (VOICE_LOG) {
 			try {
 				appendFileSync(VOICE_LOG, `${new Date().toISOString()} ${kind}: ${sentence}\n`);
@@ -847,7 +867,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("voice", {
-		description: "Toggle live voice mode: /voice [on|off|mute|unmute|lang en|lang sk|wrap on|off|say <text>]",
+		description: "Toggle live voice mode: /voice [on|off|mute|unmute|lang en|lang sk|wrap on|off|board on|off|say <text>]",
 		handler: async (args, ctx) => {
 			activeCtx = ctx;
 			const [verb = "", value = ""] = args.trim().toLowerCase().split(/\s+/);
@@ -870,6 +890,9 @@ export default function voiceExtension(pi: ExtensionAPI) {
 				}
 				activeCtx = ctx;
 				enqueueSentence(toSpeakable(text, WRAP_MAX_CHARS), "wrap");
+			} else if (verb === "board") {
+				mirrorBoardNotes = value !== "off";
+				ctx.ui.notify(`Reading board notes aloud ${mirrorBoardNotes ? "on" : "off"}`, "info");
 			} else if (verb === "wrap") {
 				wrapUpEnabled = value !== "off";
 				if (!wrapUpEnabled) stopSpeech();
@@ -878,6 +901,14 @@ export default function voiceExtension(pi: ExtensionAPI) {
 				setActive(ctx, !active);
 			}
 		},
+	});
+
+	// Composition with the dashboard extension: a note put on the board is also spoken.
+	pi.events.on("board:note", (data) => {
+		if (!active || !mirrorBoardNotes) return;
+		const note = data as { title?: string; text?: string };
+		const spoken = toSpeakable(note.text ?? "", WRAP_MAX_CHARS);
+		if (spoken) enqueueSentence(spoken, "wrap");
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
