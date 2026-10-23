@@ -9,8 +9,9 @@
   const liveText = document.getElementById("liveText");
   const token = new URLSearchParams(location.search).get("token") || "";
 
-  const LINE_HEIGHT = 18;
-  const GUTTER = 52;
+  // Kept in step with the code font size in index.html: 13px text, 20px rows.
+  const LINE_HEIGHT = 20;
+  const GUTTER = 56;
   const view = { x: 0, y: 0, k: 1 };
   const cards = [];
   const byId = new Map();
@@ -43,7 +44,7 @@
     };
     const prose = "the quick brown fox jumps over a lazy dog, then writes another long line of ordinary prose";
     charWidths = {
-      mono: probe(`12px ${cssVar("--mono")}`, "M".repeat(100)),
+      mono: probe(`13px ${cssVar("--mono")}`, "M".repeat(100)),
       prose: probe(getComputedStyle(document.body).font || "13px system-ui, sans-serif", prose),
     };
     return charWidths;
@@ -236,7 +237,7 @@
     const inner = el("div", "code-inner");
     const width = lines.reduce((max, line) => Math.max(max, line.length), 0);
     inner.style.height = `${lines.length * LINE_HEIGHT}px`;
-    inner.style.width = `${GUTTER + Math.min(width, 260) * 7.4 + 30}px`;
+    inner.style.width = `${GUTTER + Math.min(width, 260) * measureCharWidths().mono + 30}px`;
     scroll.appendChild(inner);
 
     let first = -1;
