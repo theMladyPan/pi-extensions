@@ -224,6 +224,154 @@ function repeatsAnswer(note: string, answer: string): boolean {
 	return longer.includes(shorter.slice(0, Math.min(shorter.length, 160)));
 }
 
+/**
+ * What a finished call turned out to mean, in a few words, worked out from the output. This
+ * lands the instant the tool returns; a cheaper model refines it a moment later.
+ */
+// Some shell results carry the exit code in the text, and it is machinery, not output.
+const EXIT_MARKER = /-{2,}\s*EXIT:?\s*(-?\d+)\s*-{2,}/i;
+const stripExitMarker = (value: string) => value.replace(/-{2,}\s*EXIT:?\s*-?\d+\s*-{2,}/gi, " ").trim();
+
+/** Whether a call went wrong, from its flag, its exit code, or plain words in its output. */
+function failedCall(isError: boolean, result: string): boolean {
+	const exit = result.match(EXIT_MARKER);
+	const text = stripExitMarker(result).toLowerCase();
+	// A failure can only show in the output: a chain like `ls && cat missing` still exits 0
+	// from the last command, while the text says plainly what went wrong.
+	const looksFailed = /no such file|enoent|permission denied|eacces|command not found|timed out/.test(text);
+	return isError || (exit ? Number(exit[1]) !== 0 : false) || looksFailed;
+}
+
+function toolOutcome(isError: boolean, result: string): string {
+	const text = stripExitMarker(result).toLowerCase();
+	if (failedCall(isError, result)) {
+		if (/permission denied|eacces/.test(text)) return "failed: permission denied";
+		if (/no such file|enoent/.test(text)) return "failed: missing file";
+		if (/command not found/.test(text)) return "failed: command missing";
+		if (/timed out|timeout/.test(text)) return "failed: timed out";
+		if (/outside the working directory/.test(text)) return "failed: outside the folder";
+		if (/not found/.test(text)) return "failed: nothing found";
+		return "failed";
+	}
+	const hits = result.split("\n").filter((line) => /^[^\s:]+:\d+:/.test(line));
+	if (hits.length > 0) {
+		const files = new Set(hits.map((line) => line.split(":")[0])).size;
+		return `found ${hits.length} in ${files} file${files === 1 ? "" : "s"}`;
+	}
+	const replaced = result.match(/replaced\s+(\d+)\s+block/i);
+	if (replaced) return `edited ${replaced[1]} block${replaced[1] === "1" ? "" : "s"}`;
+	return "";
+}
+
+/** A very small, very fast model turns the outcome into a phrase a person would say. */
+const ROW_MODEL = process.env.PI_BOARD_ROW_MODEL ?? "gemini-3.5-flash-lite";
+const ROW_MODEL_ENABLED = process.env.PI_BOARD_ROWS_MODEL !== "0" && Boolean(process.env.GEMINI_API_KEY);
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+
+const ROW_PROMPT = [
+	"You caption one line of a tool activity list. Answer with at most five words, lowercase, no final period, no quotes.",
+	"Say what the call did or what went wrong, using the concrete detail from the result.",
+	"",
+	"Input: tool rg, args -n TIMEOUT config/, ok. Result: config/settings.py:1:TIMEOUT = 30, config/app.yaml:2:  timeout: 30",
+	"OK: found timeout in 2 files",
+	"NOK: The search completed successfully and located the pattern.",
+	"",
+	"Input: tool read, args config/settings.py, error. Result: EACCES: permission denied, open 'config/settings.py'",
+	"OK: failed: permission denied",
+	"NOK: Error while reading the file.",
+	"",
+	"Input: tool bash, args npm test, error. Result: 3 tests failed, 41 passed",
+	"OK: 3 tests failed",
+	"NOK: The command exited with a non-zero status code, indicating failures.",
+	"",
+	"Input: tool edit, args src/main.py, ok. Result: replaced 2 blocks",
+	"OK: rewrote 2 blocks in main.py",
+	"NOK: Successfully applied the requested changes to the file.",
+	"",
+	"When the call failed, start the caption with failed: and name the cause.",
+].join("\n");
+
+type RowJob = { rowId: string; tool: string; args: string; result: string; isError: boolean; failed: boolean };
+const rowJobs: RowJob[] = [];
+/** Arguments by call id, so the end event can describe what the call was asked to do. */
+const callArgs = new Map<string, unknown>();
+let rowBusy = false;
+
+const cleanPhrase = (value: string): string =>
+	value
+		.replace(/[*_`"]/g, "")
+		.replace(/\s+/g, " ")
+		.replace(/[.]$/, "")
+		.trim()
+		.toLowerCase()
+		.split(/\s+/)
+		.slice(0, 6)
+		.join(" ")
+		.slice(0, 48);
+
+async function phraseRow(job: RowJob): Promise<string | undefined> {
+	const body = {
+		systemInstruction: { parts: [{ text: ROW_PROMPT }] },
+		contents: [
+			{
+				role: "user",
+				parts: [
+					{
+						text: `Input: tool ${job.tool}, args ${job.args.slice(0, 300)}, ${job.isError ? "error" : "ok"}. Result: ${job.result.slice(0, 900)}`,
+					},
+				],
+			},
+		],
+		generationConfig: { temperature: 0.2, maxOutputTokens: 64 },
+	};
+	const response = await fetch(`${GEMINI_BASE}/models/${ROW_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(4000),
+	});
+	if (!response.ok) return undefined;
+	const payload = (await response.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+	const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join(" ") ?? "";
+	const phrase = cleanPhrase(text);
+	return phrase.length > 2 ? phrase : undefined;
+}
+
+/** One request at a time, and only a short backlog, so the rail never waits on the model. */
+async function drainRowJobs(): Promise<void> {
+	if (rowBusy) return;
+	rowBusy = true;
+	try {
+		while (rowJobs.length > 0) {
+			const job = rowJobs.shift();
+			if (!job || !board) continue;
+			const phrase = await phraseRow(job).catch(() => undefined);
+			if (!phrase || !board) continue;
+			// A call that failed is captioned as a failure, whatever the model chose to
+			// highlight, so the row never reads as a success it did not have.
+			const caption = job.failed && !/^failed\b/i.test(phrase) ? `failed: ${phrase}`.slice(0, 56) : phrase;
+			patchActivity(board, job.rowId, job.failed ? { label: caption, status: "error" } : { label: caption });
+		}
+	} finally {
+		rowBusy = false;
+	}
+}
+
+function queueRowLabel(
+	rowId: string,
+	tool: string,
+	args: unknown,
+	result: string,
+	isError: boolean,
+	failed = isError,
+): void {
+	if (!ROW_MODEL_ENABLED) return;
+	if (rowJobs.length > 8) rowJobs.shift();
+	const flatArgs = args && typeof args === "object" ? JSON.stringify(args).slice(0, 400) : String(args ?? "");
+	rowJobs.push({ rowId, tool, args: flatArgs, result, isError, failed });
+	void drainRowJobs();
+}
+
 const MAX_ACTIVITY = 300;
 /** Which argument of a tool call names the thing the user cares about. */
 const TARGET_KEYS = ["path", "file_path", "filePath", "command", "pattern", "query", "url", "target", "cmd"];
@@ -345,6 +493,16 @@ function toolTarget(args: unknown): string {
 }
 
 /** First line of a tool result, so a row says something without being opened. */
+function resultText(result: unknown): string {
+	if (typeof result === "string") return result;
+	const content = (result as { content?: unknown })?.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part) => (part as { type?: string }).type === "text")
+		.map((part) => String((part as { text?: string }).text ?? ""))
+		.join("\n");
+}
+
 function resultSummary(result: unknown): string {
 	const text = (() => {
 		if (typeof result === "string") return result;
@@ -1048,6 +1206,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_start", async (event) => {
+		callArgs.set(event.toolCallId, event.args);
 		if (!board) return;
 		pushActivity(board, {
 			id: event.toolCallId,
@@ -1062,11 +1221,33 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("tool_execution_end", async (event) => {
 		if (!board) return;
+		const result = resultText(event.result);
+		if (process.env.PI_BOARD_DEBUG === "1") {
+			try {
+				writeFileSync("/tmp/board-tool-result.json", JSON.stringify({ tool: event.toolName, isError: event.isError, text: result }, null, 2));
+			} catch {
+				// debug only
+			}
+		}
+		// The exit marker is machinery, not output, so it never reaches the row.
+		const shown = { content: [{ type: "text", text: stripExitMarker(result) }] };
+		const failed = failedCall(event.isError, result);
 		patchActivity(board, event.toolCallId, {
-			status: event.isError ? "error" : "ok",
+			status: failed ? "error" : "ok",
 			durationMs: event.durationMs,
-			summary: resultSummary(event.result),
+			summary: resultSummary(shown),
 		});
+		// The outcome phrase lands immediately, then the cheap model may sharpen it.
+		const outcome = toolOutcome(event.isError, result);
+		if (outcome) {
+			patchActivity(
+				board,
+				event.toolCallId,
+				outcome.startsWith("failed") ? { label: outcome, status: "error" } : { label: outcome },
+			);
+		}
+		queueRowLabel(event.toolCallId, event.toolName, callArgs.get(event.toolCallId), result, event.isError, failed);
+		callArgs.delete(event.toolCallId);
 	});
 
 	// A finished turn closes with its answer text, which is what keeps the console closed.
