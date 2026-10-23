@@ -97,6 +97,15 @@
   .note-body li { margin: 1px 0; }
   .note-body .tick { color: var(--green); }
   .note-body a { color: var(--accent); text-decoration: none; }
+  .note-body a.xref, .sticky-reply a.xref { color: #79c0ff; border-bottom: 1px dotted rgba(121,192,255,.6);
+    cursor: pointer; }
+  .note-body a.xref:hover, .sticky-reply a.xref:hover { color: #a5d6ff; border-bottom-style: solid; }
+  /* A referenced card rings once so the eye finds it after the jump. */
+  .card.flash { animation: flashRing 1.2s ease-out; }
+  @keyframes flashRing {
+    0% { box-shadow: 0 0 0 2px rgba(88,166,255,.9), 0 8px 24px rgba(1,4,9,.5); }
+    100% { box-shadow: 0 0 0 14px rgba(88,166,255,0), 0 8px 24px rgba(1,4,9,.5); }
+  }
   .note-body hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
 
   /* virtualized code view */

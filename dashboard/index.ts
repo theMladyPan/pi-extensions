@@ -143,6 +143,7 @@ const BOARD_PROMPT = [
 	"A message from the board arrives as a sticky card and your final answer is attached under it automatically. Never repeat that answer in a note, and never restate it in a second card.",
 	"Post a note only for what the sticky cannot carry: a diagram (a fenced ```svg block), a palette, a file tree (a fenced block), a table, or a list you will keep updating.",
 	"Open source cards with board_source whenever you point at code or config, one card per spot, so the user reads the real lines instead of a description of them.",
+	"Refer to another card with [[key]], using the key you gave board_note or board_source, and optionally [[key|text to show]]. The user clicks it and the board centres on that card, so link instead of describing where something lives.",
 	"While you work, short breadcrumb notes are welcome: one line, past tense, no summary of the answer.",
 	"A question with a short answer gets no artefacts at all. Answer, and stop.",
 	"Keep a card current by passing the same key again: a todo list grows, a source card refreshes after an edit.",

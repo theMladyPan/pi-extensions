@@ -139,6 +139,18 @@
   // ---------- markdown -----------------------------------------------------
   function inlineMd(text) {
     let out = escapeHtml(text);
+    // Cross-references jump to another card, but a key inside inline code stays literal.
+    out = out
+      .split(/(`[^`]+`)/)
+      .map((piece) =>
+        piece.startsWith("`")
+          ? piece
+          : piece.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, key, label) => {
+              const name = key.trim();
+              return `<a class="xref" href="#" data-key="${name}" title="jump to ${name}">${(label || name).trim()}</a>`;
+            }),
+      )
+      .join("");
     out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
     out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     out = out.replace(/(^|\W)\*([^*]+)\*/g, "$1<em>$2</em>");
@@ -652,6 +664,42 @@
    * browser scrolls whatever sits under the cursor: a card's body, a code view, the rail.
    * Panning the board is drag-only, because a stray scroll should never move the layout.
    */
+  /** Centre the view on a card and ring it, so a reference lands where it points. */
+  function centerOn(record) {
+    const card = record.card;
+    const width = viewport.clientWidth;
+    const height = viewport.clientHeight;
+    const x = parseFloat(card.style.left) + card.offsetWidth / 2;
+    const y = parseFloat(card.style.top) + card.offsetHeight / 2;
+    const fits = Math.min(width / (card.offsetWidth + 80), height / (card.offsetHeight + 80));
+    view.k = Math.min(view.k, Math.max(0.3, fits));
+    view.x = width / 2 - x * view.k;
+    view.y = height / 2 - y * view.k;
+    applyView();
+    card.classList.add("flash");
+    setTimeout(() => card.classList.remove("flash"), 1400);
+    cards.forEach((c) => c.classList.toggle("active", c === card));
+  }
+
+  /** Follow a [[key]] reference: by key first, then by card title. */
+  function jumpToKey(key) {
+    const wanted = key.toLowerCase();
+    for (const record of byId.values()) {
+      if (record.data.key && record.data.key.toLowerCase() === wanted) return centerOn(record);
+    }
+    for (const record of byId.values()) {
+      const title = record.titleEl.textContent.trim().toLowerCase();
+      if (title && title === wanted) return centerOn(record);
+    }
+  }
+
+  viewport.addEventListener("click", (event) => {
+    const link = event.target.closest(".xref");
+    if (!link) return;
+    event.preventDefault();
+    jumpToKey(link.dataset.key);
+  });
+
   viewport.addEventListener("wheel", (event) => {
     if (!event.ctrlKey && !event.metaKey) return;
     event.preventDefault();
