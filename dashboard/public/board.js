@@ -382,6 +382,7 @@
     card.style.cssText = `left:${spot.x}px; top:${spot.y}px; width:${width}px; height:${height}px; z-index:${z++}`;
     card.dataset.rect = JSON.stringify(spot);
     card.dataset.kind = kind;
+    card.dataset.id = data.id;
 
     const head = el("div", "head");
     head.innerHTML = `
@@ -469,6 +470,9 @@
       const move = (ev) => {
         card.style.width = `${Math.max(240, ow + (ev.clientX - sx) / view.k)}px`;
         card.style.height = `${Math.max(120, oh + (ev.clientY - sy) / view.k)}px`;
+        // A size the user chose wins over growing to fit later answers.
+        card.dataset.sized = "user";
+        card.classList.remove("auto-height");
       };
       const up = () => {
         removeEventListener("pointermove", move);
@@ -501,6 +505,42 @@
     const { node, cls } = bodyFor(data, entry);
     entry.body.className = cls ? `body ${cls}` : "body";
     entry.body.replaceChildren(node);
+    growSticky(entry, data);
+    renumberQueue();
+  }
+
+  /**
+   * An answered sticky holds the question and the reply, so it grows to fit them instead of
+   * hiding the answer behind an inner scrollbar. Height stays put once the user resizes it.
+   */
+  function growSticky(entry, data) {
+    if (data.type !== "sticky" || !data.reply || entry.card.dataset.sized === "user") return;
+    // Letting the card size itself beats guessing pixels: no inner scrollbar, no clipping.
+    entry.card.classList.add("auto-height");
+  }
+
+  /**
+   * Pending messages read as next, 2nd, 3rd in the order they will be answered, and the
+   * labels shift up as each one is dealt with.
+   */
+  function ordinalPosition(position) {
+    if (position === 1) return "next";
+    const suffix = ["th", "st", "nd", "rd"];
+    const rest = position % 100;
+    return `${position}${suffix[(rest - 20) % 10] || suffix[rest] || suffix[0]}`;
+  }
+
+  function renumberQueue() {
+    let position = 0;
+    for (const card of cards) {
+      const record = byId.get(card.dataset.id);
+      if (!record || record.data.type !== "sticky") continue;
+      if (record.data.status === "answered" || record.data.status === "stopped") continue;
+      position += 1;
+      record.chipEl.textContent = ordinalPosition(position);
+      record.chipEl.classList.add("queue-pos");
+      record.chipEl.style.display = "";
+    }
   }
 
   function applyMessage(data) {
@@ -541,6 +581,7 @@
     if (at >= 0) cards.splice(at, 1);
     byId.delete(record.id);
     releaseSpot(record.card);
+    renumberQueue();
     recomputePill();
     updateEmpty();
   }

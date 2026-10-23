@@ -139,16 +139,39 @@ let deliver: (text: string, mode: "queue" | "steer") => Promise<void> = async ()
 const awaitingStickies: string[] = [];
 
 const BOARD_PROMPT = [
-	"[DASHBOARD MODE: the user watches a visual board, so put your narration there instead of in prose]",
-	"Send every breadcrumb, finding and summary the user should read through board_note, one note per step, short and conversational.",
-	"Open the file you are talking about with board_source and pass the line you mean, so the user sees it without hunting.",
-	"Keep a card updated by passing the same key again: a todo list grows, a status note changes, a source card refreshes after you edit the file.",
+	"[DASHBOARD MODE: the user watches a visual board instead of the terminal]",
+	"A message from the board arrives as a sticky card and your final answer is attached under it automatically. Never repeat that answer in a note, and never restate it in a second card.",
+	"Post a note only for what the sticky cannot carry: a diagram (a fenced ```svg block), a palette, a file tree (a fenced block), a table, or a list you will keep updating.",
+	"Open source cards with board_source whenever you point at code or config, one card per spot, so the user reads the real lines instead of a description of them.",
+	"While you work, short breadcrumb notes are welcome: one line, past tense, no summary of the answer.",
+	"A question with a short answer gets no artefacts at all. Answer, and stop.",
+	"Keep a card current by passing the same key again: a todo list grows, a source card refreshes after an edit.",
 	"When a decision is genuinely the user's, ask with board_ask instead of guessing; it blocks until they click.",
-	"Inside a note, a fenced svg block renders as a picture and a fenced block renders as monospace text; use them for diagrams, palettes, graphs and file trees.",
-	"Your normal reply still goes to the transcript: keep it to a few lines, because the substance belongs on the board.",
+	"Your transcript reply stays a couple of lines, because the substance belongs on the cards.",
 ].join("\n");
 
 const totals = { tokensIn: 0, tokensOut: 0, cost: 0 };
+
+/** Notes posted during the current turn, so one that repeats the answer can be dropped. */
+const turnNotes: { id: string; text: string }[] = [];
+
+const flatText = (value: string) =>
+	value
+		.toLowerCase()
+		.replace(/[`*#>_[\]()]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+
+/** True when a note only says what the answer already says. Artefacts never count. */
+function repeatsAnswer(note: string, answer: string): boolean {
+	if (note.includes("```")) return false;
+	const left = flatText(note);
+	const right = flatText(answer);
+	if (left.length < 40 || right.length < 40) return false;
+	const shorter = left.length <= right.length ? left : right;
+	const longer = shorter === left ? right : left;
+	return longer.includes(shorter.slice(0, Math.min(shorter.length, 160)));
+}
 
 const MAX_ACTIVITY = 300;
 /** Which argument of a tool call names the thing the user cares about. */
@@ -244,18 +267,19 @@ function broadcast(target: Board, message: unknown): void {
 }
 
 /** Insert or replace by key, so a repeated key refreshes the existing card. */
-function upsert(target: Board, card: Card): void {
+function upsert(target: Board, card: Card): boolean {
 	const existing = card.key ? target.cards.findIndex((candidate) => candidate.key === card.key) : -1;
 	if (existing >= 0) {
 		const previous = target.cards[existing];
 		card.id = previous.id; // keep identity stable so the browser updates in place
 		target.cards[existing] = card;
 		broadcast(target, { type: "update", card });
-		return;
+		return false;
 	}
 	target.cards.push(card);
 	if (target.cards.length > 200) target.cards.shift();
 	broadcast(target, { type: "card", card });
+	return true;
 }
 
 function serveStatic(res: ServerResponse, file: string, type: string): void {
@@ -557,7 +581,7 @@ const noteTool = defineTool({
 			markdown: params.markdown,
 			at: Date.now(),
 		};
-		upsert(target, card);
+		if (upsert(target, card)) turnNotes.push({ id: card.id, text: params.markdown });
 		emit("board:note", { title: params.title, text: params.markdown });
 		return {
 			content: [
@@ -763,6 +787,10 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	// Every tool call becomes a row in the activity rail, so the board shows the work
 	// instead of the terminal scrolling past it.
+	pi.on("turn_start", async () => {
+		turnNotes.length = 0;
+	});
+
 	pi.on("tool_execution_start", async (event) => {
 		if (!board) return;
 		pushActivity(board, {
@@ -804,6 +832,22 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			sticky.status = "answered";
 			sticky.reply = text.slice(0, 4000);
 			broadcast(board, { type: "update", card: sticky });
+			// The answer belongs in the sticky. A note that copied it is noise, so it goes.
+			for (const note of turnNotes.splice(0)) {
+				if (!repeatsAnswer(note.text, text)) continue;
+				const index = board.cards.findIndex((card) => card.id === note.id);
+				if (index < 0) continue;
+				const [dropped] = board.cards.splice(index, 1);
+				broadcast(board, { type: "remove", id: dropped.id });
+				pushActivity(board, {
+					id: nextId(),
+					kind: "tool",
+					tool: "board_note",
+					status: "ok",
+					startedAt: Date.now(),
+					summary: "dropped a note that repeated the answer",
+				});
+			}
 		}
 	});
 

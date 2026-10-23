@@ -44,6 +44,8 @@
     box-shadow: 0 8px 24px rgba(1, 4, 9, .5); min-width: 220px; min-height: 120px;
   }
   .card.active { border-color: var(--accent-dim); box-shadow: 0 12px 32px rgba(31, 111, 235, .25); }
+  /* An answered question grows to hold its reply, up to a readable limit. */
+  .card.auto-height { height: auto !important; min-height: 160px; max-height: 620px; }
   .card.fresh { border-color: var(--accent); animation: freshPulse 1.8s ease-in-out 2; }
   @keyframes freshPulse {
     0%, 100% { box-shadow: 0 8px 24px rgba(1, 4, 9, .5); }
@@ -72,6 +74,7 @@
   .sticky-status.stopped { color: #f85149; }
   .chip { font: 11px var(--mono); color: var(--accent); background: rgba(88,166,255,.1);
     border: 1px solid rgba(88,166,255,.25); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+  .chip.queue-pos { color: #d29922; background: rgba(210,153,34,.12); border-color: rgba(210,153,34,.35); }
   .close { border: 0; background: transparent; color: var(--muted); font-size: 15px;
     line-height: 1; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
   .close:hover { background: #21262d; color: var(--text); }
