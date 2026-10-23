@@ -80,6 +80,8 @@ interface StickyCard extends CardBase {
 	type: "sticky";
 	text: string;
 	status: "queued" | "sent" | "answered" | "stopped";
+	/** How many images the message carried. */
+	images?: number;
 	mode: "queue" | "steer";
 	reply?: string;
 }
@@ -143,7 +145,8 @@ let running = false;
 let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
 /** Set by the extension so the HTTP handler can hand a board message to the session. */
-let deliver: (text: string, mode: "queue" | "steer") => Promise<void> = async () => {};
+type InboundImage = { data: string; mimeType: string };
+let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[]) => Promise<void> = async () => {};
 /** Stickies waiting for an answer, oldest first, so replies land on the right question. */
 const awaitingStickies: string[] = [];
 
@@ -367,9 +370,9 @@ function startBoard(): Board {
 					return;
 				}
 				const body = await readBody(req);
-				let payload: { text?: string; mode?: string } = {};
+				let payload: { text?: string; mode?: string; images?: { data?: string; mimeType?: string }[] } = {};
 				try {
-					payload = JSON.parse(body) as { text?: string; mode?: string };
+					payload = JSON.parse(body) as { text?: string; mode?: string; images?: { data?: string; mimeType?: string }[] };
 				} catch {
 					res.writeHead(400, { "Content-Type": "text/plain" });
 					res.end("bad json");
@@ -381,6 +384,10 @@ function startBoard(): Board {
 					res.end("empty message");
 					return;
 				}
+				const images = (payload.images ?? [])
+					.filter((image) => typeof image.data === "string" && /^image\//.test(image.mimeType ?? ""))
+					.slice(0, 4)
+					.map((image) => ({ data: image.data as string, mimeType: image.mimeType as string }));
 				const mode = payload.mode === "steer" ? "steer" : "queue";
 				const sticky: StickyCard = {
 					id: nextId(),
@@ -388,6 +395,7 @@ function startBoard(): Board {
 					text: text.slice(0, 4000),
 					status: "queued",
 					mode,
+					images: images.length,
 					title: "you",
 					at: Date.now(),
 				};
@@ -396,7 +404,7 @@ function startBoard(): Board {
 				broadcast(board ?? ({ clients } as Board), { type: "card", card: sticky });
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ id: sticky.id }));
-				void deliver(text, mode)
+				void deliver(text, mode, images)
 					.then(() => {
 						sticky.status = "sent";
 						broadcast(board ?? ({ clients } as Board), { type: "update", card: sticky });
@@ -843,8 +851,17 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	// The composer hands messages straight to the session: a steer lands mid-run, a queue
 	// waits for the agent to finish what it is doing.
-	deliver = async (text, mode) => {
-		await pi.sendUserMessage(text, { deliverAs: mode === "steer" ? "steer" : "followUp" });
+	deliver = async (text, mode, images) => {
+		// An image pasted into the composer reaches the agent as an image part, exactly as if
+		// it had been pasted into the terminal.
+		const content =
+			images.length === 0
+				? text
+				: [
+						{ type: "text" as const, text },
+						...images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
+					];
+		await pi.sendUserMessage(content, { deliverAs: mode === "steer" ? "steer" : "followUp" });
 	};
 
 	// Every tool call becomes a row in the activity rail, so the board shows the work

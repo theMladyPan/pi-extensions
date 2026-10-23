@@ -201,6 +201,15 @@
     display: flex; gap: 10px; padding: 10px 14px; background: rgba(10,15,22,.96);
     border-top: 1px solid var(--border); backdrop-filter: blur(8px);
   }
+  #composer .type { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  /* Floating above the composer, so attachments never squeeze the textarea. */
+  #attachments { position: absolute; bottom: 100%; left: 14px; display: flex; gap: 6px; padding-bottom: 6px; }
+  #attachments:empty { display: none; }
+  #attachments .shot { position: relative; }
+  #attachments .shot img { height: 64px; border-radius: 5px; border: 1px solid var(--border); display: block; }
+  #attachments .shot button { position: absolute; top: -5px; right: -5px; width: 16px; height: 16px;
+    border-radius: 50%; border: 1px solid var(--border); background: #21262d; color: var(--text);
+    font: 10px var(--mono); line-height: 1; cursor: pointer; padding: 0; }
   #composer textarea {
     flex: 1; resize: none; font: 14px/1.45 system-ui, sans-serif; color: var(--text);
     background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
@@ -257,7 +266,10 @@
 </aside>
 
 <div id="composer">
-  <textarea id="msg" placeholder="message the agent…  (enter sends, shift+enter for a new line)"></textarea>
+  <div class="type">
+    <div id="attachments"></div>
+    <textarea id="msg" placeholder="message the agent…  (enter sends, shift+enter for a new line, paste an image to attach it)"></textarea>
+  </div>
   <div class="side">
     <div class="modes">
       <button data-mode="queue" class="on">queue</button>

@@ -356,6 +356,11 @@
     const text = el("div", "sticky-text");
     text.textContent = data.text || "";
     holder.appendChild(text);
+    if (data.images) {
+      const shot = el("div", "sticky-status");
+      shot.textContent = `${data.images} image${data.images > 1 ? "s" : ""} attached`;
+      holder.appendChild(shot);
+    }
     const status = el("div", `sticky-status ${data.status || "queued"}`);
     status.textContent =
       data.status === "answered"
@@ -955,18 +960,67 @@
     });
   }
 
+  // Images pasted into the composer travel with the message, so a screenshot reaches the
+  // agent without leaving the board for the terminal.
+  const attachments = document.getElementById("attachments");
+  const pendingImages = [];
+
+  function drawAttachments() {
+    attachments.replaceChildren();
+    for (const [index, image] of pendingImages.entries()) {
+      const holder = el("div", "shot");
+      const thumb = document.createElement("img");
+      thumb.src = image.dataUrl;
+      thumb.title = image.mimeType;
+      const remove = el("button", "");
+      remove.textContent = "×";
+      remove.title = "remove";
+      remove.addEventListener("click", () => {
+        pendingImages.splice(index, 1);
+        drawAttachments();
+      });
+      holder.append(thumb, remove);
+      attachments.appendChild(holder);
+    }
+  }
+
+  msgBox.addEventListener("paste", (event) => {
+    const files = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+    if (files.length === 0) return;
+    event.preventDefault();
+    for (const file of files.slice(0, 4)) {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => {
+        const dataUrl = String(reader.result);
+        pendingImages.push({
+          dataUrl,
+          mimeType: file.type,
+          data: dataUrl.slice(dataUrl.indexOf(",") + 1),
+        });
+        drawAttachments();
+      });
+      reader.readAsDataURL(file);
+    }
+  });
+
   async function sendMessage() {
     const text = msgBox.value.trim();
-    if (!text) return;
+    if (!text && pendingImages.length === 0) return;
     sendBtn.disabled = true;
     try {
       const response = await fetch(`/message?token=${encodeURIComponent(token)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, mode: sendMode }),
+        body: JSON.stringify({
+          text,
+          mode: sendMode,
+          images: pendingImages.map((image) => ({ data: image.data, mimeType: image.mimeType })),
+        }),
       });
       if (!response.ok) throw new Error((await response.text()).slice(0, 80) || response.statusText);
       msgBox.value = "";
+      pendingImages.length = 0;
+      drawAttachments();
       composerHint.textContent = sendMode === "steer" ? "steered" : "queued";
     } catch (error) {
       composerHint.textContent = `failed: ${error.message || error}`;
