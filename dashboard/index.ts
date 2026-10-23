@@ -184,6 +184,10 @@ let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[]) => 
 /** Stickies waiting for an answer, oldest first, so replies land on the right question. */
 const awaitingStickies: string[] = [];
 
+/** Messages accepted but not yet handed to the session, oldest first. */
+const outbox: { id: string; text: string; images: InboundImage[] }[] = [];
+let pumping = false;
+
 const BOARD_PROMPT = [
 	"[DASHBOARD MODE: the user watches a visual board instead of the terminal]",
 	"A message from the board arrives as a sticky card and your final answer is attached under it automatically. Never repeat that answer in a note, and never restate it in a second card.",
@@ -409,6 +413,36 @@ function pushMeta(): void {
 	broadcast(board, { type: "meta", meta: board.meta });
 }
 
+/** Hand one message to the session and keep the sticky showing what happened to it. */
+async function sendNow(sticky: StickyCard, text: string, images: InboundImage[], mode: "queue" | "steer"): Promise<void> {
+	try {
+		await deliver(text, mode, images);
+		sticky.status = "sent";
+	} catch {
+		sticky.status = "answered";
+		sticky.reply = "could not deliver this message";
+		const at = awaitingStickies.indexOf(sticky.id);
+		if (at >= 0) awaitingStickies.splice(at, 1);
+	}
+	if (board) broadcast(board, { type: "update", card: sticky });
+}
+
+/** Send the oldest waiting message once the session is free. */
+async function pumpOutbox(): Promise<void> {
+	if (pumping || running || outbox.length === 0 || !board) return;
+	pumping = true;
+	try {
+		const next = outbox.shift();
+		if (!next) return;
+		const sticky = board.cards.find((card) => card.id === next.id);
+		if (!sticky || sticky.type !== "sticky") return; // closed while waiting
+		awaitingStickies.push(sticky.id);
+		await sendNow(sticky, next.text, next.images, "queue");
+	} finally {
+		pumping = false;
+	}
+}
+
 function urlFor(target: Board): string {
 	return `http://127.0.0.1:${target.port}/?token=${target.token}`;
 }
@@ -540,20 +574,18 @@ function startBoard(): Board {
 					at: Date.now(),
 				};
 				cards.push(sticky);
-				awaitingStickies.push(sticky.id);
 				broadcast(board ?? ({ clients } as Board), { type: "card", card: sticky });
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ id: sticky.id }));
-				void deliver(text, mode, images)
-					.then(() => {
-						sticky.status = "sent";
-						broadcast(board ?? ({ clients } as Board), { type: "update", card: sticky });
-					})
-					.catch(() => {
-						sticky.status = "answered";
-						sticky.reply = "could not deliver this message";
-						broadcast(board ?? ({ clients } as Board), { type: "update", card: sticky });
-					});
+				if (mode === "steer") {
+					awaitingStickies.push(sticky.id);
+					void sendNow(sticky, text, images, "steer");
+				} else {
+					// Queued messages wait here rather than in pi's own queue, so closing the card
+					// can take the message back before the agent ever sees it.
+					outbox.push({ id: sticky.id, text, images });
+					void pumpOutbox();
+				}
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/stop") {
@@ -640,6 +672,9 @@ function startBoard(): Board {
 				const [closed] = cards.splice(at, 1);
 				const waiting = awaitingStickies.indexOf(closed.id);
 				if (waiting >= 0) awaitingStickies.splice(waiting, 1);
+				// Closing a message that has not been handed over yet cancels it outright.
+				const queued = outbox.findIndex((item) => item.id === closed.id);
+				if (queued >= 0) outbox.splice(queued, 1);
 				broadcast(board ?? ({ clients } as Board), { type: "remove", id: closed.id });
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ closed: closed.id }));
@@ -1131,6 +1166,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			}
 		}
 		pushMeta();
+		void pumpOutbox();
 	});
 
 	pi.on("session_shutdown", async () => {
