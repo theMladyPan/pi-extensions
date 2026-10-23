@@ -23,6 +23,40 @@
   const GAP = 18;
   const STEP = 24;
 
+  // Cards are sized in columns rather than pixels: code reads best at 120 monospace
+  // columns, prose at 80. Both are measured from the fonts actually in use.
+  const SOURCE_COLS = 120;
+  const NOTE_COLS = 80;
+  let charWidths;
+
+  function measureCharWidths() {
+    if (charWidths) return charWidths;
+    const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const probe = (font, text) => {
+      const span = document.createElement("span");
+      span.style.cssText = `position:absolute;left:-9999px;top:0;white-space:pre;font:${font}`;
+      span.textContent = text;
+      document.body.appendChild(span);
+      const perChar = span.getBoundingClientRect().width / text.length;
+      span.remove();
+      return perChar;
+    };
+    const prose = "the quick brown fox jumps over a lazy dog, then writes another long line of ordinary prose";
+    charWidths = {
+      mono: probe(`12px ${cssVar("--mono")}`, "M".repeat(100)),
+      prose: probe(getComputedStyle(document.body).font || "13px system-ui, sans-serif", prose),
+    };
+    return charWidths;
+  }
+
+  /** Default width: gutter, text padding and borders included, so the columns really fit. */
+  function defaultWidth(kind) {
+    const widths = measureCharWidths();
+    if (kind === "source") return Math.round(52 + 24 + 2 + widths.mono * SOURCE_COLS);
+    if (kind === "question") return 460;
+    return Math.round(24 + 2 + widths.prose * NOTE_COLS);
+  }
+
   const overlaps = (a, b) =>
     a.x < b.x + b.w + GAP && a.x + a.w + GAP > b.x && a.y < b.y + b.h + GAP && a.y + a.h + GAP > b.y;
 
@@ -297,7 +331,7 @@
     const isSource = data.type === "source";
     const isQuestion = data.type === "question";
     const kind = data.type;
-    const width = isSource ? 660 : isQuestion ? 460 : 420;
+    const width = defaultWidth(kind);
     const height = isSource ? 430 : isQuestion ? 300 : 250;
 
     const anchorRect =
