@@ -34,7 +34,9 @@
     cursor: grab;
   }
   #viewport.dragging { cursor: grabbing; }
-  #world { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }
+  /* Zoom is a real layout zoom, not a scaled bitmap: text is laid out at the size it is
+     shown at, so it stays sharp instead of waiting for a repaint to catch up. */
+  #world { position: absolute; top: 0; left: 0; zoom: 1; }
 
   .card {
     position: absolute; display: flex; flex-direction: column; overflow: hidden;

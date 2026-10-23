@@ -100,23 +100,21 @@
     if (cls) node.className = cls;
     return node;
   };
-  // Chrome keeps painting the pre-zoom bitmap until something invalidates the layer, so a
-  // zoomed board looks soft until a click forces a repaint. Nudging a paint property once
-  // the gesture settles re-rasterises the text at the new scale.
-  let rasterTimer = null;
-  function refreshRaster() {
-    if (rasterTimer) clearTimeout(rasterTimer);
-    rasterTimer = setTimeout(() => {
-      rasterTimer = null;
-      world.style.filter = "opacity(1)";
-      void world.offsetWidth;
-      world.style.filter = "";
-    }, 180);
-  }
-
+  /**
+   * The world is zoomed with the CSS `zoom` property, so text is laid out at the size it is
+   * shown at and never softens the way a scaled bitmap does. `zoom` scales the element's own
+   * offsets too, hence dividing the pan by the scale.
+   */
+  const ZOOM_SUPPORTED = typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("zoom", "2");
   const applyView = () => {
-    world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`;
-    refreshRaster();
+    if (ZOOM_SUPPORTED) {
+      world.style.zoom = view.k;
+      world.style.left = `${view.x / view.k}px`;
+      world.style.top = `${view.y / view.k}px`;
+    } else {
+      // Older browsers only have the bitmap scale, which softens text while it catches up.
+      world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`;
+    }
     if (typeof recomputePill === "function") recomputePill();
   };
 
