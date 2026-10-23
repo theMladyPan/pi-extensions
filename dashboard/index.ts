@@ -358,9 +358,11 @@ async function drainRowJobs(): Promise<void> {
 			if (!job || !board) continue;
 			const phrase = await phraseRow(job).catch(() => undefined);
 			if (!phrase || !board) continue;
+			// A caption that invents a failure is worse than no caption at all.
+			if (!job.failed && /^failed\b/i.test(phrase)) continue;
 			// A call that failed is captioned as a failure, whatever the model chose to
 			// highlight, so the row never reads as a success it did not have.
-			const caption = job.failed && !/^failed\b/i.test(phrase) ? `failed: ${phrase}`.slice(0, 56) : phrase;
+			const caption = job.failed && !/failed/i.test(phrase) ? `failed: ${phrase}`.slice(0, 56) : phrase;
 			patchActivity(board, job.rowId, job.failed ? { label: caption, status: "error" } : { label: caption });
 		}
 	} finally {
@@ -379,6 +381,9 @@ function queueRowLabel(
 	start = "",
 ): void {
 	if (!ROW_MODEL_ENABLED) return;
+	// Nothing to explain in a two-word answer, and a small model asked to caption one will
+	// invent context. The plain caption already says it.
+	if (!failed && result.trim().length <= 40) return;
 	if (rowJobs.length > 8) rowJobs.shift();
 	const flatArgs = args && typeof args === "object" ? JSON.stringify(args).slice(0, 400) : String(args ?? "");
 	rowJobs.push({ rowId, tool, args: flatArgs, result, isError, failed, start: start || toolLabel(tool, args), hint });
