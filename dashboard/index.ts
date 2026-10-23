@@ -264,34 +264,39 @@ function toolOutcome(isError: boolean, result: string): string {
 }
 
 /** A very small, very fast model turns the outcome into a phrase a person would say. */
-const ROW_MODEL = process.env.PI_BOARD_ROW_MODEL ?? "gemini-3.5-flash-lite";
-const ROW_MODEL_ENABLED = process.env.PI_BOARD_ROWS_MODEL !== "0" && Boolean(process.env.GEMINI_API_KEY);
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const ROW_MODEL = process.env.PI_BOARD_ROW_MODEL ?? "inception/mercury-3";
+const ROW_MODEL_ENABLED = process.env.PI_BOARD_ROWS_MODEL !== "0" && Boolean(process.env.OPENROUTER_API_KEY);
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 const ROW_PROMPT = [
-	"You caption one line of a tool activity list. Answer with at most five words, lowercase, no final period, no quotes.",
-	"Say what the call did or what went wrong, using the concrete detail from the result.",
+	"You caption one line of a tool activity list. Reply with the caption only.",
+	"At most five words, lowercase, no period, no quotes, and never the words successfully or done.",
+	'If the call failed, start with "failed:" and name the cause. If it did not fail, never say it did.',
 	"",
-	"Input: tool rg, args -n TIMEOUT config/, ok. Result: config/settings.py:1:TIMEOUT = 30, config/app.yaml:2:  timeout: 30",
-	"OK: found timeout in 2 files",
-	"NOK: The search completed successfully and located the pattern.",
+	"Tool: bash, asked: grep -rn TIMEOUT config",
+	"Output: config/settings.py:1:TIMEOUT = 30, config/app.yaml:2:  timeout: 30",
+	"Caption: found timeout in 2 files",
 	"",
-	"Input: tool read, args config/settings.py, error. Result: EACCES: permission denied, open 'config/settings.py'",
-	"OK: failed: permission denied",
-	"NOK: Error while reading the file.",
+	"Tool: read, asked: reading /home/u/app/main.py",
+	"Output: EACCES: permission denied",
+	"Caption: failed: permission denied",
 	"",
-	"Input: tool bash, args npm test, error. Result: 3 tests failed, 41 passed",
-	"OK: 3 tests failed",
-	"NOK: The command exited with a non-zero status code, indicating failures.",
-	"",
-	"Input: tool edit, args src/main.py, ok. Result: replaced 2 blocks",
-	"OK: rewrote 2 blocks in main.py",
-	"NOK: Successfully applied the requested changes to the file.",
-	"",
-	"When the call failed, start the caption with failed: and name the cause.",
+	"Tool: bash, asked: grep -rn TIMEOUT config",
+	"Output: config/settings.py:1:TIMEOUT = 30",
+	"Caption: The search completed successfully and located the pattern in the configuration file.",
 ].join("\n");
 
-type RowJob = { rowId: string; tool: string; args: string; result: string; isError: boolean; failed: boolean };
+type RowJob = {
+	rowId: string;
+	tool: string;
+	args: string;
+	result: string;
+	isError: boolean;
+	failed: boolean;
+	/** What the call was already captioned as, and what went wrong by the plain rules. */
+	start: string;
+	hint: string;
+};
 const rowJobs: RowJob[] = [];
 /** Arguments by call id, so the end event can describe what the call was asked to do. */
 const callArgs = new Map<string, unknown>();
@@ -300,6 +305,9 @@ let rowBusy = false;
 const cleanPhrase = (value: string): string =>
 	value
 		.replace(/[*_`"]/g, "")
+		// Small models like to answer "Caption: ..." or ": ...", and the label already has a place.
+		.replace(/^\s*(caption|label)\s*:?\s*/i, "")
+		.replace(/^[\s:.\-–—]+/, "")
 		.replace(/\s+/g, " ")
 		.replace(/[.]$/, "")
 		.trim()
@@ -310,30 +318,33 @@ const cleanPhrase = (value: string): string =>
 		.slice(0, 48);
 
 async function phraseRow(job: RowJob): Promise<string | undefined> {
+	// Reasoning is switched off: a caption of five words is not a puzzle, and the reasoning
+	// tokens cost more than the answer and arrive slower than the row can wait.
 	const body = {
-		systemInstruction: { parts: [{ text: ROW_PROMPT }] },
-		contents: [
+		model: ROW_MODEL,
+		messages: [
+			{ role: "system", content: ROW_PROMPT },
 			{
 				role: "user",
-				parts: [
-					{
-						text: `Input: tool ${job.tool}, args ${job.args.slice(0, 300)}, ${job.isError ? "error" : "ok"}. Result: ${job.result.slice(0, 900)}`,
-					},
-				],
+				content: `Tool: ${job.tool}, asked: ${job.start}${job.hint ? `\nThe first guess was "${job.hint}". Improve it if you can.` : ""}\nOutput: ${job.result.slice(0, 400)}`,
 			},
 		],
-		generationConfig: { temperature: 0.2, maxOutputTokens: 64 },
+		max_tokens: 24,
+		temperature: 0,
+		reasoning: { enabled: false },
 	};
-	const response = await fetch(`${GEMINI_BASE}/models/${ROW_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+	const response = await fetch(OPENROUTER_URL, {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+		},
 		body: JSON.stringify(body),
 		signal: AbortSignal.timeout(4000),
 	});
 	if (!response.ok) return undefined;
-	const payload = (await response.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
-	const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join(" ") ?? "";
-	const phrase = cleanPhrase(text);
+	const payload = (await response.json()) as { choices?: { message?: { content?: string | null } }[] };
+	const phrase = cleanPhrase(payload.choices?.[0]?.message?.content ?? "");
 	return phrase.length > 2 ? phrase : undefined;
 }
 
@@ -364,11 +375,13 @@ function queueRowLabel(
 	result: string,
 	isError: boolean,
 	failed = isError,
+	hint = "",
+	start = "",
 ): void {
 	if (!ROW_MODEL_ENABLED) return;
 	if (rowJobs.length > 8) rowJobs.shift();
 	const flatArgs = args && typeof args === "object" ? JSON.stringify(args).slice(0, 400) : String(args ?? "");
-	rowJobs.push({ rowId, tool, args: flatArgs, result, isError, failed });
+	rowJobs.push({ rowId, tool, args: flatArgs, result, isError, failed, start: start || toolLabel(tool, args), hint });
 	void drainRowJobs();
 }
 
@@ -1246,7 +1259,15 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 				outcome.startsWith("failed") ? { label: outcome, status: "error" } : { label: outcome },
 			);
 		}
-		queueRowLabel(event.toolCallId, event.toolName, callArgs.get(event.toolCallId), result, event.isError, failed);
+		queueRowLabel(
+			event.toolCallId,
+			event.toolName,
+			callArgs.get(event.toolCallId),
+			result,
+			event.isError,
+			failed,
+			outcome,
+		);
 		callArgs.delete(event.toolCallId);
 	});
 
