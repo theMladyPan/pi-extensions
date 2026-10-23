@@ -100,8 +100,23 @@
     if (cls) node.className = cls;
     return node;
   };
+  // Chrome keeps painting the pre-zoom bitmap until something invalidates the layer, so a
+  // zoomed board looks soft until a click forces a repaint. Nudging a paint property once
+  // the gesture settles re-rasterises the text at the new scale.
+  let rasterTimer = null;
+  function refreshRaster() {
+    if (rasterTimer) clearTimeout(rasterTimer);
+    rasterTimer = setTimeout(() => {
+      rasterTimer = null;
+      world.style.filter = "opacity(1)";
+      void world.offsetWidth;
+      world.style.filter = "";
+    }, 180);
+  }
+
   const applyView = () => {
     world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`;
+    refreshRaster();
     if (typeof recomputePill === "function") recomputePill();
   };
 
@@ -320,8 +335,31 @@
     }
   }
 
+  /** A message from the user, with the agent's answer attached once it arrives. */
+  function stickyBody(data) {
+    const holder = el("div", "sticky-body");
+    const text = el("div", "sticky-text");
+    text.textContent = data.text || "";
+    holder.appendChild(text);
+    const status = el("div", `sticky-status ${data.status || "queued"}`);
+    status.textContent =
+      data.status === "answered"
+        ? "answered"
+        : data.status === "sent"
+          ? "delivered"
+          : `queued · ${data.mode === "steer" ? "steer" : "queue"}`;
+    holder.appendChild(status);
+    if (data.reply) {
+      const reply = el("div", "sticky-reply note-body");
+      reply.appendChild(renderMarkdown(data.reply));
+      holder.appendChild(reply);
+    }
+    return holder;
+  }
+
   function bodyFor(data, entry) {
     if (data.type === "source") return { node: sourceBody(data), cls: "" };
+    if (data.type === "sticky") return { node: stickyBody(data), cls: "sticky-body-wrap" };
     if (data.type === "question") return { node: questionBody(data, entry), cls: "q-body-wrap" };
     return { node: renderMarkdown(data.markdown || ""), cls: "note-body" };
   }
@@ -340,14 +378,14 @@
     occupied.push(spot);
     anchors[kind] = spot;
 
-    const card = el("div", "card");
+    const card = el("div", kind === "sticky" ? "card sticky" : "card");
     card.style.cssText = `left:${spot.x}px; top:${spot.y}px; width:${width}px; height:${height}px; z-index:${z++}`;
     card.dataset.rect = JSON.stringify(spot);
     card.dataset.kind = kind;
 
     const head = el("div", "head");
     head.innerHTML = `
-      <span class="dot ${isSource ? "code" : isQuestion ? "question" : "note"}"></span>
+      <span class="dot ${isSource ? "code" : isQuestion ? "question" : kind === "sticky" ? "sticky" : "note"}"></span>
       <span class="title"></span>
       <span class="sub"></span>
       <span class="spacer"></span>
@@ -446,13 +484,16 @@
   function paintCard(entry, data) {
     const isSource = data.type === "source";
     entry.data = data;
-    entry.titleEl.textContent = data.title || (isSource ? data.path : data.type === "question" ? "question" : "note");
+    entry.titleEl.textContent =
+      data.title || (isSource ? data.path : data.type === "question" ? "question" : data.type === "sticky" ? "you" : "note");
     entry.titleEl.title = entry.titleEl.textContent;
     entry.subEl.textContent = isSource
       ? `${data.content.split("\n").length} lines`
       : data.type === "question"
         ? data.status === "answered" ? "answered" : "waiting for you"
-        : new Date(data.at || Date.now()).toLocaleTimeString();
+        : data.type === "sticky"
+          ? data.status || "queued"
+          : new Date(data.at || Date.now()).toLocaleTimeString();
     entry.chipEl.textContent = isSource && data.line ? `line ${data.line}` : "";
     entry.chipEl.style.display = entry.chipEl.textContent ? "" : "none";
 
@@ -635,6 +676,101 @@
     applyView();
   });
 
+  // ---------- activity rail ------------------------------------------------
+  const railNow = document.getElementById("railNow");
+  const railLog = document.getElementById("railLog");
+  const railRunning = document.getElementById("railRunning");
+  const actEls = new Map();
+
+  function actRow(row) {
+    const node = el("div", `act ${row.kind === "reply" ? "reply" : ""} ${row.status}`);
+    const top = el("div", "top");
+    top.appendChild(el("span", "dot"));
+    const name = el("span", "name");
+    name.textContent = row.kind === "reply" ? "answer" : row.tool || "tool";
+    top.appendChild(name);
+    const timing = el("span", "ms");
+    timing.textContent = row.durationMs
+      ? `${(row.durationMs / 1000).toFixed(row.durationMs < 1000 ? 2 : 1)}s`
+      : row.status === "running"
+        ? "…"
+        : "";
+    top.appendChild(timing);
+    node.appendChild(top);
+    const detail = row.kind === "reply" ? row.text || "" : row.summary || row.target || "";
+    if (detail) {
+      const note = el("div", row.kind === "reply" ? "note" : "target");
+      note.textContent = detail;
+      note.title = detail;
+      node.appendChild(note);
+    }
+    return node;
+  }
+
+  function applyActivity(row) {
+    const node = actRow(row);
+    const previous = actEls.get(row.id);
+    if (previous) previous.remove();
+    actEls.set(row.id, node);
+    if (row.status === "running") {
+      railNow.prepend(node);
+    } else {
+      railLog.prepend(node);
+      while (railLog.childElementCount > 200) {
+        const last = railLog.lastElementChild;
+        if (!last) break;
+        for (const [id, elem] of actEls) if (elem === last) actEls.delete(id);
+        last.remove();
+      }
+    }
+    railRunning.textContent = railNow.childElementCount ? String(railNow.childElementCount) : "";
+  }
+
+  // ---------- composer -----------------------------------------------------
+  const msgBox = document.getElementById("msg");
+  const sendBtn = document.getElementById("send");
+  const composerHint = document.getElementById("composerHint");
+  let sendMode = "queue";
+  composerHint.textContent = "waits for this run to finish";
+
+  for (const button of document.querySelectorAll("#composer .modes button")) {
+    button.addEventListener("click", () => {
+      sendMode = button.dataset.mode === "steer" ? "steer" : "queue";
+      for (const other of document.querySelectorAll("#composer .modes button")) {
+        other.classList.toggle("on", other === button);
+      }
+      composerHint.textContent = sendMode === "steer" ? "interrupts the run" : "waits for this run to finish";
+    });
+  }
+
+  async function sendMessage() {
+    const text = msgBox.value.trim();
+    if (!text) return;
+    sendBtn.disabled = true;
+    try {
+      const response = await fetch(`/message?token=${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, mode: sendMode }),
+      });
+      if (!response.ok) throw new Error((await response.text()).slice(0, 80) || response.statusText);
+      msgBox.value = "";
+      composerHint.textContent = sendMode === "steer" ? "steered" : "queued";
+    } catch (error) {
+      composerHint.textContent = `failed: ${error.message || error}`;
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  sendBtn.addEventListener("click", () => void sendMessage());
+  msgBox.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendMessage();
+    }
+  });
+
   // ---------- transport ----------------------------------------------------
   // ---------- session header -----------------------------------------------
   const shortNum = (value) => {
@@ -722,9 +858,12 @@
       } else if (payload.type === "snapshot") {
         applyMeta(payload.meta);
         clearBoard();
+        for (const row of payload.activity || []) applyActivity(row);
         for (const card of payload.cards || []) applyMessage(card);
         sawFirstCard = (payload.cards || []).length > 0;
         if (cards.length) fitAll();
+      } else if (payload.type === "activity") {
+        applyActivity(payload.row);
       } else if (payload.type === "card" || payload.type === "update") {
         applyMessage(payload.card);
         startFlash();

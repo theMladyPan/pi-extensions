@@ -66,7 +66,29 @@ interface QuestionCard extends CardBase {
 	answer?: string;
 }
 
-type Card = NoteCard | SourceCard | QuestionCard;
+/** A message the user typed on the board; the agent's answer lands on the same card. */
+interface StickyCard extends CardBase {
+	type: "sticky";
+	text: string;
+	status: "queued" | "sent" | "answered";
+	mode: "queue" | "steer";
+	reply?: string;
+}
+
+type Card = NoteCard | SourceCard | QuestionCard | StickyCard;
+
+/** One row of the activity rail: a tool call, or the answer that closed a turn. */
+interface ActivityRow {
+	id: string;
+	kind: "tool" | "reply";
+	tool?: string;
+	target?: string;
+	status: "running" | "ok" | "error";
+	startedAt: number;
+	durationMs?: number;
+	summary?: string;
+	text?: string;
+}
 
 /** What the header shows: which session this board belongs to and what it has spent. */
 interface BoardMeta {
@@ -87,6 +109,7 @@ interface Board {
 	clients: Set<ServerResponse>;
 	cards: Card[];
 	meta: BoardMeta;
+	activity: ActivityRow[];
 }
 
 const EMPTY_META: BoardMeta = {
@@ -104,6 +127,10 @@ let board: Board | undefined;
 let currentCtx: ExtensionContext | undefined;
 let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
+/** Set by the extension so the HTTP handler can hand a board message to the session. */
+let deliver: (text: string, mode: "queue" | "steer") => Promise<void> = async () => {};
+/** Stickies waiting for an answer, oldest first, so replies land on the right question. */
+const awaitingStickies: string[] = [];
 
 const BOARD_PROMPT = [
 	"[DASHBOARD MODE: the user watches a visual board, so put your narration there instead of in prose]",
@@ -116,6 +143,58 @@ const BOARD_PROMPT = [
 ].join("\n");
 
 const totals = { tokensIn: 0, tokensOut: 0, cost: 0 };
+
+const MAX_ACTIVITY = 300;
+/** Which argument of a tool call names the thing the user cares about. */
+const TARGET_KEYS = ["path", "file_path", "filePath", "command", "pattern", "query", "url", "target", "cmd"];
+
+function toolTarget(args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const record = args as Record<string, unknown>;
+	for (const key of TARGET_KEYS) {
+		const value = record[key];
+		if (typeof value === "string" && value.trim()) return value.trim().slice(0, 120);
+	}
+	const first = Object.values(record).find((value) => typeof value === "string" && value.trim());
+	return typeof first === "string" ? first.trim().slice(0, 120) : "";
+}
+
+/** First line of a tool result, so a row says something without being opened. */
+function resultSummary(result: unknown): string {
+	const text = (() => {
+		if (typeof result === "string") return result;
+		const content = (result as { content?: unknown })?.content;
+		if (Array.isArray(content)) {
+			const first = content.find((part) => (part as { type?: string })?.type === "text");
+			if (first) return String((first as { text?: string }).text ?? "");
+		}
+		return "";
+	})();
+	return text.split("\n").map((line) => line.trim()).find((line) => line.length > 0)?.slice(0, 140) ?? "";
+}
+
+function textOf(message: { content?: unknown }): string {
+	const content = message.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part) => (part as { type?: string })?.type === "text")
+		.map((part) => String((part as { text?: string }).text ?? ""))
+		.join("\n")
+		.trim();
+}
+
+function pushActivity(target: Board, row: ActivityRow): void {
+	target.activity.push(row);
+	if (target.activity.length > MAX_ACTIVITY) target.activity.splice(0, target.activity.length - MAX_ACTIVITY);
+	broadcast(target, { type: "activity", row });
+}
+
+function patchActivity(target: Board, id: string, patch: Partial<ActivityRow>): void {
+	const row = target.activity.find((candidate) => candidate.id === id);
+	if (!row) return;
+	Object.assign(row, patch);
+	broadcast(target, { type: "activity", row });
+}
 
 /** Fold a finished assistant message into the running totals the header reports. */
 function addUsage(message: { usage?: { input?: number; output?: number; cost?: { total?: number } } }): boolean {
@@ -198,6 +277,7 @@ function startBoard(): Board {
 	const token = randomBytes(16).toString("hex");
 	const clients = new Set<ServerResponse>();
 	const cards: Card[] = [];
+	const activity: ActivityRow[] = [];
 
 	const server = createServer((req, res) => {
 		void (async () => {
@@ -223,7 +303,12 @@ function startBoard(): Board {
 					Connection: "keep-alive",
 				});
 				res.write(
-					`data: ${JSON.stringify({ type: "snapshot", cards, meta: currentMeta(board ?? ({ port: 0 } as Board)) })}\n\n`,
+					`data: ${JSON.stringify({
+						type: "snapshot",
+						cards,
+						activity,
+						meta: currentMeta(board ?? ({ port: 0 } as Board)),
+					})}\n\n`,
 				);
 				clients.add(res);
 				const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20_000);
@@ -231,6 +316,54 @@ function startBoard(): Board {
 					clearInterval(keepAlive);
 					clients.delete(res);
 				});
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/message") {
+				if (url.searchParams.get("token") !== token) {
+					res.writeHead(403, { "Content-Type": "text/plain" });
+					res.end("bad token");
+					return;
+				}
+				const body = await readBody(req);
+				let payload: { text?: string; mode?: string } = {};
+				try {
+					payload = JSON.parse(body) as { text?: string; mode?: string };
+				} catch {
+					res.writeHead(400, { "Content-Type": "text/plain" });
+					res.end("bad json");
+					return;
+				}
+				const text = (payload.text ?? "").trim();
+				if (!text) {
+					res.writeHead(400, { "Content-Type": "text/plain" });
+					res.end("empty message");
+					return;
+				}
+				const mode = payload.mode === "steer" ? "steer" : "queue";
+				const sticky: StickyCard = {
+					id: nextId(),
+					type: "sticky",
+					text: text.slice(0, 4000),
+					status: "queued",
+					mode,
+					title: "you",
+					at: Date.now(),
+				};
+				cards.push(sticky);
+				awaitingStickies.push(sticky.id);
+				broadcast(board ?? ({ clients } as Board), { type: "card", card: sticky });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ id: sticky.id }));
+				void deliver(text, mode)
+					.then(() => {
+						sticky.status = "sent";
+						broadcast(board ?? ({ clients } as Board), { type: "update", card: sticky });
+					})
+					.catch(() => {
+						sticky.status = "answered";
+						sticky.reply = "could not deliver this message";
+						broadcast(board ?? ({ clients } as Board), { type: "update", card: sticky });
+					});
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/answer") {
@@ -264,7 +397,7 @@ function startBoard(): Board {
 		})();
 	});
 
-	const created: Board = { server, token, port: 0, clients, cards, meta: EMPTY_META };
+	const created: Board = { server, token, port: 0, clients, cards, meta: EMPTY_META, activity };
 
 	// Parallel sessions each need their own board, so walk upward from the preferred port
 	// before giving up on a predictable number and letting the kernel pick one.
@@ -575,6 +708,58 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		const line = (data as { text?: string }).text;
 		if (!line) return;
 		upsert(board, { id: nextId(), type: "note", title: "spoken", markdown: line, at: Date.now() });
+	});
+
+	// The composer hands messages straight to the session: a steer lands mid-run, a queue
+	// waits for the agent to finish what it is doing.
+	deliver = async (text, mode) => {
+		await pi.sendUserMessage(text, { deliverAs: mode === "steer" ? "steer" : "followUp" });
+	};
+
+	// Every tool call becomes a row in the activity rail, so the board shows the work
+	// instead of the terminal scrolling past it.
+	pi.on("tool_execution_start", async (event) => {
+		if (!board) return;
+		pushActivity(board, {
+			id: event.toolCallId,
+			kind: "tool",
+			tool: event.toolName,
+			target: toolTarget(event.args),
+			status: "running",
+			startedAt: Date.now(),
+		});
+	});
+
+	pi.on("tool_execution_end", async (event) => {
+		if (!board) return;
+		patchActivity(board, event.toolCallId, {
+			status: event.isError ? "error" : "ok",
+			durationMs: event.durationMs,
+			summary: resultSummary(event.result),
+		});
+	});
+
+	// A finished turn closes with its answer text, which is what keeps the console closed.
+	pi.on("turn_end", async (event) => {
+		if (!board) return;
+		const message = event.message as { role?: string };
+		if (message.role !== "assistant") return;
+		const text = textOf(message as { content?: unknown });
+		if (!text) return;
+		pushActivity(board, {
+			id: nextId(),
+			kind: "reply",
+			status: "ok",
+			startedAt: Date.now(),
+			text: text.slice(0, 4000),
+		});
+		const waitingId = awaitingStickies.shift();
+		const sticky = waitingId ? board.cards.find((card) => card.id === waitingId) : undefined;
+		if (sticky && sticky.type === "sticky") {
+			sticky.status = "answered";
+			sticky.reply = text.slice(0, 4000);
+			broadcast(board, { type: "update", card: sticky });
+		}
 	});
 
 	// The header is the user's only view of the session, so keep it current on every turn.
