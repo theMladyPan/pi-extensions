@@ -410,6 +410,30 @@ function startBoard(): Board {
 				res.end(JSON.stringify({ stopped: true }));
 				return;
 			}
+			if (req.method === "POST" && url.pathname === "/edit") {
+				// The user owns the words in a note. A later board_note with the same key still
+				// wins, which is the agent's way of refreshing its own card.
+				const body = await readBody(req);
+				let payload: { cardId?: string; markdown?: string } = {};
+				try {
+					payload = JSON.parse(body) as { cardId?: string; markdown?: string };
+				} catch {
+					res.writeHead(400, { "Content-Type": "text/plain" });
+					res.end("bad json");
+					return;
+				}
+				const card = cards.find((candidate) => candidate.id === payload.cardId);
+				if (!card || card.type !== "note") {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end("not an editable note");
+					return;
+				}
+				card.markdown = (payload.markdown ?? "").slice(0, 20000);
+				broadcast(board ?? ({ clients } as Board), { type: "update", card });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ edited: card.id }));
+				return;
+			}
 			if (req.method === "POST" && url.pathname === "/close") {
 				const body = await readBody(req);
 				let payload: { cardId?: string } = {};

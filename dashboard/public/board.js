@@ -27,7 +27,7 @@
   // Cards are sized in columns rather than pixels: code reads best at 120 monospace
   // columns, prose at 80. Both are measured from the fonts actually in use.
   const SOURCE_COLS = 120;
-  const NOTE_COLS = 80;
+  const NOTE_COLS = 90;
   let charWidths;
 
   function measureCharWidths() {
@@ -169,6 +169,7 @@
   function renderMarkdown(markdown) {
     const holder = el("div");
     const fences = [];
+    let tickIndex = 0;
     const stripped = markdown.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, lang, body) => {
       const index = fences.push({ lang: lang.toLowerCase(), body }) - 1;
       return `\u0000FENCE${index}\u0000`;
@@ -193,22 +194,27 @@
         }
         continue;
       }
-      const lines = block.split("\n").filter((line) => line.trim().length > 0);
-      if (lines.length > 0 && lines.every((line) => /^\s*[-*+]\s+/.test(line))) {
-        const ul = el("ul");
-        for (const line of lines) {
+      // Lines are walked one by one, so a list can be followed by a paragraph with no blank
+      // line between them, which is what typing under a list produces.
+      let ul = null;
+      for (const line of block.split("\n")) {
+        const item = line.match(/^\s*[-*+]\s+(.*)$/);
+        if (item) {
+          if (!ul) {
+            ul = el("ul");
+            holder.appendChild(ul);
+          }
           const li = el("li");
-          const body = line.replace(/^\s*[-*+]\s+/, "");
-          const box = body.match(/^\[([ xX])\]\s*(.*)$/);
+          const box = item[1].match(/^\[([ xX])\]\s*(.*)$/);
           li.innerHTML = box
-            ? `<span class="tick">${box[1].trim() ? "☑" : "☐"}</span> ${inlineMd(box[2])}`
-            : inlineMd(body);
+            ? `<span class="tick" title="tick it">${box[1].trim() ? "☑" : "☐"}</span> ${inlineMd(box[2])}`
+            : inlineMd(item[1]);
+          if (box) li.dataset.tick = String(tickIndex++);
           ul.appendChild(li);
+          continue;
         }
-        holder.appendChild(ul);
-        continue;
-      }
-      for (const line of lines) {
+        ul = null;
+        if (!line.trim()) continue;
         const heading = line.match(/^(#{1,6})\s+(.*)$/);
         if (heading) {
           const h = el("h3");
@@ -220,7 +226,6 @@
           holder.appendChild(el("hr"));
           continue;
         }
-        if (!line.trim()) continue;
         const p = el("p");
         p.innerHTML = inlineMd(line);
         holder.appendChild(p);
@@ -383,7 +388,7 @@
     const isQuestion = data.type === "question";
     const kind = data.type;
     const width = defaultWidth(kind);
-    const height = isSource ? 430 : isQuestion ? 300 : 250;
+    const height = isSource ? 430 : isQuestion ? 300 : 300;
 
     const anchorRect =
       anchors[kind] ? { x: anchors[kind].x + 40, y: anchors[kind].y + anchors[kind].h + STEP } : viewportCenter();
@@ -404,6 +409,7 @@
       <span class="sub"></span>
       <span class="spacer"></span>
       <span class="chip"></span>
+      <button class="edit" title="edit this note">✎</button>
       <button class="close" title="close">×</button>`;
     const body = el("div", "body");
     const grip = el("div", "resize");
@@ -418,7 +424,8 @@
     const clearFresh = () => {
       if (!card.classList.contains("fresh")) return;
       card.classList.remove("fresh");
-      badge.remove();
+      // Hidden, not removed: dropping it would shift the buttons under the pointer.
+      badge.style.visibility = "hidden";
       recomputePill();
     };
     card.addEventListener("pointerdown", clearFresh, true);
@@ -441,6 +448,11 @@
       cards.forEach((c) => c.classList.toggle("active", c === card));
     }, true);
 
+    head.querySelector(".edit").addEventListener("click", (event) => {
+      event.stopPropagation();
+      startEditing(entry);
+    });
+
     head.querySelector(".close").addEventListener("click", (event) => {
       event.stopPropagation();
       dropCard(entry);
@@ -453,7 +465,8 @@
     });
 
     head.addEventListener("pointerdown", (event) => {
-      if (event.target.closest(".close")) return;
+      // Buttons in the header are for clicking, not for dragging the card.
+      if (event.target.closest(".close, .edit")) return;
       event.preventDefault();
       card.classList.add("dragging");
       const sx = event.clientX;
@@ -502,6 +515,7 @@
   function paintCard(entry, data) {
     const isSource = data.type === "source";
     entry.data = data;
+    if (entry.editing) return;
     entry.titleEl.textContent =
       data.title || (isSource ? data.path : data.type === "question" ? "question" : data.type === "sticky" ? "you" : "note");
     entry.titleEl.title = entry.titleEl.textContent;
@@ -512,6 +526,8 @@
         : data.type === "sticky"
           ? data.status || "queued"
           : new Date(data.at || Date.now()).toLocaleTimeString();
+    const editBtn = entry.head.querySelector(".edit");
+    if (editBtn) editBtn.style.display = data.type === "note" ? "" : "none";
     entry.chipEl.textContent = isSource && data.line ? `line ${data.line}` : "";
     entry.chipEl.style.display = entry.chipEl.textContent ? "" : "none";
 
@@ -665,6 +681,60 @@
    * browser scrolls whatever sits under the cursor: a card's body, a code view, the rail.
    * Panning the board is drag-only, because a stray scroll should never move the layout.
    */
+  /** Save a note the user changed: a ticked box, or text typed in the editor. */
+  async function saveNote(entry, markdown) {
+    entry.data = { ...entry.data, markdown };
+    paintCard(entry, entry.data);
+    try {
+      await fetch(`/edit?token=${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cardId: entry.id, markdown }),
+      });
+    } catch {
+      // A failed save leaves the text on screen; the next reload shows the server's copy.
+    }
+  }
+
+  /** Flip the Nth task marker, so the tick lands on the line the user clicked. */
+  function flipTask(markdown, index) {
+    let seen = -1;
+    return markdown.replace(/^(\s*[-*+]\s+)\[([ xX])\]/gm, (whole, lead, state) => {
+      seen += 1;
+      if (seen !== index) return whole;
+      return `${lead}[${state.trim() ? " " : "x"}]`;
+    });
+  }
+
+  /** The note body becomes a textarea holding its own markdown: no rich text, no surprises. */
+  function startEditing(entry) {
+    if (entry.data.type !== "note") return;
+    entry.editing = true;
+    const area = el("textarea", "note-edit");
+    area.value = entry.data.markdown || "";
+    area.spellcheck = false;
+    entry.body.replaceChildren(area);
+    area.focus();
+    const finish = (commit) => {
+      if (!entry.editing) return;
+      entry.editing = false;
+      const value = area.value;
+      if (commit && value !== entry.data.markdown) void saveNote(entry, value);
+      else paintCard(entry, entry.data);
+    };
+    area.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false);
+      }
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        finish(true);
+      }
+    });
+    area.addEventListener("blur", () => finish(true));
+  }
+
   /** Centre the view on a card and ring it, so a reference lands where it points. */
   function centerOn(record) {
     const card = record.card;
@@ -695,6 +765,16 @@
   }
 
   viewport.addEventListener("click", (event) => {
+    const tick = event.target.closest(".tick");
+    if (tick) {
+      const card = tick.closest(".card");
+      const record = card ? byId.get(card.dataset.id) : null;
+      const item = tick.closest("li");
+      if (record && record.data.type === "note" && item && item.dataset.tick != null) {
+        void saveNote(record, flipTask(record.data.markdown || "", Number(item.dataset.tick)));
+      }
+      return;
+    }
     const link = event.target.closest(".xref");
     if (!link) return;
     event.preventDefault();
