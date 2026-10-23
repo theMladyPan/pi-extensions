@@ -17,7 +17,6 @@
   const byId = new Map();
   let z = 1;
   const occupied = [];
-  const anchors = { source: null, note: null, question: null };
   let sawFirstCard = false;
   let freshCount = 0;
 
@@ -387,14 +386,16 @@
     const isSource = data.type === "source";
     const isQuestion = data.type === "question";
     const kind = data.type;
-    const width = defaultWidth(kind);
-    const height = isSource ? 430 : isQuestion ? 300 : 300;
+    const width = data.rect ? data.rect.w : defaultWidth(kind);
+    const height = data.rect ? data.rect.h : isSource ? 430 : isQuestion ? 300 : 300;
 
-    const anchorRect =
-      anchors[kind] ? { x: anchors[kind].x + 40, y: anchors[kind].y + anchors[kind].h + STEP } : viewportCenter();
-    const spot = findFreeSpot(width, height, anchorRect);
+    // The server remembers where a card was put, so a refresh and other tabs agree. A card
+    // without a place goes in the nearest free area to the middle of what you are looking at.
+    const spot = data.rect
+      ? { x: data.rect.x, y: data.rect.y, w: width, h: height }
+      : findFreeSpot(width, height, viewportCenter());
     occupied.push(spot);
-    anchors[kind] = spot;
+    if (!data.rect) void saveLayout(data.id, spot);
 
     const card = el("div", kind === "sticky" ? "card sticky" : "card");
     card.style.cssText = `left:${spot.x}px; top:${spot.y}px; width:${width}px; height:${height}px; z-index:${z++}`;
@@ -481,6 +482,14 @@
         card.classList.remove("dragging");
         removeEventListener("pointermove", move);
         removeEventListener("pointerup", up);
+        const rect = {
+          x: Math.round(parseFloat(card.style.left)),
+          y: Math.round(parseFloat(card.style.top)),
+          w: card.offsetWidth,
+          h: card.offsetHeight,
+        };
+        placeCard(entry, rect);
+        void saveLayout(entry.id, rect);
       };
       addEventListener("pointermove", move);
       addEventListener("pointerup", up);
@@ -503,6 +512,14 @@
       const up = () => {
         removeEventListener("pointermove", move);
         removeEventListener("pointerup", up);
+        const rect = {
+          x: Math.round(parseFloat(card.style.left)),
+          y: Math.round(parseFloat(card.style.top)),
+          w: card.offsetWidth,
+          h: card.offsetHeight,
+        };
+        placeCard(entry, rect);
+        void saveLayout(entry.id, rect);
       };
       addEventListener("pointermove", move);
       addEventListener("pointerup", up);
@@ -592,9 +609,6 @@
     cards.length = 0;
     byId.clear();
     occupied.length = 0;
-    anchors.source = null;
-    anchors.note = null;
-    anchors.question = null;
     freshCount = 0;
     paintPill();
     sawFirstCard = false;
@@ -626,9 +640,6 @@
   /** Deliberate re-pack of everything, only ever triggered by the user. */
   function tidy() {
     occupied.length = 0;
-    anchors.source = null;
-    anchors.note = null;
-    anchors.question = null;
     const ordered = [...cards].sort((a, b) => (a.dataset.kind === "source" ? -1 : 0) - (b.dataset.kind === "source" ? -1 : 0));
     let cursor = { x: 60, y: 60 };
     for (const card of ordered) {
@@ -637,6 +648,8 @@
       card.style.left = `${rect.x}px`;
       card.style.top = `${rect.y}px`;
       card.dataset.rect = JSON.stringify(rect);
+      const record = byId.get(card.dataset.id);
+      if (record) void saveLayout(record.id, { ...rect, w: card.offsetWidth, h: card.offsetHeight });
     }
     fitAll();
   }
@@ -681,6 +694,31 @@
    * browser scrolls whatever sits under the cursor: a card's body, a code view, the rail.
    * Panning the board is drag-only, because a stray scroll should never move the layout.
    */
+  /** Tell the server where a card sits, so placement survives a refresh. */
+  function saveLayout(cardId, rect) {
+    return fetch(`/layout?token=${encodeURIComponent(token)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cardId, rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h } }),
+    }).catch(() => {});
+  }
+
+  /** Move a card locally and take the space it now holds into account. */
+  function placeCard(record, rect) {
+    const card = record.card;
+    card.style.left = `${rect.x}px`;
+    card.style.top = `${rect.y}px`;
+    if (rect.w) card.style.width = `${rect.w}px`;
+    if (rect.h) card.style.height = `${rect.h}px`;
+    const old = card.dataset.rect ? JSON.parse(card.dataset.rect) : null;
+    if (old) {
+      const at = occupied.findIndex((spot) => spot.x === old.x && spot.y === old.y);
+      if (at >= 0) occupied.splice(at, 1);
+    }
+    card.dataset.rect = JSON.stringify(rect);
+    occupied.push(rect);
+  }
+
   /** Save a note the user changed: a ticked box, or text typed in the editor. */
   async function saveNote(entry, markdown) {
     entry.data = { ...entry.data, markdown };
@@ -1054,6 +1092,9 @@
         for (const card of payload.cards || []) applyMessage(card);
         sawFirstCard = (payload.cards || []).length > 0;
         if (cards.length) fitAll();
+      } else if (payload.type === "move") {
+        const record = byId.get(payload.id);
+        if (record && payload.rect) placeCard(record, payload.rect);
       } else if (payload.type === "remove") {
         dropCard({ id: payload.id });
       } else if (payload.type === "activity") {

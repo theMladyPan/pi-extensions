@@ -38,11 +38,20 @@ const PREFERRED_PORT = Number(process.env.PI_BOARD_PORT ?? 7374);
 const MAX_SOURCE_BYTES = 2_000_000;
 const ASK_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Where a card sits on the canvas. The server keeps it so a refresh and other tabs agree. */
+interface CardRect {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+}
+
 interface CardBase {
 	id: string;
 	key?: string;
 	title?: string;
 	at: number;
+	rect?: CardRect;
 }
 
 interface NoteCard extends CardBase {
@@ -273,6 +282,7 @@ function upsert(target: Board, card: Card): boolean {
 	if (existing >= 0) {
 		const previous = target.cards[existing];
 		card.id = previous.id; // keep identity stable so the browser updates in place
+		card.rect = previous.rect; // and keep the place the user put it
 		target.cards[existing] = card;
 		broadcast(target, { type: "update", card });
 		return false;
@@ -408,6 +418,33 @@ function startBoard(): Board {
 				currentCtx.abort();
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ stopped: true }));
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/layout") {
+				// The browser owns placement; the server only remembers it. Storing it means a
+				// closed card frees its space and a refresh reproduces the board exactly.
+				const body = await readBody(req);
+				let payload: { cardId?: string; rect?: Partial<CardRect> } = {};
+				try {
+					payload = JSON.parse(body) as { cardId?: string; rect?: Partial<CardRect> };
+				} catch {
+					res.writeHead(400, { "Content-Type": "text/plain" });
+					res.end("bad json");
+					return;
+				}
+				const card = cards.find((candidate) => candidate.id === payload.cardId);
+				const rect = payload.rect;
+				if (!card || !rect) {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end("no such card");
+					return;
+				}
+				const clamp = (value: unknown) =>
+					Math.max(0, Math.min(40000, Math.round(Number.isFinite(Number(value)) ? Number(value) : 0)));
+				card.rect = { x: clamp(rect.x), y: clamp(rect.y), w: clamp(rect.w), h: clamp(rect.h) };
+				broadcast(board ?? ({ clients } as Board), { type: "move", id: card.id, rect: card.rect });
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ placed: card.id }));
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/edit") {
