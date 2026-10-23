@@ -551,10 +551,26 @@
   }
 
   // ---------- view ---------------------------------------------------------
+  /**
+   * Ctrl (or Cmd) plus wheel zooms around the pointer; a plain wheel pans the board.
+   * Keeping zoom behind the modifier stops an accidental scroll from losing the layout.
+   */
+  function wheelIntent(event) {
+    if (event.ctrlKey || event.metaKey) return { kind: "zoom", factor: Math.exp(-event.deltaY * 0.0015) };
+    const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1;
+    return { kind: "pan", dx: -event.deltaX * scale, dy: -event.deltaY * scale };
+  }
+
   viewport.addEventListener("wheel", (event) => {
     event.preventDefault();
-    const factor = Math.exp(-event.deltaY * 0.0015);
-    const k = Math.min(3, Math.max(0.25, view.k * factor));
+    const intent = wheelIntent(event);
+    if (intent.kind === "pan") {
+      view.x += intent.dx;
+      view.y += intent.dy;
+      applyView();
+      return;
+    }
+    const k = Math.min(3, Math.max(0.25, view.k * intent.factor));
     const rect = viewport.getBoundingClientRect();
     const px = event.clientX - rect.left;
     const py = event.clientY - rect.top;
@@ -637,7 +653,7 @@
     name.textContent = folder;
     sess.append(name);
     sess.title = `${meta.cwd || folder} · port ${meta.port}`;
-    document.title = `pi - ${folder}`;
+    setBaseTitle(`pi - ${folder}`);
     const model = document.getElementById("statModel");
     if (meta.model) {
       model.innerHTML = `<em>${meta.model.split("/").pop()}</em>`;
@@ -652,6 +668,38 @@
     document.getElementById("statCtx").innerHTML =
       typeof meta.contextPercent === "number" ? `ctx ${Math.round(meta.contextPercent)}%` : "";
   }
+
+  // A background tab announces new material the way a chat app does: the title blinks
+  // until the tab is looked at again.
+  let baseTitle = document.title || "pi - board";
+  let flashTimer = null;
+
+  function setBaseTitle(text) {
+    baseTitle = text;
+    if (!flashTimer) document.title = text;
+  }
+
+  function startFlash() {
+    if (flashTimer || !document.hidden) return;
+    let on = false;
+    flashTimer = setInterval(() => {
+      on = !on;
+      document.title = on ? `● new · ${baseTitle}` : baseTitle;
+    }, 800);
+  }
+
+  function stopFlash() {
+    if (flashTimer) {
+      clearInterval(flashTimer);
+      flashTimer = null;
+    }
+    document.title = baseTitle;
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) stopFlash();
+  });
+  addEventListener("focus", stopFlash);
 
   function setLive(up) {
     live.classList.toggle("down", !up);
@@ -679,6 +727,7 @@
         if (cards.length) fitAll();
       } else if (payload.type === "card" || payload.type === "update") {
         applyMessage(payload.card);
+        startFlash();
       } else if (payload.type === "clear") {
         clearBoard();
       }
