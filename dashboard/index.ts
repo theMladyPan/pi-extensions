@@ -17,7 +17,9 @@
  *
  * Security: the page is loopback only, the event stream and the answer endpoint
  * need the random token printed at session start, and file reads are confined to
- * the session working directory.
+ * the session working directory. The composer's folder picker lists the names in a
+ * folder anywhere the user can read, which is a pointer the agent opens with its own
+ * tools; it never sends file contents.
  *
  * Voice mode is a separate extension. When both are loaded, the `board:note`
  * event lets voice read board notes aloud; neither depends on the other.
@@ -26,9 +28,9 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -835,6 +837,11 @@ async function readJson<T>(req: import("node:http").IncomingMessage, res: Server
 	}
 }
 
+/** How many names one folder listing may carry, so a huge folder cannot stall the page. */
+const BROWSE_LIMIT = 500;
+/** A name is pasted into a message as one line, so a break inside it could pose as a new line. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f\u2028\u2029]/;
+
 function startBoard(): Board {
 	const remembered = readRemembered(process.cwd());
 	const freshToken = () => randomBytes(16).toString("hex");
@@ -885,6 +892,78 @@ function startBoard(): Board {
 				};
 				req.on("close", forget);
 				res.on("error", forget);
+				return;
+			}
+			// The composer's picker walks folders anywhere the user can read and answers with names
+			// only. Reading a file is the agent's job, through its own tools and their permissions.
+			if (req.method === "GET" && url.pathname === "/browse") {
+				const start = currentCtx?.cwd ?? process.cwd();
+				const asked = url.searchParams.get("path") ?? "";
+				const showHidden = url.searchParams.get("hidden") === "1";
+				let dir = start;
+				// A path that names a file opens the folder holding it, narrowed to that name.
+				let named = "";
+				if (asked) {
+					// A bare `~` is the home folder, and a relative path is read inside the session
+					// folder rather than whatever directory the server was started in.
+					const expanded =
+						asked === "~"
+							? homedir()
+							: asked.startsWith("~/")
+								? join(homedir(), asked.slice(2))
+								: resolve(start, asked);
+					try {
+						// realpath resolves `..` and symlinks, so the answer names where a folder really is.
+						dir = await realpath(expanded);
+						if (!(await stat(dir)).isDirectory()) {
+							named = basename(dir);
+							dir = dirname(dir);
+						}
+					} catch {
+						// A folder the user named and the server cannot open is worth saying out loud:
+						// quietly showing a different one would put the wrong path in the message.
+						res.writeHead(404, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+						res.end(`no such folder: ${asked}`);
+						return;
+					}
+				}
+				const query = (url.searchParams.get("q") ?? named).trim().toLowerCase();
+				const entries: { name: string; path: string; dir: boolean }[] = [];
+				try {
+					for (const entry of await readdir(dir, { withFileTypes: true })) {
+						if (!showHidden && entry.name.startsWith(".")) continue;
+						if (CONTROL_CHARS.test(entry.name)) continue;
+						if (query && !entry.name.toLowerCase().includes(query)) continue;
+						let isDir = entry.isDirectory();
+						if (entry.isSymbolicLink()) {
+							try {
+								isDir = (await stat(join(dir, entry.name))).isDirectory();
+							} catch {
+								continue; // a link to nothing would only fail after it was picked
+							}
+						}
+						entries.push({ name: entry.name, path: join(dir, entry.name), dir: isDir });
+					}
+				} catch {
+					res.writeHead(403, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+					res.end(`cannot list ${dir}`);
+					return;
+				}
+				// Folders first, then files, each alphabetically, and only then the cut: a list capped
+				// in readdir order hides whatever sorts last, which in a big folder is most of it.
+				entries.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+				res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+				res.end(
+					JSON.stringify({
+						path: dir,
+						parent: dirname(dir),
+						home: homedir(),
+						cwd: start,
+						entries: entries.slice(0, BROWSE_LIMIT),
+						total: entries.length,
+						truncated: entries.length > BROWSE_LIMIT,
+					}),
+				);
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/message") {

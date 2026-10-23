@@ -1240,17 +1240,17 @@
       msgBox.placeholder = "ask a follow-up about this card…  (esc to send to the board instead)";
       msgBox.focus();
     } else {
-      msgBox.placeholder = "message the agent…  (enter sends, shift+enter for a new line, paste an image to attach it)";
+      msgBox.placeholder = "message the agent…  (enter sends, shift+enter for a new line, paste an image or pick files)";
     }
     composerHint.textContent = sendMode === "steer" ? "interrupts the run" : "waits for this run to finish";
   }
 
   document.getElementById("replyChipClear").addEventListener("click", () => setReplyTarget(null));
 
-  for (const button of document.querySelectorAll("#composer .modes button")) {
+  for (const button of document.querySelectorAll("#composer .modes button[data-mode]")) {
     button.addEventListener("click", () => {
       sendMode = button.dataset.mode === "steer" ? "steer" : "queue";
-      for (const other of document.querySelectorAll("#composer .modes button")) {
+      for (const other of document.querySelectorAll("#composer .modes button[data-mode]")) {
         other.classList.toggle("on", other === button);
       }
       composerHint.textContent = sendMode === "steer" ? "interrupts the run" : "waits for this run to finish";
@@ -1323,9 +1323,233 @@
     }
   });
 
+  // ---------- file picker --------------------------------------------------
+  // The agent works on paths, so the picker attaches paths: it lists a folder's names and never
+  // pulls file contents through the browser. Picking starts at the session folder and walks
+  // anywhere the server can read, which is what the user asked for when attaching a file.
+  const picker = document.getElementById("picker");
+  const pickList = document.getElementById("pickList");
+  const pickPathInput = document.getElementById("pickPath");
+  const pickFilter = document.getElementById("pickFilter");
+  const pickHidden = document.getElementById("pickHidden");
+  const pickUp = document.getElementById("pickUp");
+  const pickCount = document.getElementById("pickCount");
+  const pickError = document.getElementById("pickError");
+  const pathChips = document.getElementById("pathChips");
+  /** Picked paths survive navigation, so one message can name files from several folders. */
+  const picked = new Map();
+  let pickerAt = "";
+  let listed = [];
+  let listedTotal = 0;
+  /** Every listing bumps this, so a slow reply cannot land on top of a newer one. */
+  let browseSeq = 0;
+  let filterTimer = 0;
+
+  /** `~` in place of the home folder keeps a chip short enough to read in a row. */
+  function shortenPath(path) {
+    const home = picker.dataset.home || "";
+    return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+  }
+
+  function drawChips() {
+    pathChips.replaceChildren();
+    for (const [path, meta] of picked) {
+      const chip = el("div", meta.dir ? "chip folder" : "chip");
+      chip.title = path;
+      const label = el("span", "");
+      label.textContent = shortenPath(path);
+      const remove = el("button", "");
+      remove.textContent = "×";
+      remove.title = "remove";
+      remove.addEventListener("click", () => {
+        picked.delete(path);
+        drawChips();
+        drawList();
+      });
+      chip.append(label, remove);
+      pathChips.appendChild(chip);
+    }
+    const count = picked.size;
+    pickCount.textContent = count === 0 ? "nothing picked" : count === 1 ? "1 path" : `${count} paths`;
+  }
+
+  function drawList() {
+    pickList.replaceChildren();
+    if (listed.length === 0) {
+      const hint = el("div", "p-empty");
+      hint.textContent = pickFilter.value.trim() ? "nothing matches" : "empty folder";
+      pickList.appendChild(hint);
+      return;
+    }
+    for (const entry of listed) {
+      const isPicked = picked.has(entry.path);
+      const row = el("div", `p-item${entry.dir ? " dir" : ""}${isPicked ? " on" : ""}`);
+      row.title = entry.path;
+      const tick = el("span", "p-tick");
+      tick.textContent = isPicked ? "●" : "○";
+      const name = el("span", "p-name");
+      name.textContent = entry.name;
+      row.append(tick, name);
+      // A click picks; the chevron opens, because walking a tree and choosing in it are two acts.
+      row.addEventListener("click", () => {
+        if (isPicked) picked.delete(entry.path);
+        else picked.set(entry.path, { dir: entry.dir });
+        drawList();
+        drawChips();
+      });
+      if (entry.dir) {
+        const open = el("button", "p-open");
+        open.textContent = "›";
+        open.title = "open this folder";
+        open.addEventListener("click", (event) => {
+          event.stopPropagation();
+          void browse(entry.path);
+        });
+        row.appendChild(open);
+      }
+      pickList.appendChild(row);
+    }
+    if (listedTotal > listed.length) {
+      const note = el("div", "p-empty");
+      note.textContent = `${listedTotal - listed.length} more — type in the filter to narrow it`;
+      pickList.appendChild(note);
+    }
+  }
+
+  /** The list hangs off the composer's top edge, which is where the field is however the page moves. */
+  function placePicker() {
+    const box = document.getElementById("composer").getBoundingClientRect();
+    const width = Math.min(430, window.innerWidth - 28);
+    picker.style.width = `${width}px`;
+    const left = Math.min(Math.max(14, box.left + 14), window.innerWidth - width - 14);
+    picker.style.left = `${left}px`;
+    // Anchored by its bottom, so the list grows upward and never drifts across the field.
+    picker.style.bottom = `${Math.max(14, window.innerHeight - box.top + 8)}px`;
+  }
+
+  async function browse(path, { focus = true } = {}) {
+    const seq = (browseSeq += 1);
+    pickError.hidden = true;
+    try {
+      const query = new URLSearchParams({ token, path: path ?? "" });
+      if (pickHidden.checked) query.set("hidden", "1");
+      const needle = pickFilter.value.trim();
+      // Filtering happens on the server because the server is what caps how many names travel.
+      if (needle) query.set("q", needle);
+      const response = await fetch(`/browse?${query}`);
+      if (seq !== browseSeq) return;
+      if (!response.ok) throw new Error((await response.text()).slice(0, 120) || response.statusText);
+      const data = await response.json();
+      if (seq !== browseSeq) return;
+      pickerAt = data.path;
+      picker.dataset.home = data.home || "";
+      pickPathInput.value = shortenPath(data.path);
+      pickUp.disabled = data.parent === data.path;
+      pickUp.dataset.parent = data.parent;
+      listed = data.entries;
+      listedTotal = data.total ?? data.entries.length;
+      drawList();
+      drawChips();
+      picker.hidden = false;
+      placePicker();
+      // Typing a filter must not have its text selected out from under it, so only an
+      // open or a deliberate move takes focus.
+      if (focus) {
+        pickFilter.focus();
+        pickFilter.select();
+      }
+    } catch (error) {
+      if (seq !== browseSeq) return;
+      // The folder already open stays open: a typo in a path should not wipe the list.
+      pickError.textContent = error.message || String(error);
+      pickError.hidden = false;
+      picker.hidden = false;
+      placePicker();
+    }
+  }
+
+  const closePicker = () => {
+    picker.hidden = true;
+    // Whatever is still in flight belongs to a picker that is gone.
+    browseSeq += 1;
+    clearTimeout(filterTimer);
+  };
+
+  document.getElementById("pickFiles").addEventListener("click", () => {
+    if (!picker.hidden) closePicker();
+    else void browse(pickerAt);
+  });
+  document.getElementById("pickDone").addEventListener("click", closePicker);
+  document.getElementById("pickClose").addEventListener("click", closePicker);
+  document.getElementById("pickHere").addEventListener("click", () => {
+    if (!pickerAt) return;
+    if (picked.has(pickerAt)) picked.delete(pickerAt);
+    else picked.set(pickerAt, { dir: true });
+    drawList();
+    drawChips();
+  });
+  pickUp.addEventListener("click", () => {
+    if (pickUp.dataset.parent) void browse(pickUp.dataset.parent);
+  });
+  document.getElementById("pickHome").addEventListener("click", () => void browse("~"));
+  document.getElementById("pickCwd").addEventListener("click", () => void browse(""));
+  pickHidden.addEventListener("change", () => void browse(pickerAt, { focus: false }));
+  pickFilter.addEventListener("input", () => {
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => {
+      if (!picker.hidden) void browse(pickerAt, { focus: false });
+    }, 160);
+  });
+  pickFilter.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePicker();
+      msgBox.focus();
+    }
+  });
+  pickPathInput.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePicker();
+      msgBox.focus();
+      return;
+    }
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    void browse(pickPathInput.value.trim() || "/");
+  });
+  window.addEventListener("resize", () => {
+    if (!picker.hidden) placePicker();
+  });
+  // A click anywhere else puts the picker away, the same as closing it. The chip row is part of
+  // the composer's own furniture, so removing a pick is not a click on the board.
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (picker.hidden || event.target.closest("#picker, #pickFiles, #pathChips")) return;
+      closePicker();
+    },
+    true,
+  );
+
+  /** Paths travel as text, which the agent's own file tools read directly. */
+  function pickedPathsText() {
+    const lines = [...picked].map(([path, meta]) => `${path}${meta.dir ? "/" : ""}`);
+    return `Files and folders:\n${lines.join("\n")}`;
+  }
+
   async function sendMessage() {
-    const text = msgBox.value.trim();
-    if (!text && pendingImages.length === 0) return;
+    // Enter fires again while the first send is in flight; a second body would carry a new id,
+    // slip past the server's duplicate guard and deliver the message twice.
+    if (sendBtn.disabled) return;
+    const draft = msgBox.value;
+    const typed = draft.trim();
+    if (!typed && pendingImages.length === 0 && picked.size === 0) return;
+    const text = picked.size === 0 ? typed : `${typed}${typed ? "\n\n" : ""}${pickedPathsText()}`;
+    // What this message carries, so a pick or a keystroke made while it travels is still there.
+    const sentPaths = [...picked.keys()];
+    const sentImages = [...pendingImages];
+    const sentTarget = replyTarget;
     sendBtn.disabled = true;
     // Both attempts carry the same id, so a retry after a reset cannot deliver twice.
     const body = JSON.stringify({
@@ -1333,7 +1557,7 @@
       cardId: replyTarget ? replyTarget.id : undefined,
       text,
       mode: sendMode,
-      images: pendingImages.map((image) => ({ data: image.data, mimeType: image.mimeType })),
+      images: sentImages.map((image) => ({ data: image.data, mimeType: image.mimeType })),
     });
     try {
       let response;
@@ -1352,10 +1576,16 @@
         }
       }
       if (!response.ok) throw new Error((await response.text()).slice(0, 80) || response.statusText);
-      msgBox.value = "";
-      pendingImages.length = 0;
+      if (msgBox.value === draft) msgBox.value = "";
+      for (const image of sentImages) {
+        const at = pendingImages.indexOf(image);
+        if (at >= 0) pendingImages.splice(at, 1);
+      }
       drawAttachments();
-      setReplyTarget(null);
+      for (const path of sentPaths) picked.delete(path);
+      drawChips();
+      closePicker();
+      if (replyTarget === sentTarget) setReplyTarget(null);
       composerHint.textContent = sendMode === "steer" ? "steered" : "queued";
     } catch (error) {
       const gone = error instanceof TypeError; // fetch rejects like this when nothing answers
@@ -1389,6 +1619,8 @@
    * card is the reply target the field sits at the bottom of that card, and `esc` puts it back.
    */
   function dockComposer(entry) {
+    // The field is about to move, so a list hanging off it is closed rather than left behind.
+    closePicker();
     if (entry) {
       // A folded card has no room for a field, so replying unfolds it.
       if (entry.card.classList.contains("mini")) setMini(entry.card, false);

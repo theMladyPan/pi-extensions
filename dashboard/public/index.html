@@ -284,6 +284,17 @@
   #attachments .shot button { position: absolute; top: -5px; right: -5px; width: 16px; height: 16px;
     border-radius: 50%; border: 1px solid var(--border); background: #21262d; color: var(--text);
     font: 10px var(--mono); line-height: 1; cursor: pointer; padding: 0; }
+  /* One row, scrolling sideways, so a long list of picks costs one line of the field. */
+  #pathChips { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; }
+  #pathChips:empty { display: none; }
+  #pathChips .chip { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; max-width: 240px;
+    font: 11px var(--mono); color: var(--text); background: #161b22;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 4px 2px 9px; }
+  #pathChips .chip.folder { color: var(--accent); border-color: var(--accent-dim); }
+  #pathChips .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pathChips .chip button { border: 0; background: transparent; color: var(--muted); cursor: pointer;
+    font: 12px var(--mono); line-height: 1; padding: 1px 4px; border-radius: 50%; }
+  #pathChips .chip button:hover { background: #21262d; color: var(--text); }
   #composer textarea {
     flex: 1; resize: none; font: 14px/1.45 system-ui, sans-serif; color: var(--text);
     background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
@@ -308,6 +319,40 @@
   #replyChip button { border: 0; background: transparent; color: #e3b341; cursor: pointer;
     font: 12px var(--mono); line-height: 1; padding: 1px 4px; border-radius: 50%; }
   #replyChip button:hover { background: rgba(210,153,34,.25); }
+
+  /* Folder picker: anchored above the composer, sized so a folder fits in one glance. */
+  #picker { position: fixed; z-index: 2000; display: flex; flex-direction: column; gap: 6px;
+    padding: 8px; background: rgba(13,17,23,.98); border: 1px solid var(--border-bright);
+    border-radius: 10px; box-shadow: 0 18px 40px rgba(0,0,0,.55); }
+  #picker[hidden] { display: none; }
+  #picker .p-row { display: flex; gap: 6px; align-items: center; }
+  #picker input[type=text] { flex: 1; min-width: 0; font: 11px var(--mono); color: var(--text);
+    background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
+  #picker input[type=text]:focus { outline: none; border-color: var(--accent-dim); }
+  #picker button { font: 11px var(--mono); color: var(--muted); background: #161b22;
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; cursor: pointer; }
+  #picker button:hover { color: var(--text); border-color: var(--border-bright); }
+  #picker button:disabled { opacity: .4; cursor: default; }
+  #picker .p-hidden { display: flex; align-items: center; gap: 4px; font: 11px var(--mono);
+    color: var(--muted); white-space: nowrap; cursor: pointer; }
+  #pickList { max-height: 230px; overflow: auto; border: 1px solid var(--border);
+    border-radius: 6px; background: #0d1117; }
+  #pickList .p-item { display: flex; align-items: center; gap: 7px; padding: 3px 6px;
+    font: 12px var(--mono); color: var(--text); cursor: pointer; }
+  #pickList .p-item:hover { background: #161b22; }
+  #pickList .p-item.on .p-name { color: var(--green); }
+  #pickList .p-item .p-tick { color: var(--muted); font-size: 10px; width: 9px; }
+  #pickList .p-item.on .p-tick { color: var(--green); }
+  #pickList .p-item .p-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pickList .p-item.dir .p-name { color: var(--accent); }
+  #pickList .p-item .p-open { border: 0; background: transparent; color: var(--muted);
+    cursor: pointer; font: 13px var(--mono); padding: 0 4px; }
+  #pickList .p-item .p-open:hover { color: var(--text); }
+  #pickList .p-empty { padding: 12px; color: var(--muted); font: 11px var(--mono); text-align: center; }
+  #pickError { font: 11px var(--mono); color: var(--red); padding: 0 2px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  #pickError[hidden] { display: none; }
+  #pickCount { flex: 1; font: 11px var(--mono); color: var(--muted); }
 
   /* sticky card */
   .sticky-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -354,13 +399,15 @@
 <div id="composer">
   <div class="type">
     <div id="replyChip" hidden><span id="replyChipText"></span><button id="replyChipClear" title="ask on the board instead of in this card">×</button></div>
+    <div id="pathChips"></div>
     <div id="attachments"></div>
-    <textarea id="msg" placeholder="message the agent…  (enter sends, shift+enter for a new line, paste an image to attach it)"></textarea>
+    <textarea id="msg" placeholder="message the agent…  (enter sends, shift+enter for a new line, paste an image or pick files)"></textarea>
   </div>
   <div class="side">
     <div class="modes">
       <button data-mode="queue" class="on">queue</button>
       <button data-mode="steer">steer</button>
+      <button id="pickFiles" title="attach files or folders from disk">files</button>
     </div>
     <span class="hintline" id="composerHint"></span>
     <button id="send">send</button>
@@ -370,6 +417,27 @@
 <div id="viewport">
   <div id="world"></div>
   <div class="empty" id="empty">waiting for the agent to put something on the board…</div>
+</div>
+
+<div id="picker" hidden>
+  <div class="p-row">
+    <button id="pickUp" title="parent folder">↑</button>
+    <input id="pickPath" type="text" spellcheck="false" title="type a folder and press enter" />
+    <button id="pickHome" title="home folder">home</button>
+    <button id="pickCwd" title="session folder">session</button>
+    <button id="pickClose" title="close">×</button>
+  </div>
+  <div class="p-row">
+    <input id="pickFilter" type="text" placeholder="filter this folder…" spellcheck="false" />
+    <label class="p-hidden"><input type="checkbox" id="pickHidden" /> hidden</label>
+  </div>
+  <div id="pickError" hidden></div>
+  <div id="pickList"></div>
+  <div class="p-row">
+    <span id="pickCount">nothing picked</span>
+    <button id="pickHere" title="pick the folder you are looking at">+ this folder</button>
+    <button id="pickDone" title="keep what is picked and close">done</button>
+  </div>
 </div>
 
 <script src="/board.js"></script>
