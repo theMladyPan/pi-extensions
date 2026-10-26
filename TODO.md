@@ -9,9 +9,9 @@ Ticked means in the repo. It does not mean exercised.
 - [x] **0 · Persist and restore the board** — cards, turns, layout, newest rail rows
       in `~/.pi/agent/state/boards/`, restored on start, write debounced, flush on
       stop. `5597a8a`
-- [ ] **0 · Test it with a real `/reload`** — the save side has never run: the
-      process predates the commit, so nothing is on disk yet. The next reload is the
-      last one that can empty the canvas.
+- [x] **0 · Test it with a real `/reload`** — proven: the board came back with the
+      sticky it held before the reload, at its saved rect, plus the rail rows that
+      had finished. `be4d4c2bba814da6.json` in `~/.pi/agent/state/boards/`.
 - [x] **2 · RPC transport for delegate children** — task as a `prompt` command, run
       ends on `agent_settled`, `abort` before the kill timer, `steer` proven on the
       wire. `843b040`
