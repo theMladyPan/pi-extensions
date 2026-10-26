@@ -28,15 +28,32 @@
   ::-webkit-scrollbar-thumb:hover { background: #3d444d; background-clip: content-box; }
   ::-webkit-scrollbar-corner { background: transparent; }
   body { font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  /* The keyboard is a first-class way round this board, so focus is always visible, and it sits
+     outside the element so a card border or a hover ring cannot hide it. */
+  button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  /* The board's zoom scales everything drawn inside it, ring included, so the ring on the board is
+     divided by the zoom the script publishes. Chrome outside the board keeps its plain 2px. */
+  #world button:focus-visible, #world a:focus-visible, #world [tabindex]:focus-visible {
+    outline-width: calc(2px / var(--zoom, 1)); outline-offset: calc(2px / var(--zoom, 1));
+  }
 
+  /* `hidden` is a scroll container, so a focused card can shift the board behind the pan state;
+     `clip` is not. Where `clip` is unsupported the script zeroes that scroll offset instead. */
   #viewport {
-    position: fixed; inset: 44px 0 96px var(--rail); overflow: hidden;
+    position: fixed; inset: 44px 0 96px var(--rail); overflow: hidden; overflow: clip;
     background-color: var(--bg);
     background-image: radial-gradient(circle at 1px 1px, #21262d 1px, transparent 0);
     background-size: 24px 24px;
     cursor: grab;
   }
   #viewport.dragging { cursor: grabbing; }
+  /* With the stream down nothing on the board can change, so it dims to read as stale. Each card's
+     contents dim rather than the viewport, so a docked composer stays readable while the agent is
+     blocked on a question. */
+  body.link-down #world > .card > *:not(#composer),
+  body.link-down #empty { opacity: .55; }
   /* Zoom is a real layout zoom, not a scaled bitmap: text is laid out at the size it is
      shown at, so it stays sharp instead of waiting for a repaint to catch up. */
   #world { position: absolute; top: 0; left: 0; zoom: 1; }
@@ -46,10 +63,17 @@
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     box-shadow: 0 8px 24px rgba(1, 4, 9, .5); min-width: 220px; min-height: 120px;
   }
-  .card.active { border-color: var(--accent-dim); box-shadow: 0 12px 32px rgba(31, 111, 235, .25); }
+  /* Selection is an outline, not a border colour: a card can then be active and still show its own
+     state in the border, so waiting stays pink and replying stays amber. The width and the offset
+     are divided by the zoom, like the focus ring, so both read the same at every fitted zoom. The
+     offset clears the 1px halo a state colour draws, since outlines paint above shadows. */
+  .card.active { outline: calc(2px / var(--zoom, 1)) solid var(--accent-dim);
+    outline-offset: calc(2px / var(--zoom, 1));
+    box-shadow: 0 12px 32px rgba(31, 111, 235, .25); }
   /* An answered question grows to hold its reply, up to a readable limit. */
   .card.auto-height { height: auto !important; min-height: 160px; max-height: 760px; }
-  .card.fresh { border-color: var(--accent); animation: freshPulse 1.8s ease-in-out 2; }
+  /* The badge and its pulse carry "new"; the border is left to the card's state. */
+  .card.fresh { animation: freshPulse 1.8s ease-in-out 2; }
   @keyframes freshPulse {
     0%, 100% { box-shadow: 0 8px 24px rgba(1, 4, 9, .5); }
     50% { box-shadow: 0 8px 32px rgba(88, 166, 255, .45); }
@@ -58,19 +82,29 @@
     font: 11px var(--mono); text-transform: uppercase; letter-spacing: .5px;
     color: #0d1117; background: var(--accent); border-radius: 999px; padding: 1px 6px;
   }
+  /* Same shape as the "new" tag, in the question colour: it is the way back to the card. */
+  .ask-pill {
+    font: 11px var(--mono); text-transform: uppercase; letter-spacing: .5px;
+    color: #0d1117; background: var(--pink); border: 0; border-radius: 999px; padding: 1px 6px;
+    cursor: pointer; white-space: nowrap;
+  }
   .head {
     display: flex; align-items: center; gap: 8px; padding: 8px 10px; flex: none;
     background: var(--card-head); border-bottom: 1px solid var(--border);
     cursor: grab; user-select: none;
   }
   .card.dragging .head { cursor: grabbing; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
-  .dot.note { background: var(--amber); }
-  .dot.question { background: var(--accent); box-shadow: 0 0 0 3px rgba(88,166,255,.18); }
+  /* One colour per kind, in the card head and the rail row alike. */
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.note { background: var(--muted); }
+  .dot.code { background: #d2a8ff; }
+  .dot.sticky { background: var(--amber); }
+  .dot.question { background: var(--pink); box-shadow: 0 0 0 3px rgba(219,97,162,.18); }
   .title { font-weight: 600; font-size: 13px; letter-spacing: .2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
   .sub { color: var(--muted); font: 12px var(--mono); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
+  .sub.expired { color: var(--red); }
   .spacer { flex: 1; }
   #stop { color: #f85149; border-color: rgba(248,81,73,.4); }
   #stop[disabled] { color: var(--muted); border-color: #30363d; }
@@ -91,22 +125,27 @@
   .card.mini { height: auto !important; min-height: 0; }
   .card.mini .body, .card.mini .thread, .card.mini .resize { display: none; }
   .card.mini .head { border-bottom: none; }
-  .card.replying { border-color: #d29922; box-shadow: 0 0 0 1px rgba(210,153,34,.45), 0 12px 32px rgba(1,4,9,.5); }
+  /* The pulse would repaint the halo of a card that holds the composer, so the amber ring is left
+     to say it is the reply target. */
+  .card.replying { border-color: #d29922; box-shadow: 0 0 0 1px rgba(210,153,34,.45), 0 12px 32px rgba(1,4,9,.5);
+    animation: none; }
 
-  /* Follow-ups live under the card body, in the order they were asked. */
-  .thread { flex: none; max-height: 62%; overflow: auto; border-top: 1px solid var(--border);
+  /* Follow-ups live under the card body, in the order they were asked. The whole column scrolls
+     (.card-scroll), so the thread never grows a scrollbar of its own. */
+  .thread { flex: none; border-top: 1px solid var(--border);
     background: #0f141b; padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
   .thread[hidden] { display: none; }
   .turn { display: flex; flex-direction: column; gap: 5px; }
   .turn + .turn { border-top: 1px dashed #21262d; padding-top: 8px; }
   .turn-q { color: #f0e6d2; background: #2a2415; border-left: 3px solid #d29922;
-    padding: 6px 9px; border-radius: 4px; white-space: pre-wrap; font-size: 12.5px; }
-  .turn-status { font: 10px var(--mono); color: var(--muted); text-transform: uppercase;
+    padding: 6px 9px; border-radius: 4px; white-space: pre-wrap; font-size: 13px; }
+  .turn-status { font: 11px var(--mono); color: var(--muted); text-transform: uppercase;
     letter-spacing: .5px; }
   .turn-status.answered { color: var(--green); }
   .turn-status.stopped { color: #f85149; }
   .turn-status.sent { color: var(--accent); }
-  .turn-a { padding: 0; color: #c9d1d9; font-size: 12.5px; }
+  /* The agent's answer is the thing you came to read, so it reads at the card's own size. */
+  .turn-a { padding: 0; color: #c9d1d9; font-size: 14px; }
 
   /* Markdown tables: a wide one scrolls sideways instead of bursting the card. */
   .table-wrap { overflow-x: auto; margin: 6px 0 10px; }
@@ -116,9 +155,23 @@
   .table-wrap th { background: #161b22; color: #e6edf3; font-weight: 600; white-space: nowrap; }
   .table-wrap tr:nth-child(even) td { background: rgba(22,27,34,.55); }
 
-  .body { flex: 1; overflow: auto; position: relative; }
+  /* One scroll column per card: the note and its follow-ups move together, so a card never has a
+     scrollbar inside a scrollbar. */
+  .card-scroll { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+  /* Fills the column on a fixed-height card, so the editor and the code view get the whole height,
+     and pushes the column into scrolling when the text is long. A card grown to .auto-height has
+     no fixed height to fill, so editing one falls back to its minimum while the editor is open. */
+  .body { flex: 1 0 auto; position: relative; }
+  /* The code view is absolutely positioned, so the body has no height of its own: the floor keeps
+     a source card with follow-ups from handing the whole column to the thread. */
+  .body.source-body { min-height: 140px; }
   .note-body { padding: 10px 12px; color: #c9d1d9; word-wrap: break-word; }
-  .note-body h1, .note-body h2, .note-body h3 { font-size: 14px; margin: 8px 0 4px; color: #fff; }
+  /* A heading owns the text under it, so it keeps more air above than below. */
+  .note-body h1, .note-body h2, .note-body h3 { margin: 14px 0 5px; color: #fff; }
+  .note-body h1 { font-size: 17px; }
+  .note-body h2 { font-size: 15.5px; }
+  .note-body h3 { font-size: 14.5px; }
+  .note-body > :first-child { margin-top: 0; }
   .note-body p { margin: 0 0 8px; }
   .note-body p:last-child { margin-bottom: 0; }
   .note-body strong { color: #fff; }
@@ -130,8 +183,10 @@
   .note-body .svg-wrap { margin: 8px 0; background: #0d1117; border: 1px solid var(--border);
     border-radius: 6px; padding: 8px; }
   .note-body .svg-wrap svg { max-width: 100%; height: auto; display: block; }
-  .note-body ul { margin: 0 0 8px; padding-left: 18px; list-style: none; }
+  .note-body ul { margin: 0 0 8px; padding-left: 18px; list-style: disc; }
   .note-body li { margin: 1px 0; }
+  /* A task item carries its own box in the text, so the list must not add a marker on top. */
+  .note-body li[data-tick] { list-style: none; }
   .note-body blockquote, .sticky-reply blockquote { margin: 0 0 8px; padding: 2px 0 2px 10px;
     border-left: 2px solid var(--border-bright); color: var(--muted); }
   .note-body blockquote p, .sticky-reply blockquote p { margin: 0 0 4px; }
@@ -152,13 +207,26 @@
     0% { box-shadow: 0 0 0 2px rgba(88,166,255,.9), 0 8px 24px rgba(1,4,9,.5); }
     100% { box-shadow: 0 0 0 14px rgba(88,166,255,0), 0 8px 24px rgba(1,4,9,.5); }
   }
+  /* An open question is the one thing the agent is blocked on, so it reads differently from a
+     card that merely has focus (.active), has just arrived (.fresh), holds the composer
+     (.replying) or was just jumped to (.flash). Declared last, because an animation beats a
+     plain declaration and would repaint the pink ring in the arrival colour. */
+  .card.waiting { border-color: var(--pink); box-shadow: 0 0 0 1px rgba(219,97,162,.45), 0 12px 32px rgba(1,4,9,.5); animation: none; }
   .note-body hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
+  /* A delegate card folds the full prompt and its bill away, so the face stays a headline and a
+     long prompt cannot stretch the card past its height cap. The fold rides inside the note's own
+     holder, whose last block already carries the bottom margin, so it adds none of its own. */
+  .card-details { margin: 0; border-top: 1px solid var(--border); }
+  .card-details > summary { padding: 6px 0 0; color: var(--muted); font: 12px/1.4 system-ui; cursor: pointer; }
+  .card-details > summary:hover { color: var(--text); }
+  .card-details[open] > summary { color: var(--text); }
+  .card-details > .details-body { max-height: 300px; overflow: auto; margin-top: 6px; }
 
   /* virtualized code view */
   .code-scroll { position: absolute; inset: 0; overflow: auto; background: #0f141b; }
   .code-inner { position: relative; min-width: 100%; }
   .row { position: absolute; left: 0; display: flex; font: 13px/var(--lh) var(--mono); white-space: pre; }
-  .row .n { flex: none; width: 56px; text-align: right; padding-right: 12px; color: #484f58; user-select: none; }
+  .row .n { flex: none; width: 56px; text-align: right; padding-right: 12px; color: var(--muted); user-select: none; }
   .row .t { color: #c9d1d9; padding-right: 24px; }
   .row.hit { background: rgba(88,166,255,.13); box-shadow: inset 2px 0 0 var(--accent); }
   .row.hit .n { color: var(--accent); }
@@ -166,7 +234,6 @@
   .f { color: #d2a8ff; } .n2 { color: #79c0ff; }
 
   /* interactive question card */
-  .body.q-body-wrap { overflow: auto; }
   .q-body { padding: 12px 12px 14px; display: flex; flex-direction: column; gap: 10px; }
   .q-text { color: var(--text); font-size: 14px; }
   .q-options { display: flex; flex-direction: column; gap: 6px; }
@@ -176,6 +243,9 @@
     padding: 8px 10px; cursor: pointer;
   }
   .q-opt:hover:not(:disabled) { border-color: var(--accent-dim); background: #1f2631; }
+  /* The keyboard path starts here, so a focused option looks like a hovered one rather than
+     carrying the global outline on top of it. */
+  .q-opt:focus-visible { outline: none; border-color: var(--accent-dim); background: #1f2631; }
   .q-opt:disabled { cursor: default; opacity: .55; }
   .q-opt.picked { border-color: var(--accent); background: rgba(88,166,255,.12); opacity: 1; }
   .q-free { display: flex; gap: 6px; }
@@ -185,6 +255,7 @@
   }
   .q-free input:focus { border-color: var(--accent-dim); }
   .q-done { color: var(--muted); font: 12px var(--mono); }
+  .q-done.q-problem { color: var(--red); }
 
   .resize { position: absolute; right: 0; bottom: 0; width: 14px; height: 14px; cursor: nwse-resize;
     background: linear-gradient(135deg, transparent 50%, var(--border-bright) 50%);
@@ -201,6 +272,10 @@
     display: inline-block; box-shadow: 0 0 0 3px rgba(63,185,80,.15); }
   header .live.down { color: var(--red); }
   header .live.down b { background: var(--red); box-shadow: 0 0 0 3px rgba(248,81,73,.15); }
+  /* A running agent is shown amber, so it reads as busy without the alarm of a red link. */
+  header .live.working { color: var(--amber); font-variant-numeric: tabular-nums; }
+  header .live.working b { background: var(--amber); box-shadow: 0 0 0 3px rgba(210,153,34,.15);
+    animation: pulseDot 1.1s ease-in-out infinite; }
   header .hint { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   header .sess { font: 13px var(--mono); color: var(--text); }
   header .sess b { color: var(--accent); font-weight: 600; }
@@ -238,6 +313,22 @@
   #railToggle:hover { color: var(--text); }
   #railNow { padding: 0 8px 6px; display: flex; flex-direction: column; gap: 4px; }
   #railLog { flex: 1; overflow-y: auto; padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+  /* Cards first: the rail is the map of a board too big to read on the canvas. The cap keeps
+     the activity feed below it visible however many cards there are. */
+  #railCards { flex: 0 1 auto; min-height: 0; max-height: 45%; overflow-y: auto;
+    padding: 0 8px 6px; display: flex; flex-direction: column; gap: 2px; }
+  #railCards:empty { display: none; }
+  #railCards .rail-card { display: flex; align-items: center; gap: 6px; width: 100%; flex: none;
+    padding: 3px 6px; border: 1px solid transparent; border-radius: 6px; background: none;
+    color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  #railCards .rail-card:hover { background: #0f141b; border-color: #1c2128; }
+  #railCards .rail-card:focus-visible { outline: none; border-color: var(--accent-dim); }
+  #railCards .rail-card .dot { width: 6px; height: 6px; }
+  #railCards .rail-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; color: var(--text); }
+  #railCards .rail-state { flex: none; color: var(--muted); font-size: 11px; }
+  #railCards .rail-card.wants .rail-state { color: var(--pink); }
+  #railCards .rail-card.updated .rail-state { color: var(--accent); }
   .act { border-radius: 6px; padding: 5px 7px; background: #0f141b; border: 1px solid #1c2128;
     flex: none; }
   .act .top { display: flex; align-items: center; gap: 6px; }
@@ -247,7 +338,7 @@
   .act.error { border-color: rgba(248,81,73,.45); }
   .act .name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .act .ms { margin-left: auto; color: var(--muted); font-size: 11px; flex: none; }
-  .act .target, .act .note { color: #6e7681; font-size: 11px; overflow: hidden;
+  .act .target, .act .note { color: var(--muted); font-size: 11px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .act.reply { background: #10161e; border-color: #232a33; }
   .act.reply .note { color: #c9d1d9; white-space: pre-wrap; display: -webkit-box;
@@ -337,9 +428,12 @@
     color: var(--muted); white-space: nowrap; cursor: pointer; }
   #pickList { max-height: 230px; overflow: auto; border: 1px solid var(--border);
     border-radius: 6px; background: #0d1117; }
-  #pickList .p-item { display: flex; align-items: center; gap: 7px; padding: 3px 6px;
-    font: 12px var(--mono); color: var(--text); cursor: pointer; }
-  #pickList .p-item:hover { background: #161b22; }
+  /* Each row is a real button so the list can be walked with the keyboard; the button look is
+     stripped so a row still reads as a row. */
+  #pickList .p-item { display: flex; align-items: center; gap: 7px; padding: 3px 6px; width: 100%;
+    font: 12px var(--mono); color: var(--text); background: none; border: 0; text-align: left;
+    cursor: pointer; }
+  #pickList .p-item:hover, #pickList .p-item.hl { background: #161b22; }
   #pickList .p-item.on .p-name { color: var(--green); }
   #pickList .p-item .p-tick { color: var(--muted); font-size: 10px; width: 9px; }
   #pickList .p-item.on .p-tick { color: var(--green); }
@@ -357,8 +451,8 @@
   /* sticky card */
   .sticky-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
   .sticky-text { color: #f0e6d2; background: #2a2415; border-left: 3px solid #d29922;
-    padding: 8px 10px; border-radius: 4px; white-space: pre-wrap; font-size: 13px; }
-  .card.sticky .dot { background: #d29922; }
+    padding: 8px 10px; border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere;
+    font-size: 13px; }
   .sticky-status { font: 11px var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
   .sticky-status.sent { color: var(--accent); }
   .sticky-status.answered { color: var(--green); }
@@ -369,13 +463,21 @@
   header button:hover { color: var(--text); border-color: var(--border-bright); }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
     font-size: 14px; pointer-events: none; text-align: center; padding: 20px; }
+  /* Each of the board's three animations repeats a state the text already spells out, so the board
+     loses nothing when the reader asks for less motion. Last, because it kills rules from the card
+     states, the header and the rail alike. */
+  @media (prefers-reduced-motion: reduce) {
+    .card.fresh, .card.flash, header .live.working b, .act.running .dot { animation: none; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <span class="brand" title="ctrl+wheel: zoom · drag background: pan · drag header: move · corner: resize">pi</span>
+  <span class="brand" title="ctrl+wheel: zoom · wheel or drag background: pan · drag header: move · corner: resize · f: fit · 0: 100% · n: next · r: reply">pi</span>
   <span class="sess" id="sess"></span>
-  <span class="live" id="live"><b></b> <span id="liveText">connecting</span></span>
+  <!-- Polite, so the state is spoken when it changes; the elapsed clock is decoration that ticks
+       every second and is hidden, so it is never read out. -->
+  <span class="live" id="live" role="status" aria-live="polite"><b aria-hidden="true"></b> <span id="liveText">connecting</span><span id="liveClock" aria-hidden="true"></span></span>
   <span class="grow"></span>
   <span class="stat" id="statModel"></span>
   <span class="stat" id="statTokens"></span>
@@ -389,7 +491,9 @@
 </header>
 
 <aside id="rail">
-  <div class="rail-head">activity <b id="railRunning"></b><button id="railToggle" title="hide the activity rail">«</button></div>
+  <div class="rail-head">cards <b id="railCardCount"></b><button id="railToggle" title="hide the rail">«</button></div>
+  <div id="railCards"></div>
+  <div class="rail-head">activity <b id="railRunning"></b></div>
   <div id="railNow"></div>
   <div id="railLog"></div>
   <div id="railGrip" title="drag to resize"></div>
@@ -409,7 +513,7 @@
       <button data-mode="steer">steer</button>
       <button id="pickFiles" title="attach files or folders from disk">files</button>
     </div>
-    <span class="hintline" id="composerHint"></span>
+    <span class="hintline" id="composerHint" role="status" aria-live="polite"></span>
     <button id="send">send</button>
   </div>
 </div>
@@ -419,7 +523,7 @@
   <div class="empty" id="empty">waiting for the agent to put something on the board…</div>
 </div>
 
-<div id="picker" hidden>
+<div id="picker" role="dialog" aria-label="attach files or folders" hidden>
   <div class="p-row">
     <button id="pickUp" title="parent folder">↑</button>
     <input id="pickPath" type="text" spellcheck="false" title="type a folder and press enter" />

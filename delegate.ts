@@ -518,7 +518,13 @@ export default function delegateExtension(pi: ExtensionAPI) {
         pi.events.emit("delegate:progress", {
           toolCallId,
           role,
+          // The short task titles the card; the full prompt is what the reader opens to check.
           task: mainTask.slice(0, 240),
+          prompt: mainTask,
+          provider,
+          model,
+          thinking,
+          tokens: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite },
           tools: completedTools.slice(-8),
           toolCount: completedTools.length,
           changedFiles: [...changedFiles].slice(-8),

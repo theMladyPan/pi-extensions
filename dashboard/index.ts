@@ -114,6 +114,8 @@ interface Turn {
 interface NoteCard extends CardBase {
 	type: "note";
 	markdown: string;
+	/** Folded detail under the note, for what the card face has no room to show. */
+	details?: string;
 }
 
 interface SourceCard extends CardBase {
@@ -128,8 +130,10 @@ interface QuestionCard extends CardBase {
 	question: string;
 	options: string[];
 	allowFreeText: boolean;
-	status: "open" | "answered";
+	status: "open" | "answered" | "expired";
 	answer?: string;
+	/** When the ask gives up, so the board can show the wait has an end. */
+	expiresAt: number;
 }
 
 /** A message the user typed on the board; the agent's answer lands on the same card. */
@@ -172,6 +176,8 @@ interface BoardMeta {
 	contextPercent: number | null;
 	/** True while the agent is working, so the board can offer a stop button. */
 	running: boolean;
+	/** Epoch ms when the current run began, so the board can show how long it has been working. */
+	runStartedAt: number | null;
 }
 
 interface Board {
@@ -194,6 +200,7 @@ const EMPTY_META: BoardMeta = {
 	cost: 0,
 	contextPercent: null,
 	running: false,
+	runStartedAt: null,
 };
 
 let board: Board | undefined;
@@ -201,6 +208,8 @@ let currentCtx: ExtensionContext | undefined;
 /** Whether a run is in flight. `agent_end` can be followed by more work, so this clears
  *  only when the whole run settles. */
 let running = false;
+/** When the run that is currently in flight began, or null while the board is idle. */
+let runStartedAt: number | null = null;
 let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
 /** Set by the extension so the HTTP handler can hand a board message to the session. */
@@ -622,6 +631,7 @@ function currentMeta(target: Board): BoardMeta {
 		cost: totals.cost,
 		contextPercent: currentCtx?.getContextUsage()?.percent ?? null,
 		running,
+		runStartedAt,
 	};
 }
 
@@ -722,6 +732,12 @@ function forgetCard(cardId: string): void {
 /** True while some exchange is waiting for the answer being written now. */
 function awaitingAnswer(cardId: string): boolean {
 	return awaitingTurns.some((pending) => pending.cardId === cardId);
+}
+
+/** Release an answer nobody can give any more, so the ask returns instead of timing out. */
+function resolveAsk(cardId: string): void {
+	pendingAnswers.get(cardId)?.("");
+	pendingAnswers.delete(cardId);
 }
 
 /** Hand one exchange to the session and keep its card showing what happened to it. */
@@ -1136,6 +1152,9 @@ function startBoard(): Board {
 				broadcast(board ?? ({ clients } as Board), { type: "remove", id: closed.id });
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ closed: closed.id }));
+				// Released only now: the remove has to reach the clients before the ask's
+				// continuation re-adds the card, or the card the user dismissed comes back.
+				resolveAsk(closed.id);
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/answer") {
@@ -1376,25 +1395,34 @@ const askTool = defineTool({
 			allowFreeText: params.allowFreeText !== false,
 			status: "open",
 			at: Date.now(),
+			expiresAt: Date.now() + ASK_TIMEOUT_MS,
 		};
 		upsert(target, card);
 		emit("board:note", { title: card.title, text: params.question });
 
+		// A local flag rather than a different resolution value: a timeout is the only path that
+		// leaves the question unanswered by anyone, and the card has to say so.
+		let expired = false;
 		const answer = await new Promise<string>((done) => {
 			const finish = (value: string) => {
 				clearTimeout(timer);
 				pendingAnswers.delete(card.id);
 				done(value);
 			};
-			const timer = setTimeout(() => finish(""), ASK_TIMEOUT_MS);
+			const timer = setTimeout(() => {
+				expired = true;
+				finish("");
+			}, ASK_TIMEOUT_MS);
 			pendingAnswers.set(card.id, finish);
 			signal?.addEventListener("abort", () => finish(""));
 		});
 
 		if (!answer) {
-			card.status = "answered";
-			card.answer = "no answer";
-			upsert(target, card);
+			card.status = expired ? "expired" : "answered";
+			if (!expired) card.answer = "no answer";
+			// The card may have been dismissed while this ask was waiting; putting it back here
+			// would return it seconds after the user closed it. On a timeout it is still there.
+			if (target.cards.some((candidate) => candidate.id === card.id)) upsert(target, card);
 			return {
 				content: [{ type: "text", text: "The user did not answer on the board." }],
 				details: { cardId: card.id, answered: false },
@@ -1402,7 +1430,7 @@ const askTool = defineTool({
 		}
 		card.status = "answered";
 		card.answer = answer;
-		upsert(target, card);
+		if (target.cards.some((candidate) => candidate.id === card.id)) upsert(target, card);
 		return {
 			content: [{ type: "text", text: `The user answered on the board: ${answer}` }],
 			details: { cardId: card.id, answered: true },
@@ -1419,6 +1447,8 @@ const clearTool = defineTool({
 		currentCtx = ctx ?? currentCtx;
 		const target = boardForTool();
 		if (!target) return { content: [{ type: "text", text: OFF_MESSAGE }], details: undefined };
+		// A card that is gone can no longer be answered, so the asks behind them return now.
+		for (const card of target.cards) resolveAsk(card.id);
 		target.cards.length = 0;
 		broadcast(target, { type: "clear" });
 		return { content: [{ type: "text", text: "Board cleared." }], details: undefined };
@@ -1475,6 +1505,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 					ctx.ui.notify(OFF_MESSAGE, "warning");
 					return;
 				}
+				for (const card of target.cards) resolveAsk(card.id);
 				target.cards.length = 0;
 				broadcast(target, { type: "clear" });
 				ctx.ui.notify("Board cleared", "info");
@@ -1573,6 +1604,12 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	interface DelegateRun {
 		role: string;
 		task: string;
+		/** The whole task packet as sent, kept for the folded detail under the card. */
+		prompt?: string;
+		provider?: string;
+		model?: string;
+		thinking?: string;
+		tokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		tools: string[];
 		toolCount: number;
 		fileCount: number;
@@ -1591,10 +1628,58 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 	};
 
+	/** Token counts are read at a glance, so whole numbers below ten thousand and a rounded thousand above. */
+	const formatTokens = (tokens: number): string =>
+		tokens < 10000 ? String(Math.round(tokens)) : `${Math.round(tokens / 1000)}k`;
+
+	/** `provider:model · thinking`, showing only the part the run actually reported. */
+	const modelFacts = (run: DelegateRun): string[] =>
+		[
+			run.provider && run.model ? `${run.provider}:${run.model}` : (run.provider ?? run.model ?? ""),
+			run.thinking ? `thinking ${run.thinking}` : "",
+		].filter(Boolean);
+
+	/** Same cap the board puts on an edited note: the prompt rides every progress event. */
+	const PROMPT_CAP = 20000;
+
+	// The card face is a headline; the prompt and the bill are what the human opens the card for.
+	function delegateDetails(run: DelegateRun): string | undefined {
+		const full = run.prompt ?? run.task ?? "";
+		const prompt = full.slice(0, PROMPT_CAP);
+		// One backtick longer than the longest run in the prompt, so a packet quoting its own code
+		// fence still lands in one block. Three is the floor the renderer accepts.
+		const longest = Math.max(0, ...(prompt.match(/`+/g) ?? []).map((ticks) => ticks.length));
+		const fence = "`".repeat(Math.max(3, longest + 1));
+		const sent = prompt ? `${fence}\n${prompt}\n${fence}` : "";
+		const cut = full.length > prompt.length ? `prompt cut at ${PROMPT_CAP} characters` : "";
+		const model = modelFacts(run);
+		const tokens = run.tokens;
+		const spent = tokens
+			? [
+					tokens.input ? `in ${formatTokens(tokens.input)}` : "",
+					tokens.output ? `out ${formatTokens(tokens.output)}` : "",
+					tokens.cacheRead ? `cache read ${formatTokens(tokens.cacheRead)}` : "",
+					tokens.cacheWrite ? `cache write ${formatTokens(tokens.cacheWrite)}` : "",
+					run.cost > 0 ? `$${run.cost.toFixed(4)}` : "",
+				]
+					.filter(Boolean)
+					.join(" · ")
+			: "";
+		const lines = [
+			sent,
+			cut,
+			model.length ? `**model** ${model.join(" · ")}` : "",
+			spent ? `**tokens** ${spent}` : "",
+		].filter(Boolean);
+		return lines.length ? lines.join("\n\n") : undefined;
+	}
+
 	function delegateMarkdown(run: DelegateRun, durationMs: number): string {
 		const finished = run.status && run.status !== "running";
 		const facts = [
 			`**${finished ? run.status : "running"}** · ${elapsed(durationMs)}`,
+			// The face says which model ran; the thinking level stays in the fold with the run.
+			modelFacts(run)[0] ?? "",
 			`${run.toolCount} tool${run.toolCount === 1 ? "" : "s"}`,
 			run.fileCount ? `${run.fileCount} file${run.fileCount === 1 ? "" : "s"} changed` : "",
 			run.cost > 0 ? `$${run.cost.toFixed(2)}` : "",
@@ -1613,6 +1698,11 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			toolCallId?: string;
 			role?: string;
 			task?: string;
+			prompt?: string;
+			provider?: string;
+			model?: string;
+			thinking?: string;
+			tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 			tools?: string[];
 			toolCount?: number;
 			fileCount?: number;
@@ -1636,6 +1726,18 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		run.toolCount = event.toolCount ?? run.toolCount;
 		run.fileCount = event.fileCount ?? run.fileCount;
 		run.cost = event.cost ?? run.cost;
+		run.prompt = event.prompt ?? run.prompt;
+		run.provider = event.provider ?? run.provider;
+		run.model = event.model ?? run.model;
+		run.thinking = event.thinking ?? run.thinking;
+		if (event.tokens) {
+			run.tokens = {
+				input: event.tokens.input ?? 0,
+				output: event.tokens.output ?? 0,
+				cacheRead: event.tokens.cacheRead ?? 0,
+				cacheWrite: event.tokens.cacheWrite ?? 0,
+			};
+		}
 		if (event.status) run.status = event.status;
 		if (event.summary) run.summary = event.summary;
 		delegateRuns.set(event.toolCallId, run);
@@ -1650,6 +1752,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			key: `delegate-${event.toolCallId}`,
 			title: `delegate · ${run.role}`,
 			markdown: delegateMarkdown(run, event.durationMs ?? Date.now() - run.startedAt),
+			details: delegateDetails(run),
 			at: run.startedAt,
 		});
 	});
@@ -1706,6 +1809,9 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
+		// A second session in the same process starts idle, so the previous run's clock is dropped.
+		running = false;
+		runStartedAt = null;
 		// Only the interactive session owns a port; print and subagent runs stay headless.
 		if (enabled && ctx.mode === "tui") {
 			announceBoard(ensureBoard(), ctx);
@@ -1715,6 +1821,8 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		currentCtx = ctx;
+		// One run can start the agent more than once, so the clock keeps its first start.
+		if (!running) runStartedAt = Date.now();
 		running = true;
 		pushMeta();
 		const live = Boolean(enabled && board) && ctx.mode === "tui";
@@ -1739,11 +1847,14 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	// that asked what happened to it.
 	pi.on("agent_settled", async (event) => {
 		running = false;
+		runStartedAt = null;
 		if (board) {
 			for (const row of board.activity) {
 				if (row.kind === "tool" && row.status === "running") {
 					row.status = "error";
 					row.summary = "stopped";
+					// No end event will arrive to fill this in, and the time is most useful right here.
+					row.durationMs = Date.now() - row.startedAt;
 					broadcast(board, { type: "activity", row });
 				}
 			}
