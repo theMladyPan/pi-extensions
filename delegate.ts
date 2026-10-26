@@ -485,8 +485,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
       const rolePrompt = await loadRolePrompt(role);
       const args = [
         "--mode",
-        "json",
-        "-p",
+        "rpc",
         "--no-extensions",
         "--tools",
         tools.join(","),
@@ -501,7 +500,7 @@ export default function delegateExtension(pi: ExtensionAPI) {
 
       args.push("--provider", params.provider);
       args.push("--model", params.model);
-      args.push("--append-system-prompt", buildPrompt(role, rolePrompt), mainTask);
+      args.push("--append-system-prompt", buildPrompt(role, rolePrompt));
 
       const usage = emptyUsage();
       const changedFiles = new Set<string>();
@@ -612,6 +611,12 @@ export default function delegateExtension(pi: ExtensionAPI) {
         emitTimer.unref();
       };
 
+      // RPC mode keeps the child alive between commands, so stdin is the control channel and the
+      // only orderly shutdown (docs/rpc.md, "Shutdown").
+      const sendCommand = (record: Record<string, unknown>) => {
+        if (proc?.stdin?.writable) proc.stdin.write(`${JSON.stringify(record)}\n`);
+      };
+
       const stop = (reason: Limit | "cancelled") => {
         if (closed || limit || cancelled) return;
         if (reason === "cancelled") cancelled = true;
@@ -625,7 +630,11 @@ export default function delegateExtension(pi: ExtensionAPI) {
         const details = makeDetails(stoppedStatus, null);
         onUpdate?.({ content: [{ type: "text", text: message }], details });
         if (reason !== "cancelled") pi.events.emit("delegate:limit", { toolCallId, ...details });
-        proc?.kill("SIGTERM");
+        // Abort lets the child settle and report; the timer stays as the fallback kill. Closing
+        // stdin covers the window where the run has not started yet: an abort that arrives before
+        // preflight finishes finds nothing to stop, and shutdown then aborts the run it starts.
+        sendCommand({ type: "abort" });
+        proc?.stdin?.end();
         forceKillTimer = setTimeout(() => {
           if (proc?.exitCode === null) proc.kill("SIGKILL");
         }, 5000);
@@ -644,8 +653,21 @@ export default function delegateExtension(pi: ExtensionAPI) {
           return;
         }
 
-        if (event.type === "session" && typeof event.id === "string" && !sessionId) {
-          sessionId = event.id;
+        if (event.type === "response" && event.command === "get_state") {
+          // RPC mode emits no session header; get_state is the session id source the resume path needs.
+          if (typeof event.data?.sessionId === "string") sessionId = event.data.sessionId;
+        } else if (event.type === "response" && event.command === "prompt" && event.success === false) {
+          // A rejected prompt starts no run, so no agent_settled will ever arrive.
+          lastErrorMessage = String(event.error ?? "prompt rejected");
+          lastStopReason = "error";
+          stderr = appendTail(stderr, `prompt rejected: ${lastErrorMessage}\n`);
+          proc?.stdin?.end();
+        } else if (event.type === "response" && event.command === "prompt" && event.data?.disposition === "handled") {
+          // A prompt the session answered itself, such as a slash command, starts no run either.
+          lastErrorMessage = "the task was handled as a command, so no run started";
+          lastStopReason = "error";
+          stderr = appendTail(stderr, `${lastErrorMessage}\n`);
+          proc?.stdin?.end();
         } else if (event.type === "message_end" && event.message?.role === "assistant") {
           addUsage(usage, event.message.usage);
           const assistantText = getText(event.message);
@@ -682,6 +704,9 @@ export default function delegateExtension(pi: ExtensionAPI) {
           }
           scheduleProgress();
           scheduleUpdate();
+        } else if (event.type === "agent_settled") {
+          // Nothing runs after settle, so closing stdin is what makes the child exit and `close` fire.
+          proc?.stdin?.end();
         }
       };
 
@@ -705,18 +730,21 @@ export default function delegateExtension(pi: ExtensionAPI) {
         spawnError = undefined;
         lastStopReason = undefined;
         lastErrorMessage = "";
+        // A retry spawns a fresh child; `closed` describes that child, or stop() would no-op on it.
+        closed = false;
 
         let currentArgs = args;
+        let promptMessage = mainTask;
         if (attempt > 0 && sessionId) {
           const resumeArgs = [...args];
-          resumeArgs.splice(3, 0, "--session", sessionId);
-          const promptIdx = resumeArgs.indexOf("--append-system-prompt");
-          if (promptIdx !== -1) resumeArgs.splice(promptIdx, 2);
-          const continuationText =
+          resumeArgs.splice(2, 0, "--session", sessionId);
+          // The role prompt is rebuilt from flags on every start and a session file does not keep
+          // it, so a resumed attempt that dropped it would run without its rules — a review role
+          // would lose the instruction that it must not write.
+          promptMessage =
             nextRetryKind === "continue"
               ? "Your previous turn failed with an upstream API error. Continue the task from where you left off — prior work is preserved in this session and on disk. Finish the task and end with a concise final text summary."
               : "Your previous run finished the work but ended without a final text summary. Do not redo any work. Reply with a concise summary of what you did and the results.";
-          resumeArgs[resumeArgs.length - 1] = continuationText;
           currentArgs = resumeArgs;
         }
 
@@ -726,11 +754,15 @@ export default function delegateExtension(pi: ExtensionAPI) {
           proc = spawn(invocation.command, invocation.args, {
             cwd,
             shell: false,
-            stdio: ["ignore", "pipe", "pipe"],
+            stdio: ["pipe", "pipe", "pipe"],
           });
 
           const stdoutDecoder = new StringDecoder("utf8");
           const stderrDecoder = new StringDecoder("utf8");
+          // A child that dies while a long task is still being written to it raises EPIPE, and an
+          // unhandled one takes the whole parent session with it. The exit code and stderr already
+          // say what went wrong.
+          proc.stdin?.on("error", () => {});
 
           proc.stdout?.on("data", (chunk: Buffer | string) => {
             stdoutBuffer += typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk);
@@ -758,6 +790,10 @@ export default function delegateExtension(pi: ExtensionAPI) {
             if (stdoutBuffer.trim()) processLine(stdoutBuffer);
             done(code);
           });
+
+          // Every listener is attached above, so the first records cannot be missed.
+          sendCommand({ id: `prompt-${toolCallId}`, type: "prompt", message: promptMessage });
+          sendCommand({ id: `state-${toolCallId}`, type: "get_state" });
 
           if (params.timeoutSeconds) {
             timeout = setTimeout(() => stop("timeout"), params.timeoutSeconds * 1000);
