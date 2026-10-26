@@ -62,4 +62,3 @@ it exits cleanly with no stderr output.
 - This directory is a Git repository. Check `git status` before edits or pulls.
 - Never commit credentials, authentication files, machine settings, session history, caches, or `node_modules`.
 - Use `git pull --ff-only`; stop on conflicts or uncommitted changes.
-- The `security.ts` extension requires the `security` skill at `$HOME/.agents/skills/security`.

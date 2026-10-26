@@ -1,0 +1,7 @@
+{
+	"name": "pi-ytrack",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "YouTrack tool behind Duo 2FA gateway: harvests Duo session cookies from the user's main Vivaldi via CDP, combines with a permanent token for REST API access."
+}
