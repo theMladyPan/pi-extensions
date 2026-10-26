@@ -170,6 +170,8 @@ interface ActivityRow {
 	/** Thinking rows: thinking tokens, and whether the provider reported them or we estimated. */
 	tokens?: number;
 	tokensEstimated?: boolean;
+	/** Set when no payload is kept behind the row, so the rail does not offer to open it. */
+	plain?: boolean;
 }
 
 /** What the header shows: which session this board belongs to and what it has spent. */
@@ -230,6 +232,8 @@ let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[], pre
 let compactSession: () => void = () => {};
 /** Set by the extension so closing the board also forgets the thought it was streaming. */
 let forgetThoughts: () => void = () => {};
+/** Set by the extension so closing the board also drops the detail its rail rows point at. */
+let forgetActivityDetails: () => void = () => {};
 
 /**
  * An exchange waiting for its answer. Turn -1 is the sticky's own message; anything else is a
@@ -609,9 +613,120 @@ function textOf(message: { content?: unknown }): string {
 		.trim();
 }
 
+/** A field of one row's detail. */
+type DetailField = "args" | "log" | "output" | "thinking" | "text";
+
+/**
+ * What a rail row leaves out. The row stays one line on the wire; this is kept aside and fetched
+ * only when the row is opened.
+ */
+interface ActivityDetail {
+	kind: ActivityRow["kind"];
+	tool?: string;
+	status: ActivityRow["status"];
+	startedAt: number;
+	durationMs?: number;
+	/** The arguments as they arrived, or their JSON when that was too long to keep whole. */
+	args?: unknown;
+	log?: string;
+	output?: string;
+	thinking?: string;
+	text?: string;
+	/** Fields cut at DETAIL_CAP, so the panel can say what it does not have. */
+	cut: DetailField[];
+	/** Set when the log stream repeats what it already sent, so the marker branch may replace it. */
+	cumulative?: boolean;
+}
+
+/** 64 K characters per field: far past anything a person reads, cheap enough to keep 300 of. */
+const DETAIL_CAP = 64 * 1024;
+
+/** 8 M characters over the whole map, so the store cannot pass about 16 MB however tools report. */
+const DETAIL_BUDGET = 8 * 1024 * 1024;
+
+/** One payload per activity row, filled by the hooks and read by `GET /activity/<id>`. */
+const activityDetails = new Map<string, ActivityDetail>();
+
+/** Characters one payload holds; the arguments count by the JSON the panel would show. */
+function detailSize(detail: ActivityDetail): number {
+	const args = typeof detail.args === "string" ? detail.args : detail.args === undefined ? "" : (JSON.stringify(detail.args) ?? "");
+	return (
+		args.length +
+		(detail.log?.length ?? 0) +
+		(detail.output?.length ?? 0) +
+		(detail.thinking?.length ?? 0) +
+		(detail.text?.length ?? 0)
+	);
+}
+
+/** Drop the oldest payloads until the whole map fits DETAIL_BUDGET. */
+function trimDetails(): void {
+	let total = 0;
+	for (const detail of activityDetails.values()) total += detailSize(detail);
+	// Map iteration is insertion order, so the first entry is the oldest payload.
+	for (const id of activityDetails.keys()) {
+		if (total <= DETAIL_BUDGET) return;
+		const detail = activityDetails.get(id);
+		if (detail) total -= detailSize(detail);
+		activityDetails.delete(id);
+	}
+}
+
+/**
+ * The whole text, or its first DETAIL_CAP characters with the field marked as cut. This is where
+ * payloads grow, so the shared budget is checked here: a write can push the map a field past the
+ * budget, and the next write trims it back.
+ */
+function capped(text: string, detail: ActivityDetail, field: DetailField): string {
+	trimDetails();
+	if (text.length <= DETAIL_CAP) return text;
+	if (!detail.cut.includes(field)) detail.cut.push(field);
+	return text.slice(0, DETAIL_CAP);
+}
+
+/** Grow a streaming field, stopping at the cap so a long tool cannot keep growing the row. */
+function appendDetail(detail: ActivityDetail, field: "log" | "thinking", text: string): void {
+	if (!text || detail.cut.includes(field)) return;
+	const grown = (detail[field] ?? "") + text;
+	detail[field] = capped(grown, detail, field);
+}
+
+/**
+ * The built-in bash tool hands `onUpdate` a fresh `output.snapshot()` each time (see
+ * dist/core/tools/bash.js in the installed package), so an update repeats everything reported
+ * before it instead of carrying only the new chunk. Its snapshot drops the head once the output
+ * passes the line or byte limit, though, so a plain prefix test stops matching mid-run and the
+ * panel would grow a duplicate middle. Hence the marker: when the new text starts inside what is
+ * stored, the stored window is stale and is replaced rather than extended. A chunk the stored
+ * log never held is new output from a tool that reports only the new part, so it is appended.
+ * The marker needs eight characters because a short one could match inside a delta by accident,
+ * and a repeated tail is easier to live with than output that silently disappeared.
+ *
+ * A tool that pushes only the new part can also repeat a chunk, and an exact repeat would look like
+ * the marker. So the stream is judged cumulative once, by a second text that both grows and
+ * repeats the first, and the marker branch only applies then; everything else is appended. A wrong
+ * first guess costs a duplicate chunk, which is the failure the marker was meant to avoid.
+ */
+function mergeLog(detail: ActivityDetail, text: string): void {
+	if (!text || detail.cut.includes("log")) return;
+	const stored = detail.log ?? "";
+	if (stored && text.length > stored.length && text.startsWith(stored)) detail.cumulative = true;
+	const firstLine = text.slice(0, text.indexOf("\n") + 1 || text.length).slice(0, 32);
+	if (detail.cumulative && (text.startsWith(stored) || (firstLine.length >= 8 && stored.includes(firstLine)))) {
+		detail.log = capped(text, detail, "log");
+		return;
+	}
+	appendDetail(detail, "log", text);
+}
+
 function pushActivity(target: Board, row: ActivityRow): void {
 	target.activity.push(row);
-	if (target.activity.length > MAX_ACTIVITY) target.activity.splice(0, target.activity.length - MAX_ACTIVITY);
+	if (target.activity.length > MAX_ACTIVITY) {
+		// A row that left the rail can never be opened, so its detail goes with it.
+		for (const dropped of target.activity.splice(0, target.activity.length - MAX_ACTIVITY)) {
+			activityDetails.delete(dropped.id);
+		}
+	}
 	broadcast(target, { type: "activity", row });
 }
 
@@ -936,6 +1051,24 @@ function startBoard(): Board {
 				};
 				req.on("close", forget);
 				res.on("error", forget);
+				return;
+			}
+			// What a rail row leaves out: its arguments, log, output, thinking and answer text.
+			if (req.method === "GET" && url.pathname.startsWith("/activity/")) {
+				let id = "";
+				try {
+					id = decodeURIComponent(url.pathname.slice("/activity/".length));
+				} catch {
+					id = "";
+				}
+				const detail = id ? activityDetails.get(id) : undefined;
+				if (!detail) {
+					res.writeHead(404, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+					res.end("no detail kept for this row");
+					return;
+				}
+				res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+				res.end(JSON.stringify({ id, ...detail }));
 				return;
 			}
 			// The composer's picker walks folders anywhere the user can read and answers with names
@@ -1321,6 +1454,7 @@ function stopBoard(): void {
 	for (const resolveAnswer of pendingAnswers.values()) resolveAnswer("");
 	pendingAnswers.clear();
 	forgetThoughts();
+	forgetActivityDetails();
 }
 
 /** Resolve a path inside the session working directory, refusing to escape it. */
@@ -1609,6 +1743,19 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	pi.on("tool_execution_start", async (event) => {
 		callArgs.set(event.toolCallId, event.args);
 		if (!board) return;
+		const startedAt = Date.now();
+		const detail: ActivityDetail = { kind: "tool", tool: event.toolName, status: "running", startedAt, cut: [] };
+		// The panel shows the arguments as JSON, so a wall of text is cut here rather than carried.
+		try {
+			const argsJson = JSON.stringify(event.args ?? null) ?? "";
+			detail.args = argsJson.length > DETAIL_CAP ? capped(argsJson, detail, "args") : event.args;
+		} catch {
+			// The object that could not be serialized would break the panel's own response too, so it
+			// gets words instead and the rest of the detail stays readable.
+			detail.args = "the arguments could not be serialized";
+		}
+		trimDetails();
+		activityDetails.set(event.toolCallId, detail);
 		pushActivity(board, {
 			id: event.toolCallId,
 			kind: "tool",
@@ -1616,8 +1763,16 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			label: toolLabel(event.toolName, event.args),
 			target: toolTarget(event.args),
 			status: "running",
-			startedAt: Date.now(),
+			startedAt,
 		});
+	});
+
+	// The row shows one line, so the streamed output is collected here for the panel instead.
+	pi.on("tool_execution_update", async (event) => {
+		if (!board) return;
+		const detail = activityDetails.get(event.toolCallId);
+		if (!detail) return;
+		mergeLog(detail, resultText(event.partialResult));
 	});
 
 	pi.on("tool_execution_end", async (event) => {
@@ -1633,6 +1788,15 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		// The exit marker is machinery, not output, so it never reaches the row.
 		const shown = { content: [{ type: "text", text: stripExitMarker(result) }] };
 		const failed = failedCall(event.isError, result);
+		const detail = activityDetails.get(event.toolCallId);
+		if (detail) {
+			// The panel shows the tool's own words, so the marker stays here. The output holds the run
+			// whole, so the log that repeated it on the way in would only be one block seen twice.
+			detail.status = failed ? "error" : "ok";
+			detail.durationMs = event.durationMs;
+			detail.log = undefined;
+			detail.output = capped(result, detail, "output");
+		}
 		patchActivity(board, event.toolCallId, {
 			status: failed ? "error" : "ok",
 			durationMs: event.durationMs,
@@ -1688,6 +1852,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	const thoughts = new Map<string, Thought>();
 	// The records only exist while a board is open, so the board's own cleanup has to drop them.
 	forgetThoughts = () => thoughts.clear();
+	forgetActivityDetails = () => activityDetails.clear();
 	/** Counts assistant messages, so two blocks in different messages never share a row id. */
 	let thoughtMessage = "0";
 
@@ -1741,6 +1906,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 				if (stale.messageKey !== thoughtMessage) thoughts.delete(staleId);
 			}
 			thoughts.set(id, { messageKey: thoughtMessage, tail: "", cut: false, chars: 0, samples: [], pushedAt: now });
+			activityDetails.set(id, { kind: "thinking", status: "running", startedAt: now, cut: [], thinking: "" });
 			pushActivity(board, {
 				id,
 				kind: "thinking",
@@ -1759,6 +1925,9 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			const delta = update.delta ?? "";
 			thought.chars += delta.length;
 			thought.tail += delta;
+			// The panel shows the whole block, so it grows here while the row keeps its short tail.
+			const detail = activityDetails.get(id);
+			if (detail) appendDetail(detail, "thinking", delta);
 			if (thought.tail.length > THOUGHT_TAIL) {
 				thought.tail = safeTail(thought.tail, THOUGHT_TAIL);
 				thought.cut = true;
@@ -1790,9 +1959,18 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			thought.tail = thought.cut ? safeTail(content, THOUGHT_TAIL) : content;
 		}
 		const row = board.activity.find((candidate) => candidate.id === id);
+		const durationMs = now - (row?.startedAt ?? now);
+		const detail = activityDetails.get(id);
+		if (detail) {
+			// The authoritative block replaces whatever the deltas accumulated. An end event with no
+			// content leaves the deltas alone: the row's tail is not the whole thought.
+			if (update.content) detail.thinking = capped(update.content, detail, "thinking");
+			detail.status = "ok";
+			detail.durationMs = durationMs;
+		}
 		patchActivity(board, id, {
 			status: "ok",
-			durationMs: now - (row?.startedAt ?? now),
+			durationMs,
 			text: `${thought.cut ? "…" : ""}${thought.tail}`,
 			rate: undefined,
 			tokens: Math.round(thought.chars / CHARS_PER_TOKEN),
@@ -1967,11 +2145,16 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		if (message.role !== "assistant") return;
 		const text = textOf(message as { content?: unknown });
 		if (!text) return;
+		const startedAt = Date.now();
+		const id = nextId();
+		const detail: ActivityDetail = { kind: "reply", status: "ok", startedAt, cut: [] };
+		detail.text = capped(text, detail, "text");
+		activityDetails.set(id, detail);
 		pushActivity(board, {
-			id: nextId(),
+			id,
 			kind: "reply",
 			status: "ok",
-			startedAt: Date.now(),
+			startedAt,
 			text: text.slice(0, 4000),
 		});
 		const waiting = awaitingTurns.shift();
@@ -1994,6 +2177,8 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 					status: "ok",
 					startedAt: Date.now(),
 					summary: "dropped a note that repeated the answer",
+					// Nothing was streamed for this row, so it has no payload to open.
+					plain: true,
 				});
 			}
 		}

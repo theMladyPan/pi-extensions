@@ -1849,6 +1849,24 @@
     // A running row is re-rendered by the ticker in place, so it carries its own start time.
     node.dataset.startedAt = String(row.startedAt ?? "");
     node.appendChild(top);
+    // Opening is the only thing a row does besides being read, so it is a button for the keyboard
+    // too. A drag that selected text was a read, not a click, and must not open the panel. A row
+    // with no payload behind it cannot open anything, so it stays plain text.
+    if (!row.plain) {
+      node.tabIndex = 0;
+      node.setAttribute("role", "button");
+      node.setAttribute("aria-label", `open details: ${name.textContent}`);
+      node.addEventListener("click", () => {
+        const selection = window.getSelection();
+        if (selection && !selection.isCollapsed) return;
+        openActPanel(row);
+      });
+      node.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openActPanel(row);
+      });
+    }
     if (thinking) {
       node.appendChild(el("div", "tail"));
       paintThought(node, row);
@@ -1870,6 +1888,145 @@
     }
     return node;
   }
+
+  // ---------- row detail panel ---------------------------------------------
+  // A rail row is one line. This sheet holds everything the row leaves out, fetched when the row
+  // is opened and refreshed while it still runs, so the rail itself stays cheap on the wire.
+  const actPanel = document.getElementById("actDetail");
+  const actPanelName = document.getElementById("actDetailName");
+  const actPanelMeta = document.getElementById("actDetailMeta");
+  const actPanelBody = document.getElementById("actDetailBody");
+  const actPanelClose = document.getElementById("actDetailClose");
+  /** The row the panel belongs to, or null while it is closed. */
+  let actPanelId = null;
+  /** When the last fetch was sent, so a streaming row cannot ask faster than four times a second. */
+  let actPanelAskedAt = 0;
+  let actPanelTimer = 0;
+
+  /** One titled block of monospace text, saying when the server cut it. */
+  function panelSection(title, text, cut) {
+    const box = el("section");
+    box.appendChild(el("h4")).textContent = title;
+    const pre = el("pre");
+    pre.textContent = text;
+    box.appendChild(pre);
+    if (cut) box.appendChild(el("div", "cut")).textContent = "cut at 64 K characters by the board server";
+    return box;
+  }
+
+  function paintActPanel(payload) {
+    actPanelName.textContent =
+      payload.kind === "reply" ? "answer" : payload.kind === "thinking" ? "thinking" : payload.tool || "tool";
+    const took =
+      typeof payload.durationMs === "number"
+        ? payload.durationMs
+        : payload.status === "running"
+          ? Date.now() - payload.startedAt
+          : 0;
+    actPanelMeta.textContent = [payload.status, took ? rowClock(took) : ""].filter(Boolean).join(" · ");
+    const cut = new Set(payload.cut || []);
+    const parts = [];
+    if (payload.args !== undefined) {
+      // The server hands arguments over as an object, or as their JSON when it had to cut them.
+      const text = typeof payload.args === "string" ? payload.args : JSON.stringify(payload.args, null, 2);
+      parts.push(panelSection("input", text || "", cut.has("args")));
+    }
+    for (const [field, title] of [
+      ["log", "log"],
+      ["output", "output"],
+      ["thinking", "thinking"],
+      ["text", "answer"],
+    ]) {
+      const text = payload[field];
+      if (typeof text !== "string" || !text) continue;
+      parts.push(panelSection(title, text, cut.has(field)));
+    }
+    if (!parts.length) {
+      const gone = el("div", "gone");
+      gone.textContent = "nothing kept for this row";
+      parts.push(gone);
+    }
+    actPanelBody.replaceChildren(...parts);
+  }
+
+  async function fetchActDetail(id) {
+    actPanelAskedAt = Date.now();
+    let running = false;
+    try {
+      const response = await fetch(`/activity/${encodeURIComponent(id)}?token=${encodeURIComponent(token)}`);
+      // A slow answer for a panel the user already closed must not paint over the next one.
+      if (actPanelId !== id) return;
+      if (!response.ok) {
+        // A missing payload is final: the row settled, was trimmed, or never had one, and nothing
+        // will bring it back, so the panel stops asking.
+        const why = el("div", "gone");
+        why.textContent = (await response.text()).trim() || "no detail kept for this row";
+        actPanelBody.replaceChildren(why);
+        return;
+      }
+      const payload = await response.json();
+      paintActPanel(payload);
+      running = payload.status === "running";
+    } catch {
+      const why = el("div", "gone");
+      why.textContent = "could not reach the board server";
+      actPanelBody.replaceChildren(why);
+      return;
+    }
+    // The loop drives itself: a tool that only streams an update never broadcasts a row, so a
+    // timer armed from the board's stream would leave its panel frozen until the tool finished.
+    if (running && actPanelId === id) {
+      actPanelTimer = setTimeout(() => {
+        if (actPanelId === id) void fetchActDetail(id);
+      }, Math.max(0, 250 - (Date.now() - actPanelAskedAt)));
+    }
+  }
+
+  function openActPanel(row) {
+    if (!row) return;
+    clearTimeout(actPanelTimer);
+    actPanelId = row.id;
+    actPanel.hidden = false;
+    actPanelName.textContent = row.kind === "reply" ? "answer" : row.kind === "thinking" ? "thinking" : row.tool || "tool";
+    actPanelMeta.textContent = String(row.status || "");
+    actPanelBody.replaceChildren();
+    // The panel itself takes the focus, so a second Enter goes nowhere instead of closing what just
+    // opened. Tab walks in from here.
+    actPanel.focus();
+    void fetchActDetail(row.id);
+  }
+
+  function closeActPanel() {
+    if (actPanel.hidden) return;
+    const id = actPanelId;
+    actPanelId = null;
+    clearTimeout(actPanelTimer);
+    actPanel.hidden = true;
+    actPanelBody.replaceChildren();
+    // The row may have been rebuilt while the panel was up, so the focus goes to the one there now.
+    actEls.get(id)?.focus();
+  }
+
+  actPanelClose.addEventListener("click", closeActPanel);
+  actPanel.addEventListener("click", (event) => {
+    if (event.target === actPanel) closeActPanel();
+  });
+  actPanel.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeActPanel();
+      return;
+    }
+    // The panel holds the keyboard while it is open, so tab cannot walk the board behind it. Two
+    // stops are inside: the close button and the body, and tab cycles between them both ways.
+    if (event.key === "Tab") {
+      event.preventDefault();
+      const stops = [actPanelClose, actPanelBody];
+      const at = stops.indexOf(document.activeElement);
+      const step = event.shiftKey ? stops.length - 1 : 1;
+      stops[at < 0 ? (event.shiftKey ? stops.length - 1 : 0) : (at + step) % stops.length].focus();
+    }
+  });
 
   /**
    * A thought's count leads, then its rate while it runs or the time it took once it ends. A tilde
@@ -1914,6 +2071,12 @@
   }
 
   function applyActivity(row) {
+    // A row that just settled gets one fetch, the one that carries its full output. A running row
+    // is polled by fetchActDetail itself.
+    if (actPanelId === row.id && row.status !== "running") {
+      clearTimeout(actPanelTimer);
+      void fetchActDetail(row.id);
+    }
     const previous = actEls.get(row.id);
     // A thought patches four times a second while its status stays put. Rebuilding the node would
     // restart the dot's pulse and drop a text selection, so it is updated where it stands.
@@ -2468,6 +2631,14 @@
     const key = event.key.toLowerCase();
     if ((key !== "r" && key !== "q") || event.metaKey || event.ctrlKey || event.altKey) return;
     if (typingSomewhere()) return;
+    // The panel covers the board, so its closing key wins over the card it hides.
+    if (!actPanel.hidden) {
+      if (key === "q") {
+        event.preventDefault();
+        closeActPanel();
+      }
+      return;
+    }
     // The picker is its own surface: a board shortcut behind it would act on what is out of reach.
     if (!picker.hidden) return;
     const active = document.querySelector(".card.active");
@@ -2489,6 +2660,7 @@
   document.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey || !/^[1-6]$/.test(event.key)) return;
     if (typingSomewhere()) return;
+    if (!actPanel.hidden) return;
     const record = openQuestion();
     if (!record) return;
     // The option buttons carry their own click handler, so this reuses the whole answer path.
@@ -2504,7 +2676,7 @@
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (typingSomewhere()) return;
     // The picker is its own surface: a board shortcut behind it would move what is out of reach.
-    if (!picker.hidden) return;
+    if (!picker.hidden || !actPanel.hidden) return;
     if (event.key === "f") {
       event.preventDefault();
       fitAll();

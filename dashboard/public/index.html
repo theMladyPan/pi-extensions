@@ -473,6 +473,33 @@
   #pickError[hidden] { display: none; }
   #pickCount { flex: 1; font: 11px var(--mono); color: var(--muted); }
 
+  /* What a rail row hides: a sheet over the whole board, so nothing it covers is clickable while
+     it is open. The body is the one scroll container, because a long output or thought is what
+     the panel is for. */
+  #actDetail { position: fixed; inset: 0; z-index: 2200; padding: 40px 24px;
+    background: rgba(1, 4, 9, .66); display: flex; align-items: center; justify-content: center; }
+  #actDetail[hidden] { display: none; }
+  #actDetail .panel { display: flex; flex-direction: column; width: min(880px, 100%);
+    max-height: 100%; overflow: hidden; background: var(--card);
+    border: 1px solid var(--border-bright); border-radius: 10px;
+    box-shadow: 0 18px 40px rgba(0,0,0,.55); }
+  #actDetail .panel-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+    flex: none; background: var(--card-head); border-bottom: 1px solid var(--border);
+    font: 12px var(--mono); }
+  #actDetail .name { color: var(--text); font-weight: 600; }
+  #actDetail .meta { color: var(--muted); font-size: 11px; margin-left: auto; }
+  #actDetail .panel-head .close { flex: none; }
+  #actDetailBody { overflow: auto; min-height: 0; padding: 10px;
+    display: flex; flex-direction: column; gap: 10px; }
+  #actDetail section { display: flex; flex-direction: column; gap: 4px; }
+  #actDetail h4 { margin: 0; color: var(--muted); font: 11px var(--mono);
+    text-transform: uppercase; letter-spacing: .6px; }
+  #actDetail pre { margin: 0; padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: #0d1117; color: #c9d1d9; font: 11px/1.45 var(--mono);
+    white-space: pre-wrap; overflow-wrap: anywhere; }
+  #actDetail .cut { color: var(--amber); font: 11px var(--mono); }
+  #actDetail .gone { color: var(--muted); font: 11px var(--mono); }
+
   /* sticky card */
   .sticky-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
   .sticky-text { color: #f0e6d2; background: #2a2415; border-left: 3px solid #d29922;
@@ -570,6 +597,19 @@
     <span id="pickCount">nothing picked</span>
     <button id="pickHere" title="pick the folder you are looking at">+ this folder</button>
     <button id="pickDone" title="keep what is picked and close">done</button>
+  </div>
+</div>
+
+<!-- The full text behind one activity row: its arguments, log, output, thought or answer. -->
+<div id="actDetail" role="dialog" aria-modal="true" aria-labelledby="actDetailName" tabindex="-1" hidden>
+  <div class="panel">
+    <div class="panel-head">
+      <span class="name" id="actDetailName"></span>
+      <span class="meta" id="actDetailMeta"></span>
+      <button class="close" id="actDetailClose" title="close (esc)">×</button>
+    </div>
+    <!-- Focusable so a keyboard user can scroll past the first screen; it is the second tab stop. -->
+    <div id="actDetailBody" tabindex="0"></div>
   </div>
 </div>
 
