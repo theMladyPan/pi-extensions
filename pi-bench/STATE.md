@@ -5,6 +5,14 @@ the workspace. It replaces the dashboard extension, which was a view of one pi
 session and could never supervise more than one agent. Working name; the folder
 moves when the name settles.
 
+The product name is **pi-studio**; the folder is still `pi-bench/` from the first
+slice and gets renamed when something depends on the name.
+
+Retirement note: when pi-studio lands, `delegate.ts` is retired. A child will spawn
+new cards and subagents on the board directly, so handing work to another agent
+stops being a tool call that shells out to a fresh pi process and becomes something
+the board itself does. That is what the board verbs in slice 2 are for.
+
 Read `../docs/roadmap-board.md` for why this exists and what each phase buys the
 next one, and `../TODO.md` for the running status.
 

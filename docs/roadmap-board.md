@@ -37,6 +37,10 @@ credible to someone who is not its author.
   harness would give is already a launch configuration (`pi --mode rpc --no-session
   -ne -e ./card-agent.ts --tools read,grep,find,ls -n card-42 --system-prompt
   ./card-agent.md`).
+- **`delegate.ts` retires.** Once the board owns children, an agent spawns new cards
+  and subagents on the board instead of calling a tool that shells out to a fresh pi
+  process. Handing work to another agent becomes something the board does, and the
+  tool that did it disappears rather than staying as a second path.
 - **Transport follows locality.** `--mode rpc` over stdio for local children, the
   SDK for in-process work, and a protocol of our own only when a worker is remote.
   gRPC is not an architectural choice here; it is what remote workers need.

@@ -45,6 +45,10 @@ and next slice: [`pi-bench/STATE.md`](pi-bench/STATE.md).
 - [ ] **Persistence of threads** — session ids and cards, so a restarted daemon
       resumes a thread by spawning a child on its session.
 - [ ] **Steer and abort per thread** — the wire is proven in `delegate.ts`.
+- [ ] **Retire `delegate.ts`** — once pi-studio lands, a child spawns new cards and
+      subagents on the board instead of calling a tool that shells out to a fresh pi
+      process. `delegate.ts` goes away with that, and the board becomes the only way
+      work is handed to another agent.
 
 The two decisions that are expensive to revisit: the host owns the state and the
 browser only renders events, and the runtime seam lives in the board rather than in
