@@ -302,7 +302,8 @@
         if (!line.trim()) continue;
         const heading = line.match(/^(#{1,6})\s+(.*)$/);
         if (heading) {
-          const h = el("h3");
+          // The level is kept up to h3: a deeper heading is as small as a card can show it.
+          const h = el(`h${Math.min(heading[1].length, 3)}`);
           h.innerHTML = inlineMd(heading[2]);
           holder.appendChild(h);
           continue;
@@ -528,8 +529,20 @@
    */
   function paintThread(entry, data) {
     const turns = Array.isArray(data.turns) ? data.turns : [];
+    const last = turns[turns.length - 1];
+    // News is a turn that was not there before, or the last turn's answer landing; a thread the
+    // card is created with is history. Either way it fires once per real answer.
+    const seen = entry.threadSeen ?? { count: turns.length, answered: Boolean(last?.reply) };
+    const fresh = turns.length > seen.count || (Boolean(last?.reply) && !seen.answered);
+    entry.threadSeen = { count: turns.length, answered: Boolean(last?.reply) };
     entry.thread.hidden = turns.length === 0;
     entry.thread.replaceChildren(...turns.map(turnNode));
+    if (!fresh) return;
+    // The note above the thread can be taller than the card, so the answer would land below the
+    // fold with nothing moving: the card's own column scrolls down to it.
+    requestAnimationFrame(() => {
+      entry.scroll.scrollTop = entry.scroll.scrollHeight;
+    });
   }
 
   /** A message from the user, with the agent's answer attached once it arrives. */
@@ -562,9 +575,9 @@
   }
 
   function bodyFor(data, entry) {
-    if (data.type === "source") return { node: sourceBody(data), cls: "" };
-    if (data.type === "sticky") return { node: stickyBody(data), cls: "sticky-body-wrap" };
-    if (data.type === "question") return { node: questionBody(data, entry), cls: "q-body-wrap" };
+    if (data.type === "source") return { node: sourceBody(data), cls: "source-body" };
+    if (data.type === "sticky") return { node: stickyBody(data), cls: "" };
+    if (data.type === "question") return { node: questionBody(data, entry), cls: "" };
     return { node: renderMarkdown(data.markdown || ""), cls: "note-body" };
   }
 
@@ -681,11 +694,14 @@
       <button class="reply" title="ask a follow-up about this card">↩</button>
       <button class="edit" title="edit this note">✎</button>
       <button class="close" title="close">×</button>`;
+    // One scroll column holds the note and its follow-ups, so a long card has one scrollbar.
+    const scroll = el("div", "card-scroll");
     const body = el("div", "body");
     const thread = el("div", "thread");
     thread.hidden = true;
+    scroll.append(body, thread);
     const grip = el("div", "resize");
-    card.append(head, body, thread, grip);
+    card.append(head, scroll, grip);
     world.appendChild(card);
     cards.push(card);
 
@@ -706,6 +722,7 @@
       id: data.id,
       card,
       head,
+      scroll,
       body,
       thread,
       titleEl: head.querySelector(".title"),
@@ -891,14 +908,13 @@
     const answeredSticky = data.type === "sticky" && Boolean(data.reply);
     const threaded = Array.isArray(data.turns) && data.turns.length > 0;
     // A question grows too: long options and the free-text row would otherwise hide behind the
-    // body's inner scrollbar while the card sits at its default height.
+    // column's scrollbar while the card sits at its default height.
     if (data.type !== "note" && data.type !== "question" && !answeredSticky && !threaded) return;
     requestAnimationFrame(() => {
       if (entry.card.dataset.sized === "user") return;
-      const bodyTight = entry.body.scrollHeight > entry.body.clientHeight + 2;
-      // A thread is clipped by its own max-height, so ask it directly whether it is hiding rows.
-      const threadTight = !entry.thread.hidden && entry.thread.scrollHeight > entry.thread.clientHeight + 2;
-      if (!bodyTight && !threadTight) return;
+      // The note and its follow-ups share one column, so one measurement covers both.
+      const tight = entry.scroll.scrollHeight > entry.scroll.clientHeight + 2;
+      if (!tight) return;
       entry.card.classList.add("auto-height");
       requestAnimationFrame(() => {
         // The card can be closed between the two frames, and a snapshot replay clears and
