@@ -247,7 +247,9 @@
     const holder = el("div");
     const fences = [];
     let tickIndex = 0;
-    const stripped = markdown.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, lang, body) => {
+    // A fence is three or more backticks and closes on a run of the same length, so a task packet
+    // that quotes its own code block can still travel inside one fence of its own.
+    const stripped = markdown.replace(/(`{3,})([a-zA-Z0-9_-]*)\n([\s\S]*?)\1/g, (_m, _fence, lang, body) => {
       const index = fences.push({ lang: lang.toLowerCase(), body }) - 1;
       return `\u0000FENCE${index}\u0000`;
     });
@@ -585,11 +587,50 @@
     return holder;
   }
 
+  /**
+   * The fold's state per card id: a repaint rebuilds the body on every tick and a reconnect replays
+   * the snapshot, so the open state and the scroll offset cannot live on the entry.
+   */
+  const foldState = new Map();
+
+  /**
+   * The folded detail under a card: the full prompt a delegate was given and what it spent.
+   */
+  function detailsBlock(details, entry) {
+    const state = foldState.get(entry.id) ?? { open: false, top: 0 };
+    foldState.set(entry.id, state);
+    const box = el("details", "card-details");
+    const summary = el("summary");
+    summary.textContent = "prompt and usage";
+    const inner = el("div", "details-body");
+    inner.appendChild(renderMarkdown(details));
+    box.append(summary, inner);
+    box.open = state.open;
+    box.addEventListener("toggle", () => {
+      state.open = box.open;
+      // A settled run is never re-broadcast, so nothing else grows the card for the fold and the
+      // human would get a scroller inside a scroller.
+      if (box.open) fitContent(entry, entry.data);
+    });
+    inner.addEventListener("scroll", () => {
+      state.top = inner.scrollTop;
+    });
+    // The inner body is a new element on every repaint and starts at the top, so put it back.
+    requestAnimationFrame(() => {
+      inner.scrollTop = state.top;
+    });
+    return box;
+  }
+
   function bodyFor(data, entry) {
     if (data.type === "source") return { node: sourceBody(data), cls: "source-body" };
     if (data.type === "sticky") return { node: stickyBody(data), cls: "" };
     if (data.type === "question") return { node: questionBody(data, entry), cls: "" };
-    return { node: renderMarkdown(data.markdown || ""), cls: "note-body" };
+    const note = renderMarkdown(data.markdown || "");
+    // Into the renderer's own holder, so `.note-body > :first-child` still finds the note's first
+    // element instead of a wrapper. A note without details keeps the body it had before the fold.
+    if (data.details) note.appendChild(detailsBlock(data.details, entry));
+    return { node: note, cls: "note-body" };
   }
 
   // ---------- cards --------------------------------------------------------
@@ -980,7 +1021,7 @@
    * a delegate card is re-broadcast every few seconds whether or not anything moved.
    */
   function cardChanged(before, after) {
-    const fields = ["title", "markdown", "text", "question", "reply", "status"];
+    const fields = ["title", "markdown", "details", "text", "question", "reply", "status"];
     if (fields.some((field) => before[field] !== after[field])) return true;
     // A follow-up's answer settles into the turn it was asked with, so the thread changes without
     // gaining a turn: compare what each turn draws, not only how many there are.
@@ -1075,6 +1116,7 @@
     const at = cards.indexOf(record.card);
     if (at >= 0) cards.splice(at, 1);
     byId.delete(record.id);
+    foldState.delete(record.id);
     dropRailCard(record.id);
     releaseSpot(record.card);
     renumberQueue();

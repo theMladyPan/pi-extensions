@@ -213,6 +213,14 @@
      plain declaration and would repaint the pink ring in the arrival colour. */
   .card.waiting { border-color: var(--pink); box-shadow: 0 0 0 1px rgba(219,97,162,.45), 0 12px 32px rgba(1,4,9,.5); animation: none; }
   .note-body hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
+  /* A delegate card folds the full prompt and its bill away, so the face stays a headline and a
+     long prompt cannot stretch the card past its height cap. The fold rides inside the note's own
+     holder, whose last block already carries the bottom margin, so it adds none of its own. */
+  .card-details { margin: 0; border-top: 1px solid var(--border); }
+  .card-details > summary { padding: 6px 0 0; color: var(--muted); font: 12px/1.4 system-ui; cursor: pointer; }
+  .card-details > summary:hover { color: var(--text); }
+  .card-details[open] > summary { color: var(--text); }
+  .card-details > .details-body { max-height: 300px; overflow: auto; margin-top: 6px; }
 
   /* virtualized code view */
   .code-scroll { position: absolute; inset: 0; overflow: auto; background: #0f141b; }

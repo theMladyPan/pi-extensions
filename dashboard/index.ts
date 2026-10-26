@@ -114,6 +114,8 @@ interface Turn {
 interface NoteCard extends CardBase {
 	type: "note";
 	markdown: string;
+	/** Folded detail under the note, for what the card face has no room to show. */
+	details?: string;
 }
 
 interface SourceCard extends CardBase {
@@ -1602,6 +1604,12 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	interface DelegateRun {
 		role: string;
 		task: string;
+		/** The whole task packet as sent, kept for the folded detail under the card. */
+		prompt?: string;
+		provider?: string;
+		model?: string;
+		thinking?: string;
+		tokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		tools: string[];
 		toolCount: number;
 		fileCount: number;
@@ -1620,10 +1628,58 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 	};
 
+	/** Token counts are read at a glance, so whole numbers below ten thousand and a rounded thousand above. */
+	const formatTokens = (tokens: number): string =>
+		tokens < 10000 ? String(Math.round(tokens)) : `${Math.round(tokens / 1000)}k`;
+
+	/** `provider:model · thinking`, showing only the part the run actually reported. */
+	const modelFacts = (run: DelegateRun): string[] =>
+		[
+			run.provider && run.model ? `${run.provider}:${run.model}` : (run.provider ?? run.model ?? ""),
+			run.thinking ? `thinking ${run.thinking}` : "",
+		].filter(Boolean);
+
+	/** Same cap the board puts on an edited note: the prompt rides every progress event. */
+	const PROMPT_CAP = 20000;
+
+	// The card face is a headline; the prompt and the bill are what the human opens the card for.
+	function delegateDetails(run: DelegateRun): string | undefined {
+		const full = run.prompt ?? run.task ?? "";
+		const prompt = full.slice(0, PROMPT_CAP);
+		// One backtick longer than the longest run in the prompt, so a packet quoting its own code
+		// fence still lands in one block. Three is the floor the renderer accepts.
+		const longest = Math.max(0, ...(prompt.match(/`+/g) ?? []).map((ticks) => ticks.length));
+		const fence = "`".repeat(Math.max(3, longest + 1));
+		const sent = prompt ? `${fence}\n${prompt}\n${fence}` : "";
+		const cut = full.length > prompt.length ? `prompt cut at ${PROMPT_CAP} characters` : "";
+		const model = modelFacts(run);
+		const tokens = run.tokens;
+		const spent = tokens
+			? [
+					tokens.input ? `in ${formatTokens(tokens.input)}` : "",
+					tokens.output ? `out ${formatTokens(tokens.output)}` : "",
+					tokens.cacheRead ? `cache read ${formatTokens(tokens.cacheRead)}` : "",
+					tokens.cacheWrite ? `cache write ${formatTokens(tokens.cacheWrite)}` : "",
+					run.cost > 0 ? `$${run.cost.toFixed(4)}` : "",
+				]
+					.filter(Boolean)
+					.join(" · ")
+			: "";
+		const lines = [
+			sent,
+			cut,
+			model.length ? `**model** ${model.join(" · ")}` : "",
+			spent ? `**tokens** ${spent}` : "",
+		].filter(Boolean);
+		return lines.length ? lines.join("\n\n") : undefined;
+	}
+
 	function delegateMarkdown(run: DelegateRun, durationMs: number): string {
 		const finished = run.status && run.status !== "running";
 		const facts = [
 			`**${finished ? run.status : "running"}** · ${elapsed(durationMs)}`,
+			// The face says which model ran; the thinking level stays in the fold with the run.
+			modelFacts(run)[0] ?? "",
 			`${run.toolCount} tool${run.toolCount === 1 ? "" : "s"}`,
 			run.fileCount ? `${run.fileCount} file${run.fileCount === 1 ? "" : "s"} changed` : "",
 			run.cost > 0 ? `$${run.cost.toFixed(2)}` : "",
@@ -1642,6 +1698,11 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			toolCallId?: string;
 			role?: string;
 			task?: string;
+			prompt?: string;
+			provider?: string;
+			model?: string;
+			thinking?: string;
+			tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 			tools?: string[];
 			toolCount?: number;
 			fileCount?: number;
@@ -1665,6 +1726,18 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		run.toolCount = event.toolCount ?? run.toolCount;
 		run.fileCount = event.fileCount ?? run.fileCount;
 		run.cost = event.cost ?? run.cost;
+		run.prompt = event.prompt ?? run.prompt;
+		run.provider = event.provider ?? run.provider;
+		run.model = event.model ?? run.model;
+		run.thinking = event.thinking ?? run.thinking;
+		if (event.tokens) {
+			run.tokens = {
+				input: event.tokens.input ?? 0,
+				output: event.tokens.output ?? 0,
+				cacheRead: event.tokens.cacheRead ?? 0,
+				cacheWrite: event.tokens.cacheWrite ?? 0,
+			};
+		}
 		if (event.status) run.status = event.status;
 		if (event.summary) run.summary = event.summary;
 		delegateRuns.set(event.toolCallId, run);
@@ -1679,6 +1752,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 			key: `delegate-${event.toolCallId}`,
 			title: `delegate · ${run.role}`,
 			markdown: delegateMarkdown(run, event.durationMs ?? Date.now() - run.startedAt),
+			details: delegateDetails(run),
 			at: run.startedAt,
 		});
 	});
