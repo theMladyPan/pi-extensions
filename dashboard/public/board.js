@@ -1728,9 +1728,12 @@
   const msgBox = document.getElementById("msg");
   const sendBtn = document.getElementById("send");
   const composerHint = document.getElementById("composerHint");
+  const compactBtn = document.getElementById("compact");
   const replyChip = document.getElementById("replyChip");
   const replyChipText = document.getElementById("replyChipText");
   let sendMode = "queue";
+  /** A note that outranks the usual hint until it has been read. */
+  let hintTimer = null;
 
   /**
    * The mode buttons choose between steering the run and queueing behind it, so they say nothing
@@ -1743,6 +1746,7 @@
     for (const button of document.querySelectorAll("#composer .modes button[data-mode]")) {
       button.hidden = !running;
     }
+    composerHint.classList.remove("bad");
     composerHint.textContent = !linkUp
       ? "offline"
       : !running
@@ -1751,6 +1755,29 @@
           ? "interrupts the run"
           : "waits for this run to finish";
   }
+
+  /** Something the board did rather than the composer: say it, then go back to the usual hint. */
+  function hintLine(text, bad = false) {
+    composerHint.textContent = text;
+    composerHint.classList.toggle("bad", bad);
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => paintComposer(), 6000);
+  }
+
+  // Compaction is the agent's own housekeeping, so the board asks the session for it and reports
+  // what came back. The server refuses while a run is in flight: compaction aborts that run first.
+  compactBtn.addEventListener("click", async () => {
+    compactBtn.disabled = true;
+    hintLine("compacting…");
+    try {
+      const response = await fetch(`/compact?token=${encodeURIComponent(token)}`, { method: "POST" });
+      if (!response.ok) hintLine((await response.text()).trim() || "could not compact", true);
+    } catch {
+      hintLine("could not reach the board server", true);
+    } finally {
+      compactBtn.disabled = false;
+    }
+  });
 
   /**
    * A reply is aimed at one card, so the composer shows which until it is sent or cleared.
@@ -2547,6 +2574,8 @@
         // question that has just started blocking the agent is worth a blink in a background tab.
         const record = byId.get(payload.card.id);
         if ((!known && payload.quiet !== true) || (record && !wasOpen && questionWants(record.data))) startFlash();
+      } else if (payload.type === "hint") {
+        hintLine(payload.text || "");
       } else if (payload.type === "clear") {
         clearBoard();
       }

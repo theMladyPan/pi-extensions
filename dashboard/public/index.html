@@ -400,6 +400,8 @@
     border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
   #composer #send:disabled { opacity: .5; cursor: default; }
   #composer .hintline { color: var(--muted); font: 11px var(--mono); }
+  /* A note that reports a failure, so it does not read as the usual quiet hint. */
+  #composer .hintline.bad { color: var(--red); }
   /* Which card the next message answers, shown above the box until it is sent or cleared. */
   #replyChip { display: flex; align-items: center; gap: 6px; align-self: flex-start;
     font: 11px var(--mono); color: #e3b341; background: rgba(210,153,34,.12);
@@ -512,6 +514,7 @@
       <button data-mode="queue" class="on">queue</button>
       <button data-mode="steer">steer</button>
       <button id="pickFiles" title="attach files or folders from disk">files</button>
+      <button id="compact" title="compact the context, the same as /compact">compact</button>
     </div>
     <span class="hintline" id="composerHint" role="status" aria-live="polite"></span>
     <button id="send">send</button>

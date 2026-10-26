@@ -216,6 +216,8 @@ const pendingAnswers = new Map<string, (answer: string) => void>();
 type InboundImage = { data: string; mimeType: string };
 let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[], preamble: string) => Promise<void> =
 	async () => {};
+/** Set by the extension so the board can ask the session to compact its own context. */
+let compactSession: () => void = () => {};
 
 /**
  * An exchange waiting for its answer. Turn -1 is the sticky's own message; anything else is a
@@ -639,6 +641,11 @@ function pushMeta(): void {
 	if (!board) return;
 	board.meta = currentMeta(board);
 	broadcast(board, { type: "meta", meta: board.meta });
+}
+
+/** A one-line note for the composer about something the board did not do itself. */
+function hintOnBoard(text: string): void {
+	if (board) broadcast(board, { type: "hint", text });
 }
 
 /**
@@ -1087,6 +1094,24 @@ function startBoard(): Board {
 				currentCtx.abort();
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ stopped: true }));
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/compact") {
+				if (!currentCtx) {
+					res.writeHead(503, { "Content-Type": "text/plain" });
+					res.end("no session yet");
+					return;
+				}
+				// Manual compaction aborts whatever the agent is doing, so the board does not start
+				// one behind the human's back: stopping the run is theirs to choose.
+				if (running) {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end("stop the run first");
+					return;
+				}
+				compactSession();
+				res.writeHead(202, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ compacting: true }));
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/layout") {
@@ -1538,6 +1563,19 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 						...images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
 					];
 		await pi.sendUserMessage(content, { deliverAs: mode === "steer" ? "steer" : "followUp" });
+	};
+
+	// The board can ask for a compaction, which is the same manual path `/compact` takes. It is
+	// not offered while a run is in flight, because compaction aborts that run first.
+	compactSession = () => {
+		currentCtx?.compact({
+			onComplete: () => {
+				// The header reads the new context percentage from the meta that follows.
+				pushMeta();
+				hintOnBoard("compacted");
+			},
+			onError: (error) => hintOnBoard(`compaction failed: ${error.message}`),
+		});
 	};
 
 	// Every tool call becomes a row in the activity rail, so the board shows the work
