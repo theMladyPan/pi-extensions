@@ -23,9 +23,12 @@
  *
  * Voice mode is a separate extension. When both are loaded, the `board:note`
  * event lets voice read board notes aloud; neither depends on the other.
+ *
+ * Cards and rail rows are saved per working directory, so `/reload` restarts the host
+ * without emptying the canvas.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
@@ -198,6 +201,8 @@ interface Board {
 	cards: Card[];
 	meta: BoardMeta;
 	activity: ActivityRow[];
+	/** Where this board's cards are saved, fixed for the life of the board. */
+	store: string;
 }
 
 const EMPTY_META: BoardMeta = {
@@ -212,6 +217,291 @@ const EMPTY_META: BoardMeta = {
 	running: false,
 	runStartedAt: null,
 };
+
+/**
+ * The board's cards outlive the process. `/reload` restarts the host, so without a file on disk
+ * the canvas empties every time the extension is updated. The file is per working directory and
+ * lives beside the remembered port and token. Two sessions in the same folder share one file and
+ * the last writer wins; that is accepted, because the alternative is a lock nobody asked for.
+ * File contents, including anything secret that was opened onto the board, therefore live in
+ * `~/.pi/agent/state/boards/` at mode 0600, and nothing ever deletes them.
+ */
+const BOARD_STATE_VERSION = 1;
+const BOARD_STATE_DIR = join(homedir(), ".pi", "agent", "state", "boards");
+/** A burst of moves or patches costs one write; `stopBoard` flushes what is still pending. */
+const SAVE_DEBOUNCE_MS = 500;
+/** The cap `upsert` keeps on the live board, so a file cannot restore a fuller one. */
+const MAX_BOARD_CARDS = 200;
+/**
+ * shortcut: a saved source card keeps its first 200k characters, though it may hold 2 MB, because
+ * 200 of those is a 400 MB file rewritten on every drag. The file is still on disk and the agent
+ * can reopen it. Upgrade when the board must be the only copy of what it shows.
+ */
+const MAX_SAVED_SOURCE_CHARS = 200_000;
+
+/** Named by the folder, and the folder name is also inside the file, so it stays explainable. */
+function boardStateFile(cwd: string): string {
+	return join(BOARD_STATE_DIR, `${createHash("sha256").update(cwd).digest("hex").slice(0, 16)}.json`);
+}
+
+const asText = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+const asCount = (value: unknown): number | undefined =>
+	typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+/** The clamp `/layout` applies, so a restored card lands where the browser could have put it. */
+function clampCoord(value: unknown): number {
+	return Math.max(0, Math.min(40000, Math.round(Number.isFinite(Number(value)) ? Number(value) : 0)));
+}
+
+function clampRect(raw: unknown): CardRect | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const rect = raw as Record<string, unknown>;
+	const clamped = { x: clampCoord(rect.x), y: clampCoord(rect.y), w: clampCoord(rect.w), h: clampCoord(rect.h) };
+	// The browser trusts a saved rect over its own default size, so a zero or negative one would
+	// restore a card that can never be seen or grabbed. Without a rect it places the card like new.
+	if (clamped.w <= 0 || clamped.h <= 0) return undefined;
+	return clamped;
+}
+
+/** A restored turn cannot be waiting for anything: no process remembers the queue it sat in. */
+function restoredTurn(raw: unknown): Turn | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const saved = raw as Record<string, unknown>;
+	const text = asText(saved.text);
+	if (text === undefined) return undefined;
+	const turn: Turn = {
+		text,
+		status: saved.status === "answered" ? "answered" : "stopped",
+		mode: saved.mode === "steer" ? "steer" : "queue",
+		at: asCount(saved.at) ?? 0,
+	};
+	const images = asCount(saved.images);
+	if (images !== undefined) turn.images = images;
+	const reply = asText(saved.reply);
+	if (reply !== undefined) turn.reply = reply;
+	return turn;
+}
+
+/**
+ * One card from the file, with every field this version knows and nothing else. A card is
+ * dropped when its id or type is wrong, since the browser keys and draws by those two.
+ */
+function restoredCard(raw: unknown): Card | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const saved = raw as Record<string, unknown>;
+	const id = asText(saved.id);
+	if (!id) return undefined;
+
+	const base: CardBase = { id, at: asCount(saved.at) ?? Date.now() };
+	const key = asText(saved.key);
+	if (key !== undefined) base.key = key;
+	const title = asText(saved.title);
+	if (title !== undefined) base.title = title;
+	const rect = clampRect(saved.rect);
+	if (rect) base.rect = rect;
+	if (typeof saved.mini === "boolean") base.mini = saved.mini;
+	const threadRoot = asText(saved.threadRoot);
+	if (threadRoot !== undefined) base.threadRoot = threadRoot;
+	const turns = Array.isArray(saved.turns)
+		? saved.turns.map(restoredTurn).filter((turn): turn is Turn => turn !== undefined)
+		: [];
+	if (turns.length > 0) base.turns = turns;
+
+	switch (saved.type) {
+		case "note": {
+			const card: NoteCard = { ...base, type: "note", markdown: asText(saved.markdown) ?? "" };
+			const details = asText(saved.details);
+			if (details !== undefined) card.details = details;
+			return card;
+		}
+		case "source": {
+			const card: SourceCard = {
+				...base,
+				type: "source",
+				path: asText(saved.path) ?? "",
+				content: asText(saved.content) ?? "",
+			};
+			const line = asCount(saved.line);
+			if (line !== undefined) card.line = line;
+			return card;
+		}
+		case "question": {
+			const card: QuestionCard = {
+				...base,
+				type: "question",
+				question: asText(saved.question) ?? "",
+				options: Array.isArray(saved.options)
+					? saved.options.filter((option): option is string => typeof option === "string")
+					: [],
+				allowFreeText: saved.allowFreeText === true,
+				// No process is waiting for this answer any more, so an open question reads as expired.
+				status: saved.status === "answered" ? "answered" : "expired",
+				expiresAt: asCount(saved.expiresAt) ?? 0,
+			};
+			const answer = asText(saved.answer);
+			if (answer !== undefined) card.answer = answer;
+			return card;
+		}
+		case "sticky": {
+			const card: StickyCard = {
+				...base,
+				type: "sticky",
+				text: asText(saved.text) ?? "",
+				// A queued or sent message died with the process that was holding it.
+				status: saved.status === "answered" ? "answered" : "stopped",
+				mode: saved.mode === "steer" ? "steer" : "queue",
+			};
+			const images = asCount(saved.images);
+			if (images !== undefined) card.images = images;
+			const reply = asText(saved.reply);
+			if (reply !== undefined) card.reply = reply;
+			return card;
+		}
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * One rail row from the file, with the fields the rail draws and never the payload behind them:
+ * the detail map died with the process, so the row is marked plain and cannot open a panel.
+ */
+function restoredRow(raw: unknown): ActivityRow | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const saved = raw as Record<string, unknown>;
+	const id = asText(saved.id);
+	const kind = saved.kind;
+	if (!id || (kind !== "tool" && kind !== "reply" && kind !== "thinking")) return undefined;
+	// A row still running when the process died describes work nobody is doing now, and the
+	// ticker would count it forever.
+	if (saved.status !== "ok" && saved.status !== "error") return undefined;
+
+	const row: ActivityRow = {
+		id,
+		kind,
+		status: saved.status,
+		startedAt: asCount(saved.startedAt) ?? 0,
+		plain: true,
+	};
+	for (const field of ["tool", "label", "target", "summary"] as const) {
+		const value = asText(saved[field]);
+		if (value !== undefined) row[field] = value;
+	}
+	// The rail draws a reply row from `text` and nothing else, so an answer keeps the words it
+	// showed. A tool row's payload stays out, since the detail map died with the process.
+	const text = kind === "reply" ? asText(saved.text) : undefined;
+	if (text !== undefined) row.text = text.slice(0, 4000);
+	const durationMs = asCount(saved.durationMs);
+	if (durationMs !== undefined) row.durationMs = durationMs;
+	const tokens = asCount(saved.tokens);
+	if (tokens !== undefined) row.tokens = tokens;
+	if (typeof saved.tokensEstimated === "boolean") row.tokensEstimated = saved.tokensEstimated;
+	return row;
+}
+
+/** Validate a parsed file into board content. Anything unreadable is an empty board. */
+function restoreBoard(raw: unknown): { cards: Card[]; activity: ActivityRow[] } {
+	if (!raw || typeof raw !== "object") return { cards: [], activity: [] };
+	const saved = raw as Record<string, unknown>;
+	// A file another version wrote may mean something else by the same field names.
+	if (saved.version !== BOARD_STATE_VERSION || !Array.isArray(saved.cards)) return { cards: [], activity: [] };
+	const kept = saved.cards
+		.map(restoredCard)
+		.filter((card): card is Card => card !== undefined)
+		.slice(-MAX_BOARD_CARDS);
+	// The browser keys cards by id, so two entries sharing one would leave a card nobody can close.
+	const cards = [...new Map(kept.map((card) => [card.id, card])).values()];
+	const rows = Array.isArray(saved.activity) ? saved.activity : [];
+	const activity = rows
+		.map(restoredRow)
+		.filter((row): row is ActivityRow => row !== undefined)
+		.slice(-MAX_ACTIVITY);
+	return { cards, activity };
+}
+
+function readBoardState(file: string): { cards: Card[]; activity: ActivityRow[] } {
+	try {
+		return restoreBoard(JSON.parse(readFileSync(file, "utf8")));
+	} catch {
+		// A missing, half-written or hand-mangled file is an empty board, never a failed server.
+		return { cards: [], activity: [] };
+	}
+}
+
+/** The file's shape. The cwd is inside it so the hashed name stays explainable. */
+interface SavedBoard {
+	version: number;
+	cwd: string;
+	savedAt: number;
+	cards: Card[];
+	activity: ActivityRow[];
+}
+
+function saveableRow(row: ActivityRow): ActivityRow {
+	const kept = { ...row };
+	// The payload behind a tool or a thought is not saved, so a restored row cannot open a panel.
+	// An answer is the exception: the rail draws it from `text`, so it keeps the words it showed.
+	if (row.kind === "reply" && typeof row.text === "string") kept.text = row.text.slice(0, 4000);
+	else delete kept.text;
+	kept.plain = true;
+	return kept;
+}
+
+/** A source card may hold 2 MB of file, which 200 saved cards turn into a 400 MB write per drag. */
+function saveableCard(card: Card): Card {
+	if (card.type !== "source" || card.content.length <= MAX_SAVED_SOURCE_CHARS) return card;
+	return { ...card, content: card.content.slice(0, MAX_SAVED_SOURCE_CHARS) };
+}
+
+let saveFailureReported = false;
+
+function writeBoardState(target: Board): void {
+	try {
+		const saved: SavedBoard = {
+			version: BOARD_STATE_VERSION,
+			cwd: target.meta.cwd || process.cwd(),
+			savedAt: Date.now(),
+			cards: target.cards.map(saveableCard),
+			activity: target.activity.map(saveableRow),
+		};
+		mkdirSync(BOARD_STATE_DIR, { recursive: true, mode: 0o700 });
+		// Same pattern as the remembered port: a half-written file would restore as a broken board.
+		const temp = `${target.store}.${process.pid}.tmp`;
+		writeFileSync(temp, `${JSON.stringify(saved)}\n`, { mode: 0o600 });
+		renameSync(temp, target.store);
+	} catch (error) {
+		// A board that cannot save itself still works, but the user should hear it once, before the
+		// day it comes back empty. `hint` does not schedule a save, so this cannot loop.
+		if (saveFailureReported) return;
+		saveFailureReported = true;
+		const reason = error instanceof Error ? error.message : String(error);
+		hintOnBoard(`board could not be saved to ${BOARD_STATE_DIR}: ${reason}`);
+	}
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+/** The live board object is held by reference, so the newest state is what lands. */
+let unsavedBoard: Board | undefined;
+
+function scheduleSave(target: Board): void {
+	unsavedBoard = target;
+	if (saveTimer) return;
+	saveTimer = setTimeout(() => {
+		saveTimer = undefined;
+		const pending = unsavedBoard;
+		unsavedBoard = undefined;
+		if (pending) writeBoardState(pending);
+	}, SAVE_DEBOUNCE_MS);
+}
+
+/** A clean stop writes whatever the debounce still holds. */
+function flushSave(): void {
+	if (saveTimer) clearTimeout(saveTimer);
+	saveTimer = undefined;
+	const pending = unsavedBoard;
+	unsavedBoard = undefined;
+	if (pending) writeBoardState(pending);
+}
 
 let board: Board | undefined;
 let currentCtx: ExtensionContext | undefined;
@@ -912,6 +1202,18 @@ function urlFor(target: Board): string {
 }
 
 function broadcast(target: Board, message: unknown): void {
+	// The durable half of the board is its cards and their layout, and `card`, `update`, `remove`,
+	// `move` and `clear` are the only events that change it, so those schedule a save. `activity`,
+	// `meta` and `hint` are left out for write rate alone: the ticker sends `activity` four times a
+	// second. So the restored rail is a snapshot from the last card event, and a long stretch of
+	// tool calls after the last card is lost.
+	const kind = (message as { type?: string } | null)?.type;
+	if (
+		target === board &&
+		(kind === "card" || kind === "update" || kind === "remove" || kind === "move" || kind === "clear")
+	) {
+		scheduleSave(target);
+	}
 	const payload = `data: ${JSON.stringify(message)}\n\n`;
 	for (const client of target.clients) {
 		// A tab that closed or reloaded is still in the list for a moment. Writing to its dead
@@ -943,7 +1245,7 @@ function upsert(target: Board, card: Card): boolean {
 	// Every card the agent makes passes through here, so the run in flight stamps its own.
 	if (activeThread) card.threadRoot = activeThread;
 	target.cards.push(card);
-	if (target.cards.length > 200) target.cards.shift();
+	if (target.cards.length > MAX_BOARD_CARDS) target.cards.shift();
 	broadcast(target, { type: "card", card });
 	return true;
 }
@@ -1006,8 +1308,12 @@ function startBoard(): Board {
 	const freshToken = () => randomBytes(16).toString("hex");
 	let token = remembered.token ?? freshToken();
 	const clients = new Set<ServerResponse>();
-	const cards: Card[] = [];
-	const activity: ActivityRow[] = [];
+	// The file belongs to the folder the user is working in, and its path is fixed before the
+	// first save so a later session switch cannot split the board across two files.
+	const store = boardStateFile(currentCtx?.cwd ?? process.cwd());
+	const restored = readBoardState(store);
+	const cards: Card[] = restored.cards;
+	const activity: ActivityRow[] = restored.activity;
 
 	const server = createServer((req, res) => {
 		void (async () => {
@@ -1280,9 +1586,7 @@ function startBoard(): Board {
 					res.end("no such card");
 					return;
 				}
-				const clamp = (value: unknown) =>
-					Math.max(0, Math.min(40000, Math.round(Number.isFinite(Number(value)) ? Number(value) : 0)));
-				card.rect = { x: clamp(rect.x), y: clamp(rect.y), w: clamp(rect.w), h: clamp(rect.h) };
+				card.rect = { x: clampCoord(rect.x), y: clampCoord(rect.y), w: clampCoord(rect.w), h: clampCoord(rect.h) };
 				if (typeof payload.mini === "boolean") card.mini = payload.mini;
 				broadcast(board ?? ({ clients } as Board), {
 					type: "move",
@@ -1371,7 +1675,7 @@ function startBoard(): Board {
 	server.keepAliveTimeout = 65_000;
 	server.headersTimeout = 70_000;
 
-	const created: Board = { server, token, port: 0, clients, cards, meta: EMPTY_META, activity };
+	const created: Board = { server, token, port: 0, clients, cards, meta: EMPTY_META, activity, store };
 
 	// Parallel sessions each need their own board, so walk upward from the preferred port
 	// before giving up on a predictable number and letting the kernel pick one.
@@ -1447,6 +1751,7 @@ function whenListening(target: Board, run: () => void): void {
 
 function stopBoard(): void {
 	if (!board) return;
+	flushSave();
 	for (const client of board.clients) client.end();
 	board.clients.clear();
 	board.server.close();
