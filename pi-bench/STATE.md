@@ -18,43 +18,47 @@ next one, and `../TODO.md` for the running status.
 
 ## Built and verified
 
-- `server.mjs` (about 400 lines, Node builtins only, `node server.mjs`). It owns
-  threads, spawns one `pi --mode rpc` child per thread, streams its events, and
-  serves the board.
-- Routes: `POST /thread` `{title?, folder?, model?}` → `{threadId}` (creates only,
-  spawns nothing); `POST /message` `{threadId, text}` → spawns the thread's child
-  if needed, sends the text as a `prompt` command, answers `{accepted:true}`;
-  `GET /events` (SSE snapshot + `card`/`update`/`activity`); `GET /state` (JSON).
-- Child argv: `node <pi cli> --mode rpc --no-session -ne --tools read,bash,edit,write
-  --provider $PI_BENCH_PROVIDER --model $PI_BENCH_MODEL`, defaulting to
-  `klotilda` / `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
-- Verified by curl on 2026-10-26: thread created, message accepted, child spawned,
-  session id captured, reply (`pong`) landed on the thread's card, status `idle`,
-  child gone once settled, and the daemon serves the client at `/`.
+- `server.mjs` (about 470 lines, Node builtins only, `node server.mjs`). It owns threads,
+  spawns one `pi --mode rpc` child per thread, streams its events, and serves the board.
+- The daemon speaks the routes the established client already calls, so there is one client and
+  no second UI: `GET /` `/board.js` `/events` `/browse` `/state` `/activity/<id>`, `POST /thread`
+  `/message` `/layout` `/close` `/stop` (plus honest 409s for `/compact`, `/answer`, `/edit`).
+- A thread is projected as the card the browser has always drawn: a sticky whose `title` is the
+  thread name and whose `turns` are the exchanges, each with the answer attached when it lands.
+- `meta.mode === "threads"` tells the shared client to lay itself out as a board of threads. The
+  extension's one-session board does not send it, so its composer and layout are untouched.
+- Client changes are opt-in under `body.threads`: the bottom composer is hidden, the canvas owns
+  the whole height, and a `+` button sits bottom right. Pressing it creates a thread, centres it,
+  docks the composer into it and focuses the field; the field stays docked after a send, because a
+  thread is a conversation.
+- Steering and queueing work per thread: `mode: "steer"` joins the run in flight, `mode: "queue"`
+  waits behind it and is sent when the child settles. A turn redirected by a steer reads `stopped`
+  rather than as a message still in flight.
+- Verified by curl on 2026-10-26 against real children: fresh thread, reply (`pong`), a second
+  message on the same thread (new child, reply `two`), a mid-run steer answered with `steered`,
+  `/layout` storing a rect, `/stop` aborting a live run, `/close` removing thread and child,
+  `/browse` listing a folder, 403 without a token, 404 for the rail's detail payloads, and
+  `mode: "threads"` in the snapshot's meta.
 
 ## Deliberately not built yet
 
-- **The client is not wired to these routes.** `PUBLIC_DIR` points at
-  `../dashboard/public/` on purpose: the board's client is settled and the daemon
-  has to be what it talks to. The composer still posts the extension's shapes, so
-  the `+` button and the per-thread send do not exist yet.
-- No `abort`, no `steer` from the UI (the wire is proven in `delegate.ts`).
-- No board verbs for children: they cannot draw notes, sources or questions yet.
-- No persistence of threads or cards, so a daemon restart loses the board.
-- No rail grouping per agent, no usage totals, no per-thread conversation view.
+- No persistence: a daemon restart loses threads and cards.
+- No board verbs for children: they cannot draw notes, sources or questions yet, so a thread can
+  only answer in its own card.
+- No live text in the card while the answer streams; the reply appears when the turn ends.
+- No rail detail payloads (arguments, logs, outputs), no usage totals, no image attachments.
+- One run per thread and no supervision view: the rail is one list, `stop` aborts every running
+  thread rather than a chosen one.
 
 ## Next slice, in order
 
-1. Adapt the daemon's `/message` to what the established client already posts, and
-   remove the global composer from the client in favour of the `+` button and a
-   per-card send. This is a small diff against `dashboard/public/board.js`; the
-   visuals do not change.
-2. Board verbs over HTTP for children (`POST /card/note`, `/card/source`,
-   `/card/ask`), plus a thin `slave.ts` extension a child loads with `-e` so it can
-   draw on the board the way the dashboard extension does today.
-3. Persistence: threads with their session ids, cards with their rects, so a
-   restarted daemon resumes a thread by spawning a child on its session.
-4. Steer and abort per thread, then N concurrent runs keyed by card.
+1. Board verbs over HTTP for children (`POST /card/note`, `/card/source`, `/card/ask`) plus a thin
+   `slave.ts` a child loads with `-e`, so a thread can put things on the board instead of only
+   answering.
+2. Persistence: threads with their session ids and cards with their rects, so a restarted daemon
+   resumes a thread by spawning a child on its session.
+3. Per-thread stop and a rail grouped by thread, so several runs can be supervised.
+4. Stream the answer into the card, then rail detail payloads.
 
 ## Rules for whoever continues
 

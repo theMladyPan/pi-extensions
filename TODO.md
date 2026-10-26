@@ -37,9 +37,9 @@ and next slice: [`pi-bench/STATE.md`](pi-bench/STATE.md).
 - [x] **Daemon vertical slice** — `pi-bench/server.mjs`: threads, one `--mode rpc`
       child per thread, `POST /thread`, `POST /message`, `GET /events`, `GET /state`.
       Verified by curl: message in, `pong` out, child gone when idle.
-- [ ] **Wire the established client** — the daemon serves `dashboard/public/`; the
-      composer still posts the extension's shapes. Remove the global composer, add
-      the `+` button and a per-card send, without touching the visuals.
+- [x] **Wire the established client** — the daemon speaks the client's routes; the
+      client gained an opt-in `body.threads` layout (no bottom composer, a `+` button,
+      the field docked in the card). The extension's board is untouched.
 - [ ] **Board verbs for children** — `POST /card/note`, `/card/source`, `/card/ask`,
       plus a thin `slave.ts` a child loads with `-e`.
 - [ ] **Persistence of threads** — session ids and cards, so a restarted daemon
