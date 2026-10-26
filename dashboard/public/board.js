@@ -386,16 +386,21 @@
   }
 
   function questionBody(data, entry) {
+    // A question that ran out of time is as settled as an answered one: its buttons are dead and
+    // the header says which of the two happened.
+    const settled = data.status === "answered" || data.status === "expired";
     const holder = el("div", "q-body");
     const text = el("div", "q-text");
     text.innerHTML = inlineMd(data.question || "");
     holder.appendChild(text);
 
+    // The arrival lands the keyboard here, so a focused option cannot answer on Space or Enter.
     const buttons = el("div", "q-options");
+    buttons.tabIndex = -1;
     // Built before the options are wired: every answer path hands the row to submitAnswer, which
     // takes it out of the card while the send is in flight and puts it back if the send fails.
     let freeRow = null;
-    if (data.allowFreeText && data.status !== "answered") {
+    if (data.allowFreeText && !settled) {
       freeRow = el("div", "q-free");
       const input = el("input");
       input.placeholder = "or type an answer…";
@@ -415,7 +420,7 @@
     for (const option of data.options || []) {
       const button = el("button", "q-opt");
       button.textContent = option;
-      if (data.status === "answered") {
+      if (settled) {
         button.disabled = true;
         if (data.answer === option) button.classList.add("picked");
       } else {
@@ -579,6 +584,7 @@
       <span class="title"></span>
       <span class="sub"></span>
       <span class="spacer"></span>
+      <button type="button" class="ask-pill" aria-label="centre this question">answer needed</button>
       <span class="chip"></span>
       <button class="min" title="minimize this card">▾</button>
       <button class="reply" title="ask a follow-up about this card">↩</button>
@@ -616,9 +622,14 @@
       titleEl: head.querySelector(".title"),
       subEl: head.querySelector(".sub"),
       chipEl: head.querySelector(".chip"),
+      askPill: head.querySelector(".ask-pill"),
       data,
     };
     byId.set(data.id, entry);
+    entry.askPill.addEventListener("click", (event) => {
+      event.stopPropagation();
+      centreQuestion(entry);
+    });
     if (data.mini) setMini(card, true);
     paintCard(entry, data);
 
@@ -658,7 +669,7 @@
 
     head.addEventListener("pointerdown", (event) => {
       // Buttons in the header are for clicking, not for dragging the card.
-      if (event.target.closest(".close, .edit, .reply, .min")) return;
+      if (event.target.closest(".close, .edit, .reply, .min, .ask-pill")) return;
       event.preventDefault();
       card.classList.add("dragging");
       const sx = event.clientX;
@@ -720,8 +731,20 @@
     return entry;
   }
 
+  /**
+   * An open question says when it gives up, so the wait has a visible end. A settled one says
+   * what actually happened: an answer, or a question the board abandoned.
+   */
+  function questionSub(data) {
+    if (data.status === "answered") return "answered";
+    if (data.status === "expired") return "expired — no answer sent";
+    if (!data.expiresAt) return "waiting for you";
+    return `expires ${new Date(data.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  }
+
   function paintCard(entry, data) {
     const isSource = data.type === "source";
+    const isOpenQuestion = data.type === "question" && data.status === "open";
     entry.data = data;
     if (entry.editing) return;
     entry.titleEl.textContent =
@@ -730,16 +753,21 @@
     entry.subEl.textContent = isSource
       ? `${data.content.split("\n").length} lines`
       : data.type === "question"
-        ? data.status === "answered" ? "answered" : "waiting for you"
+        ? questionSub(data)
         : data.type === "sticky"
           ? data.status || "queued"
           : new Date(data.at || Date.now()).toLocaleTimeString();
+    entry.subEl.classList.toggle("expired", data.type === "question" && data.status === "expired");
+    // The pink ring and the pill belong to the question the agent is blocked on, so both go
+    // away the moment it is settled.
+    entry.card.classList.toggle("waiting", isOpenQuestion);
+    entry.askPill.style.display = isOpenQuestion ? "" : "none";
     const editBtn = entry.head.querySelector(".edit");
     if (editBtn) editBtn.style.display = data.type === "note" ? "" : "none";
     const closeBtn = entry.head.querySelector(".close");
     // Closing an open question would leave the agent waiting for an answer with nothing on
-    // screen to click, so the button appears only once it has been answered.
-    if (closeBtn) closeBtn.style.display = data.type === "question" && data.status === "open" ? "none" : "";
+    // screen to click, so the button appears only once it has been answered or has expired.
+    if (closeBtn) closeBtn.style.display = isOpenQuestion ? "none" : "";
     entry.chipEl.textContent = isSource && data.line ? `line ${data.line}` : "";
     entry.chipEl.style.display = entry.chipEl.textContent ? "" : "none";
 
@@ -752,10 +780,6 @@
   }
 
   /**
-   * An answered sticky holds the question and the reply, so it grows to fit them instead of
-   * hiding the answer behind an inner scrollbar. Height stays put once the user resizes it.
-   */
-  /**
    * A note that holds more than its default height grows to fit, up to the CSS limit, so
    * nothing hides behind an inner scrollbar. It never shrinks on its own, and a card the user
    * resized keeps that size. An answered sticky does the same for its reply.
@@ -764,7 +788,9 @@
     if (entry.card.dataset.sized === "user" || entry.card.classList.contains("mini")) return;
     const answeredSticky = data.type === "sticky" && Boolean(data.reply);
     const threaded = Array.isArray(data.turns) && data.turns.length > 0;
-    if (data.type !== "note" && !answeredSticky && !threaded) return;
+    // A question grows too: long options and the free-text row would otherwise hide behind the
+    // body's inner scrollbar while the card sits at its default height.
+    if (data.type !== "note" && data.type !== "question" && !answeredSticky && !threaded) return;
     requestAnimationFrame(() => {
       if (entry.card.dataset.sized === "user") return;
       const bodyTight = entry.body.scrollHeight > entry.body.clientHeight + 2;
@@ -822,6 +848,17 @@
       fitAll();
     }
     entry.card.scrollIntoView && entry.card.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // A question blocks the agent, so it lands under the eye and the keyboard. A replay brings
+    // back cards the user already has, so it never pulls the view or steals the focus.
+    // A question already on screen keeps the view: a second one must not pull it away.
+    const onScreen = [...byId.values()].some(
+      (record) => record !== entry && record.data.type === "question" && record.data.status === "open" && isVisible(record.card),
+    );
+    if (!replaying && !quiet && data.type === "question" && data.status === "open" && !onScreen && !typingSomewhere()) {
+      // One frame later: fitContent grows the card in its own rAF, so centring now would measure
+      // the default height and leave the lower options under the fold.
+      requestAnimationFrame(() => centreQuestion(entry));
+    }
   }
 
   function clearBoard() {
@@ -1030,6 +1067,33 @@
     card.classList.add("flash");
     setTimeout(() => card.classList.remove("flash"), 1400);
     cards.forEach((c) => c.classList.toggle("active", c === card));
+  }
+
+  /** Centre a question and put the keyboard on its options, so the number keys are one press away. */
+  function centreQuestion(record) {
+    // The rule jumpToFresh uses: never arrive so far out that the ring and the text stop reading.
+    view.k = Math.min(1.1, Math.max(view.k, 0.6));
+    centerOn(record);
+    // preventScroll: centring already moved the canvas, and a second jump would fight it.
+    record.body.querySelector(".q-options")?.focus({ preventScroll: true });
+  }
+
+  /** True while the keystroke belongs to a field the user is typing in. */
+  function typingSomewhere() {
+    const active = document.activeElement;
+    return Boolean(active && active.closest("input, textarea"));
+  }
+
+  /**
+   * The question a number key answers: the active one, and only while it is on screen and open. A
+   * folded or scrolled-away question is one the user cannot see, so a digit must not answer it.
+   */
+  function openQuestion() {
+    const marked = document.querySelector(".card.active");
+    const record = marked ? byId.get(marked.dataset.id) : null;
+    if (!record || record.data.type !== "question" || record.data.status !== "open") return null;
+    if (record.card.classList.contains("mini") || !isVisible(record.card)) return null;
+    return record;
   }
 
   /** Follow a [[key]] reference: by key first, then by card title. */
@@ -1668,12 +1732,25 @@
   // its own keys, so a message being typed is never cut short.
   document.addEventListener("keydown", (event) => {
     if (event.key !== "r" || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (event.target.closest("textarea, input, [contenteditable=true]")) return;
+    if (typingSomewhere()) return;
     const active = document.querySelector(".card.active");
     const record = active ? byId.get(active.dataset.id) : null;
     if (!record) return;
     event.preventDefault();
     setReplyTarget(record);
+  });
+
+  // `1`–`6` answer the question the agent is waiting on, so a decision needs no mouse.
+  document.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey || !/^[1-6]$/.test(event.key)) return;
+    if (typingSomewhere()) return;
+    const record = openQuestion();
+    if (!record) return;
+    // The option buttons carry their own click handler, so this reuses the whole answer path.
+    const button = record.body.querySelectorAll(".q-options .q-opt")[Number(event.key) - 1];
+    if (!button || button.disabled) return;
+    event.preventDefault();
+    button.click();
   });
 
   msgBox.addEventListener("keydown", (event) => {
@@ -1795,9 +1872,14 @@
         const keptTarget = replyTarget ? replyTarget.id : null;
         clearBoard();
         replaying = true;
-        for (const row of payload.activity || []) applyActivity(row);
-        for (const card of payload.cards || []) applyMessage(card);
-        replaying = false;
+        // A card that throws mid-replay must not leave the flag set: the tab would then never
+        // badge, centre or restore a target again.
+        try {
+          for (const row of payload.activity || []) applyActivity(row);
+          for (const card of payload.cards || []) applyMessage(card);
+        } finally {
+          replaying = false;
+        }
         if (keptTarget && byId.has(keptTarget)) setReplyTarget(byId.get(keptTarget));
         sawFirstCard = (payload.cards || []).length > 0;
         if (cards.length) fitAll();

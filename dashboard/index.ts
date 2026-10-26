@@ -128,8 +128,10 @@ interface QuestionCard extends CardBase {
 	question: string;
 	options: string[];
 	allowFreeText: boolean;
-	status: "open" | "answered";
+	status: "open" | "answered" | "expired";
 	answer?: string;
+	/** When the ask gives up, so the board can show the wait has an end. */
+	expiresAt: number;
 }
 
 /** A message the user typed on the board; the agent's answer lands on the same card. */
@@ -1385,24 +1387,31 @@ const askTool = defineTool({
 			allowFreeText: params.allowFreeText !== false,
 			status: "open",
 			at: Date.now(),
+			expiresAt: Date.now() + ASK_TIMEOUT_MS,
 		};
 		upsert(target, card);
 		emit("board:note", { title: card.title, text: params.question });
 
+		// A local flag rather than a different resolution value: a timeout is the only path that
+		// leaves the question unanswered by anyone, and the card has to say so.
+		let expired = false;
 		const answer = await new Promise<string>((done) => {
 			const finish = (value: string) => {
 				clearTimeout(timer);
 				pendingAnswers.delete(card.id);
 				done(value);
 			};
-			const timer = setTimeout(() => finish(""), ASK_TIMEOUT_MS);
+			const timer = setTimeout(() => {
+				expired = true;
+				finish("");
+			}, ASK_TIMEOUT_MS);
 			pendingAnswers.set(card.id, finish);
 			signal?.addEventListener("abort", () => finish(""));
 		});
 
 		if (!answer) {
-			card.status = "answered";
-			card.answer = "no answer";
+			card.status = expired ? "expired" : "answered";
+			if (!expired) card.answer = "no answer";
 			// The card may have been dismissed while this ask was waiting; putting it back here
 			// would return it seconds after the user closed it. On a timeout it is still there.
 			if (target.cards.some((candidate) => candidate.id === card.id)) upsert(target, card);

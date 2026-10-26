@@ -58,6 +58,12 @@
     font: 11px var(--mono); text-transform: uppercase; letter-spacing: .5px;
     color: #0d1117; background: var(--accent); border-radius: 999px; padding: 1px 6px;
   }
+  /* Same shape as the "new" tag, in the question colour: it is the way back to the card. */
+  .ask-pill {
+    font: 11px var(--mono); text-transform: uppercase; letter-spacing: .5px;
+    color: #0d1117; background: var(--pink); border: 0; border-radius: 999px; padding: 1px 6px;
+    cursor: pointer; white-space: nowrap;
+  }
   .head {
     display: flex; align-items: center; gap: 8px; padding: 8px 10px; flex: none;
     background: var(--card-head); border-bottom: 1px solid var(--border);
@@ -66,11 +72,12 @@
   .card.dragging .head { cursor: grabbing; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
   .dot.note { background: var(--amber); }
-  .dot.question { background: var(--accent); box-shadow: 0 0 0 3px rgba(88,166,255,.18); }
+  .dot.question { background: var(--pink); box-shadow: 0 0 0 3px rgba(219,97,162,.18); }
   .title { font-weight: 600; font-size: 13px; letter-spacing: .2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
   .sub { color: var(--muted); font: 12px var(--mono); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
+  .sub.expired { color: var(--red); }
   .spacer { flex: 1; }
   #stop { color: #f85149; border-color: rgba(248,81,73,.4); }
   #stop[disabled] { color: var(--muted); border-color: #30363d; }
@@ -152,6 +159,11 @@
     0% { box-shadow: 0 0 0 2px rgba(88,166,255,.9), 0 8px 24px rgba(1,4,9,.5); }
     100% { box-shadow: 0 0 0 14px rgba(88,166,255,0), 0 8px 24px rgba(1,4,9,.5); }
   }
+  /* An open question is the one thing the agent is blocked on, so it reads differently from a
+     card that merely has focus (.active), has just arrived (.fresh), holds the composer
+     (.replying) or was just jumped to (.flash). Declared last, because an animation beats a
+     plain declaration and would repaint the pink ring in the arrival colour. */
+  .card.waiting { border-color: var(--pink); box-shadow: 0 0 0 1px rgba(219,97,162,.45), 0 12px 32px rgba(1,4,9,.5); animation: none; }
   .note-body hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
 
   /* virtualized code view */
@@ -176,6 +188,8 @@
     padding: 8px 10px; cursor: pointer;
   }
   .q-opt:hover:not(:disabled) { border-color: var(--accent-dim); background: #1f2631; }
+  /* The keyboard path starts here, so a focused option looks like a hovered one. */
+  .q-opt:focus { outline: none; border-color: var(--accent-dim); background: #1f2631; }
   .q-opt:disabled { cursor: default; opacity: .55; }
   .q-opt.picked { border-color: var(--accent); background: rgba(88,166,255,.12); opacity: 1; }
   .q-free { display: flex; gap: 6px; }
