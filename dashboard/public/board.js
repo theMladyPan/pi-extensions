@@ -569,6 +569,81 @@
   }
 
   // ---------- cards --------------------------------------------------------
+  /** Half a card on screen for this long is a card the human has had a chance to read. */
+  const SEEN_MS = 1500;
+  const seenTimers = new Map();
+  /** Only the cards the observer last called on screen may start a countdown. */
+  const inView = new Set();
+  /** A ratio reported as an int can sit a hair under the threshold the card just crossed. */
+  const RATIO_EPS = 0.01;
+
+  function forgetSeen(card) {
+    const timer = seenTimers.get(card);
+    if (timer) clearTimeout(timer);
+    seenTimers.delete(card);
+  }
+
+  function armSeen(card) {
+    // A hidden tab is nobody looking, so it schedules nothing: visibilitychange starts over.
+    if (document.hidden || seenTimers.has(card)) return;
+    seenTimers.set(
+      card,
+      setTimeout(() => {
+        seenTimers.delete(card);
+        if (!document.hidden) clearFresh(card);
+      }, SEEN_MS),
+    );
+  }
+
+  /**
+   * "New" has to expire on its own, or every card ends up wearing the same border and badge and
+   * the mark stops meaning anything. The countdown belongs to the time the card is on screen: a
+   * card scrolled away before it fires is still new when it comes back.
+   */
+  const seenObserver = new IntersectionObserver(
+    (hits) => {
+      for (const hit of hits) {
+        // The root is the canvas, not the window: a card the rail or the bars clip is not in
+        // front of the human even when it sits inside the window. Half of whichever is smaller,
+        // so a card taller than the canvas still counts once half the canvas shows it.
+        const half = Math.min(hit.boundingClientRect.height, viewport.clientHeight) * 0.5;
+        const onScreen = hit.isIntersecting && (hit.intersectionRatio >= 0.5 - RATIO_EPS || hit.intersectionRect.height >= half);
+        if (onScreen) {
+          inView.add(hit.target);
+          armSeen(hit.target);
+        } else {
+          inView.delete(hit.target);
+          forgetSeen(hit.target);
+        }
+      }
+      // The pill counts what the same rule does not call on screen, so the two cannot disagree.
+      recomputePill();
+    },
+    { root: viewport, threshold: [0, 0.5] },
+  );
+
+  /**
+   * The one place a card stops being new: the border, the badge, the rail row and the pill all
+   * read .fresh, so they have to change together or the board contradicts itself.
+   */
+  function clearFresh(card) {
+    if (!card || !card.classList.contains("fresh")) return;
+    card.classList.remove("fresh");
+    forgetSeen(card);
+    inView.delete(card);
+    seenObserver.unobserve(card);
+    // Hidden, not removed: dropping the badge would shift the buttons under the pointer.
+    const badge = card.querySelector(".new-badge");
+    if (badge) badge.style.visibility = "hidden";
+    syncRailCard(byId.get(card.dataset.id));
+    recomputePill();
+  }
+
+  /** A delegate card reports its own progress, so it redraws far more often than a note. */
+  function isDelegate(data) {
+    return typeof data.key === "string" && data.key.startsWith("delegate-");
+  }
+
   function makeCard(data, quiet = false) {
     const isSource = data.type === "source";
     const isQuestion = data.type === "question";
@@ -576,7 +651,7 @@
     const isNote = data.type === "note";
     const width = data.rect ? data.rect.w : defaultWidth(kind);
     // A delegate card opens small and grows as the run reports; a normal note wants the room.
-    const delegate = typeof data.key === "string" && data.key.startsWith("delegate-");
+    const delegate = isDelegate(data);
     const defaultHeight = isSource ? 430 : isQuestion ? 300 : isNote ? (delegate ? 220 : 420) : 300;
     const height = data.rect ? data.rect.h : defaultHeight;
 
@@ -619,16 +694,13 @@
     if (replaying || quiet) badge.style.visibility = "hidden";
     badge.textContent = "new";
     head.insertBefore(badge, head.querySelector(".close"));
-    if (!replaying) card.classList.add("fresh");
-    const clearFresh = () => {
-      if (!card.classList.contains("fresh")) return;
-      card.classList.remove("fresh");
-      // Hidden, not removed: dropping it would shift the buttons under the pointer.
-      badge.style.visibility = "hidden";
-      syncRailCard(byId.get(card.dataset.id));
-      recomputePill();
-    };
-    card.addEventListener("pointerdown", clearFresh, true);
+    if (!replaying) {
+      card.classList.add("fresh");
+      // Watched only while it can still stop being new.
+      seenObserver.observe(card);
+    }
+    // A card the human clicks is seen at once, without waiting for the observer's countdown.
+    card.addEventListener("pointerdown", () => clearFresh(card), true);
 
     const entry = {
       id: data.id,
@@ -748,6 +820,18 @@
     return entry;
   }
 
+  /** The agent is blocked on this card until the question on it is answered. */
+  function questionWants(data) {
+    return Boolean(data) && data.type === "question" && data.status === "open";
+  }
+
+  /** A note says when it arrived, or when it last changed once it has changed. */
+  function noteSub(data, entry) {
+    if (!entry.updatedAt) return new Date(data.at || Date.now()).toLocaleTimeString();
+    // Hours and minutes only: a card repainted on every run step must not flicker as seconds tick.
+    return `updated ${new Date(entry.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  }
+
   /**
    * An open question says when it gives up, so the wait has a visible end. A settled one says
    * what actually happened: an answer, or a question the board abandoned.
@@ -761,7 +845,7 @@
 
   function paintCard(entry, data) {
     const isSource = data.type === "source";
-    const isOpenQuestion = data.type === "question" && data.status === "open";
+    const isOpenQuestion = questionWants(data);
     entry.data = data;
     if (entry.editing) return;
     entry.titleEl.textContent =
@@ -773,7 +857,7 @@
         ? questionSub(data)
         : data.type === "sticky"
           ? data.status || "queued"
-          : new Date(data.at || Date.now()).toLocaleTimeString();
+          : noteSub(data, entry);
     entry.subEl.classList.toggle("expired", data.type === "question" && data.status === "expired");
     // The pink ring and the pill belong to the question the agent is blocked on, so both go
     // away the moment it is settled.
@@ -857,9 +941,49 @@
     }
   }
 
+  /**
+   * The fields a repaint actually draws. A refresh that rewrites the same text is not news, and
+   * a delegate card is re-broadcast every few seconds whether or not anything moved.
+   */
+  function cardChanged(before, after) {
+    const fields = ["title", "markdown", "text", "question", "reply", "status"];
+    if (fields.some((field) => before[field] !== after[field])) return true;
+    // A follow-up's answer settles into the turn it was asked with, so the thread changes without
+    // gaining a turn: compare what each turn draws, not only how many there are.
+    const was = before.turns || [];
+    const now = after.turns || [];
+    if (was.length !== now.length) return true;
+    return now.some((turn, at) => {
+      const old = was[at] || {};
+      return old.text !== turn.text || old.status !== turn.status || old.reply !== turn.reply || old.images !== turn.images;
+    });
+  }
+
+  /**
+   * A card that changed says so. The ring is rate-limited because a progress card is re-broadcast
+   * every few seconds; the header stamp is not, because it is cheap and has to be true.
+   */
+  function markUpdated(entry) {
+    const now = Date.now();
+    // A delegate card rebuilds its markdown with the elapsed time, so every progress tick would
+    // move this stamp and pin the rail age near zero. Its body already shows that time.
+    if (!isDelegate(entry.data)) entry.updatedAt = now;
+    const card = entry.card;
+    // A card that is still new already wears the mark, so a ring on top of it says nothing.
+    if (card.classList.contains("fresh")) return;
+    if (entry.flashedAt && now - entry.flashedAt < 10000) return;
+    entry.flashedAt = now;
+    flashCard(card);
+  }
+
   function applyMessage(data, quiet = false) {
     const existing = byId.get(data.id);
     if (existing) {
+      if (!replaying && !quiet) {
+        // An identical re-broadcast would only wipe a selection and reset a scrolled body.
+        if (!cardChanged(existing.data, data)) return;
+        markUpdated(existing);
+      }
       paintCard(existing, data);
       return;
     }
@@ -891,6 +1015,11 @@
     for (const card of cards) card.remove();
     cards.length = 0;
     byId.clear();
+    // A replay rebuilds every card, so the observer must let go of the dead ones.
+    seenObserver.disconnect();
+    inView.clear();
+    for (const timer of seenTimers.values()) clearTimeout(timer);
+    seenTimers.clear();
     occupied.length = 0;
     freshCount = 0;
     clearRailCards();
@@ -906,6 +1035,9 @@
     // Compared by id: a remote remove arrives as a bare { id } and would never match the entry.
     if (replyTarget && replyTarget.id === record.id) setReplyTarget(null);
     record.card.remove();
+    forgetSeen(record.card);
+    inView.delete(record.card);
+    seenObserver.unobserve(record.card);
     const at = cards.indexOf(record.card);
     if (at >= 0) cards.splice(at, 1);
     byId.delete(record.id);
@@ -948,21 +1080,41 @@
     pill.style.display = freshCount > 0 ? "" : "none";
   }
 
-  /** The count must follow the viewport, so it is recomputed rather than incremented. */
+  /** The count follows the observer, so a card the pill counts is a card whose mark still counts. */
   function recomputePill() {
-    freshCount = cards.filter((card) => card.classList.contains("fresh") && !isVisible(card)).length;
+    freshCount = cards.filter((card) => card.classList.contains("fresh") && !inView.has(card)).length;
     paintPill();
   }
 
   function jumpToFresh() {
-    const card = cards.find((candidate) => candidate.classList.contains("fresh"));
-    if (!card) return;
-    const x = parseFloat(card.style.left);
-    const y = parseFloat(card.style.top);
+    const record = attentionCard();
+    if (!record) return;
     view.k = Math.min(1.1, Math.max(view.k, 0.6));
-    view.x = viewport.clientWidth / 2 - (x + card.offsetWidth / 2) * view.k;
-    view.y = viewport.clientHeight / 2 - (y + card.offsetHeight / 2) * view.k;
-    applyView();
+    // A question takes the keyboard with it, the way it does when it arrives.
+    if (questionWants(record.data)) centreQuestion(record);
+    else centerOn(record);
+    // One click clears one mark, so a second click moves on to the next card.
+    clearFresh(record.card);
+  }
+
+  /**
+   * What the pill leads to: an arrival the human has not looked at outranks a question that has
+   * already waited out its mark, a question wins inside its group because it blocks the agent, and
+   * the latest event beats the latest arrival.
+   */
+  function attentionCard() {
+    const entries = (list) => list.map((card) => byId.get(card.dataset.id)).filter(Boolean);
+    // A fresh card is one the pill counts, so the same rule picks it here.
+    const fresh = entries(cards.filter((card) => card.classList.contains("fresh") && !inView.has(card)));
+    const pool = fresh.length
+      ? fresh
+      : entries(cards.filter((card) => !isVisible(card))).filter((entry) => questionWants(entry.data));
+    // The change stamp is later than the arrival the card opened with, so it is the newer event.
+    const stamp = (entry) => entry.updatedAt || new Date(entry.data.at || 0).getTime() || 0;
+    const ranked = pool.sort(
+      (a, b) => Number(questionWants(b.data)) - Number(questionWants(a.data)) || stamp(b) - stamp(a),
+    );
+    return ranked[0] || null;
   }
 
   function isVisible(card) {
@@ -1077,6 +1229,12 @@
     area.addEventListener("blur", () => finish(true));
   }
 
+  /** Ring a card once, through the same class a reference jump uses. */
+  function flashCard(card) {
+    card.classList.add("flash");
+    setTimeout(() => card.classList.remove("flash"), 1400);
+  }
+
   /** Centre the view on a card and ring it, so a reference lands where it points. */
   function centerOn(record) {
     const card = record.card;
@@ -1089,8 +1247,7 @@
     view.x = width / 2 - x * view.k;
     view.y = height / 2 - y * view.k;
     applyView();
-    card.classList.add("flash");
-    setTimeout(() => card.classList.remove("flash"), 1400);
+    flashCard(card);
     cards.forEach((c) => c.classList.toggle("active", c === card));
   }
 
@@ -1116,7 +1273,7 @@
   function openQuestion() {
     const marked = document.querySelector(".card.active");
     const record = marked ? byId.get(marked.dataset.id) : null;
-    if (!record || record.data.type !== "question" || record.data.status !== "open") return null;
+    if (!record || !questionWants(record.data)) return null;
     if (record.card.classList.contains("mini") || !isVisible(record.card)) return null;
     return record;
   }
@@ -1303,12 +1460,13 @@
     const data = entry.data || {};
     // "updated" rides on the arrival badge's own .fresh class, so there is one notion of new.
     const updated = entry.card.classList.contains("fresh");
-    const wants = data.type === "question" && data.status === "open";
+    const wants = questionWants(data);
     if (data.type === "question" && data.status === "expired") return { text: "expired", wants: false, updated };
     if (wants) return { text: "answer needed", wants, updated };
     if (updated) return { text: "updated", wants, updated };
     if (data.type === "sticky") return { text: data.status || "queued", wants, updated };
-    return { text: agoText(Date.now() - (data.at || Date.now())), wants, updated };
+    // A changed card is as old as its change, so the row does not keep counting from arrival.
+    return { text: agoText(Date.now() - (entry.updatedAt || data.at || Date.now())), wants, updated };
   }
 
   function paintRailCount() {
@@ -1961,7 +2119,10 @@
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) stopFlash();
+    if (document.hidden) return;
+    stopFlash();
+    // A hidden tab schedules nothing, so what is on screen now starts its countdown from here.
+    for (const card of inView) armSeen(card);
   });
   addEventListener("focus", stopFlash);
 
