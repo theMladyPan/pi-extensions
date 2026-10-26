@@ -392,6 +392,26 @@
     holder.appendChild(text);
 
     const buttons = el("div", "q-options");
+    // Built before the options are wired: every answer path hands the row to submitAnswer, which
+    // takes it out of the card while the send is in flight and puts it back if the send fails.
+    let freeRow = null;
+    if (data.allowFreeText && data.status !== "answered") {
+      freeRow = el("div", "q-free");
+      const input = el("input");
+      input.placeholder = "or type an answer…";
+      const send = el("button", "q-opt");
+      send.textContent = "send";
+      const fire = () => {
+        const value = input.value.trim();
+        if (value) submitAnswer(entry, value, buttons, freeRow);
+      };
+      send.addEventListener("click", fire);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") fire();
+      });
+      freeRow.append(input, send);
+    }
+
     for (const option of data.options || []) {
       const button = el("button", "q-opt");
       button.textContent = option;
@@ -399,29 +419,12 @@
         button.disabled = true;
         if (data.answer === option) button.classList.add("picked");
       } else {
-        button.addEventListener("click", () => submitAnswer(entry, option, buttons));
+        button.addEventListener("click", () => submitAnswer(entry, option, buttons, freeRow));
       }
       buttons.appendChild(button);
     }
     holder.appendChild(buttons);
-
-    if (data.allowFreeText && data.status !== "answered") {
-      const row = el("div", "q-free");
-      const input = el("input");
-      input.placeholder = "or type an answer…";
-      const send = el("button", "q-opt");
-      send.textContent = "send";
-      const fire = () => {
-        const value = input.value.trim();
-        if (value) submitAnswer(entry, value, buttons, row);
-      };
-      send.addEventListener("click", fire);
-      input.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") fire();
-      });
-      row.append(input, send);
-      holder.appendChild(row);
-    }
+    if (freeRow) holder.appendChild(freeRow);
 
     if (data.status === "answered") {
       const done = el("div", "q-done");
@@ -437,17 +440,36 @@
     for (const button of buttons.querySelectorAll("button")) {
       if (button.textContent === answer) button.classList.add("picked");
     }
+    let problem = "";
     try {
-      await fetch(`/answer?token=${encodeURIComponent(token)}`, {
+      const response = await fetch(`/answer?token=${encodeURIComponent(token)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cardId: entry.id, answer }),
       });
+      // A 409 means the question expired or another tab answered it, so nothing was delivered.
+      if (!response.ok) problem = (await response.text()).trim() || "could not send — the question may have expired";
     } catch {
-      const warn = el("div", "q-done");
-      warn.textContent = "could not reach the board server";
-      buttons.parentElement.appendChild(warn);
+      problem = "could not reach the board server";
     }
+    if (!problem) return;
+    // The agent got nothing, so the card goes back to looking unanswered: a picked option and
+    // dead buttons would read as sent.
+    for (const button of buttons.querySelectorAll("button")) {
+      button.disabled = false;
+      button.classList.remove("picked");
+    }
+    if (freeRow) buttons.after(freeRow);
+    const holder = buttons.parentElement;
+    let warn = holder.querySelector(".q-done");
+    if (!warn) {
+      warn = el("div", "q-done");
+      warn.setAttribute("role", "alert");
+      holder.appendChild(warn);
+    }
+    // Styled as a failure, so it does not read as a muted "answered: …" line.
+    warn.classList.add("q-problem");
+    warn.textContent = problem;
   }
 
   /** One follow-up exchange: your question, what happened to it, then the answer. */
@@ -714,6 +736,10 @@
           : new Date(data.at || Date.now()).toLocaleTimeString();
     const editBtn = entry.head.querySelector(".edit");
     if (editBtn) editBtn.style.display = data.type === "note" ? "" : "none";
+    const closeBtn = entry.head.querySelector(".close");
+    // Closing an open question would leave the agent waiting for an answer with nothing on
+    // screen to click, so the button appears only once it has been answered.
+    if (closeBtn) closeBtn.style.display = data.type === "question" && data.status === "open" ? "none" : "";
     entry.chipEl.textContent = isSource && data.line ? `line ${data.line}` : "";
     entry.chipEl.style.display = entry.chipEl.textContent ? "" : "none";
 
@@ -799,6 +825,9 @@
   }
 
   function clearBoard() {
+    // The composer may be docked inside a card, so it comes home first: removing the cards
+    // would take the field with them and leave nothing to type into.
+    setReplyTarget(null);
     for (const card of cards) card.remove();
     cards.length = 0;
     byId.clear();
@@ -813,7 +842,8 @@
   function dropCard(entry) {
     const record = byId.get(entry.id);
     if (!record) return;
-    if (replyTarget === entry) setReplyTarget(null);
+    // Compared by id: a remote remove arrives as a bare { id } and would never match the entry.
+    if (replyTarget && replyTarget.id === record.id) setReplyTarget(null);
     record.card.remove();
     const at = cards.indexOf(record.card);
     if (at >= 0) cards.splice(at, 1);
@@ -1760,11 +1790,15 @@
         applyMeta(payload.meta);
       } else if (payload.type === "snapshot") {
         applyMeta(payload.meta);
+        // A reconnect replays what is already on the board, and the draft survives it. The thread
+        // the draft is aimed at has to survive too, or a reply loses its card mid-conversation.
+        const keptTarget = replyTarget ? replyTarget.id : null;
         clearBoard();
         replaying = true;
         for (const row of payload.activity || []) applyActivity(row);
         for (const card of payload.cards || []) applyMessage(card);
         replaying = false;
+        if (keptTarget && byId.has(keptTarget)) setReplyTarget(byId.get(keptTarget));
         sawFirstCard = (payload.cards || []).length > 0;
         if (cards.length) fitAll();
       } else if (payload.type === "move") {

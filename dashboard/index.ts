@@ -724,6 +724,12 @@ function awaitingAnswer(cardId: string): boolean {
 	return awaitingTurns.some((pending) => pending.cardId === cardId);
 }
 
+/** Release an answer nobody can give any more, so the ask returns instead of timing out. */
+function resolveAsk(cardId: string): void {
+	pendingAnswers.get(cardId)?.("");
+	pendingAnswers.delete(cardId);
+}
+
 /** Hand one exchange to the session and keep its card showing what happened to it. */
 async function sendNow(job: Outgoing): Promise<void> {
 	const pending: Pending = { cardId: job.cardId, turn: job.turn };
@@ -1136,6 +1142,9 @@ function startBoard(): Board {
 				broadcast(board ?? ({ clients } as Board), { type: "remove", id: closed.id });
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ closed: closed.id }));
+				// Released only now: the remove has to reach the clients before the ask's
+				// continuation re-adds the card, or the card the user dismissed comes back.
+				resolveAsk(closed.id);
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/answer") {
@@ -1394,7 +1403,9 @@ const askTool = defineTool({
 		if (!answer) {
 			card.status = "answered";
 			card.answer = "no answer";
-			upsert(target, card);
+			// The card may have been dismissed while this ask was waiting; putting it back here
+			// would return it seconds after the user closed it. On a timeout it is still there.
+			if (target.cards.some((candidate) => candidate.id === card.id)) upsert(target, card);
 			return {
 				content: [{ type: "text", text: "The user did not answer on the board." }],
 				details: { cardId: card.id, answered: false },
@@ -1402,7 +1413,7 @@ const askTool = defineTool({
 		}
 		card.status = "answered";
 		card.answer = answer;
-		upsert(target, card);
+		if (target.cards.some((candidate) => candidate.id === card.id)) upsert(target, card);
 		return {
 			content: [{ type: "text", text: `The user answered on the board: ${answer}` }],
 			details: { cardId: card.id, answered: true },
@@ -1419,6 +1430,8 @@ const clearTool = defineTool({
 		currentCtx = ctx ?? currentCtx;
 		const target = boardForTool();
 		if (!target) return { content: [{ type: "text", text: OFF_MESSAGE }], details: undefined };
+		// A card that is gone can no longer be answered, so the asks behind them return now.
+		for (const card of target.cards) resolveAsk(card.id);
 		target.cards.length = 0;
 		broadcast(target, { type: "clear" });
 		return { content: [{ type: "text", text: "Board cleared." }], details: undefined };
@@ -1475,6 +1488,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 					ctx.ui.notify(OFF_MESSAGE, "warning");
 					return;
 				}
+				for (const card of target.cards) resolveAsk(card.id);
 				target.cards.length = 0;
 				broadcast(target, { type: "clear" });
 				ctx.ui.notify("Board cleared", "info");
