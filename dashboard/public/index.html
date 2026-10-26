@@ -283,14 +283,17 @@
     border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
   header .stat:empty { display: none; }
   header .stat em { color: var(--text); font-style: normal; }
-  /* The chip is also the compact button. Both labels sit in one grid cell, so they swap in place
-     and the header never shifts under the pointer as the word appears. */
-  #statCtx { cursor: pointer; display: inline-grid; align-items: center; justify-items: center; }
+  /* The chip is also the compact button: the same box as its neighbours, so it has to keep their
+     metrics. `appearance` strips the button chrome, and the width is pinned to the seven
+     characters of "ctx 42%" so a one-digit percentage does not make it narrower. */
+  #statCtx { cursor: pointer; appearance: none; position: relative;
+    min-width: calc(7ch + 14px + 2px); }
   /* `display` on the id beats the user agent's [hidden] rule, so hiding is spelled out. */
   #statCtx[hidden] { display: none; }
-  #statCtx > * { grid-area: 1 / 1; white-space: nowrap; }
-  #statCtx #statCtxValue { color: var(--text); }
-  #statCtx .act { visibility: hidden; color: var(--accent); }
+  #statCtx #statCtxValue { color: var(--text); white-space: nowrap; }
+  /* Overlaid rather than laid out beside the number, so the word costs the chip no width. */
+  #statCtx .act { position: absolute; inset: 0; display: grid; place-items: center;
+    visibility: hidden; color: var(--accent); pointer-events: none; }
   #statCtx:hover, #statCtx:focus-visible { color: var(--text); border-color: var(--border-bright); }
   #statCtx:hover #statCtxValue, #statCtx:focus-visible #statCtxValue { visibility: hidden; }
   #statCtx:hover .act, #statCtx:focus-visible .act { visibility: visible; }
