@@ -1728,7 +1728,8 @@
   const msgBox = document.getElementById("msg");
   const sendBtn = document.getElementById("send");
   const composerHint = document.getElementById("composerHint");
-  const compactBtn = document.getElementById("compact");
+  const statCtx = document.getElementById("statCtx");
+  const statCtxValue = document.getElementById("statCtxValue");
   const replyChip = document.getElementById("replyChip");
   const replyChipText = document.getElementById("replyChipText");
   let sendMode = "queue";
@@ -1766,8 +1767,8 @@
 
   // Compaction is the agent's own housekeeping, so the board asks the session for it and reports
   // what came back. The server refuses while a run is in flight: compaction aborts that run first.
-  compactBtn.addEventListener("click", async () => {
-    compactBtn.disabled = true;
+  statCtx.addEventListener("click", async () => {
+    statCtx.disabled = true;
     hintLine("compacting…");
     try {
       const response = await fetch(`/compact?token=${encodeURIComponent(token)}`, { method: "POST" });
@@ -1775,7 +1776,7 @@
     } catch {
       hintLine("could not reach the board server", true);
     } finally {
-      compactBtn.disabled = false;
+      statCtx.disabled = false;
     }
   });
 
@@ -2363,8 +2364,15 @@
       meta.tokensIn || meta.tokensOut ? `↑${shortNum(meta.tokensIn)} ↓${shortNum(meta.tokensOut)}` : "";
     document.getElementById("statCost").innerHTML =
       meta.cost > 0 ? `$${meta.cost < 0.01 ? meta.cost.toFixed(4) : meta.cost.toFixed(3)}` : "";
-    document.getElementById("statCtx").innerHTML =
-      typeof meta.contextPercent === "number" ? `ctx ${Math.round(meta.contextPercent)}%` : "";
+    // The context chip carries the compact action, so it is hidden outright when there is no
+    // figure to show rather than left as a button with nothing in it.
+    const known = typeof meta.contextPercent === "number";
+    statCtx.hidden = !known;
+    statCtxValue.textContent = known ? `ctx ${Math.round(meta.contextPercent)}%` : "";
+    // The action word is hidden until hover, so the name has to carry it for a screen reader.
+    if (known) statCtx.setAttribute("aria-label", `ctx ${Math.round(meta.contextPercent)}%, compact the context`);
+    // Compaction aborts a run in flight, so the chip stops offering it while one is happening.
+    statCtx.classList.toggle("busy", meta.running === true);
   }
 
   // A background tab announces new material the way a chat app does: the title blinks
