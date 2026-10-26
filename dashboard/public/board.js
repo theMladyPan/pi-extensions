@@ -1271,9 +1271,13 @@
     timing.textContent = row.durationMs
       ? `${(row.durationMs / 1000).toFixed(row.durationMs < 1000 ? 2 : 1)}s`
       : row.status === "running"
-        ? "…"
+        ? Number.isFinite(row.startedAt)
+          ? rowClock(Date.now() - row.startedAt)
+          : "…"
         : "";
     top.appendChild(timing);
+    // A running row is re-rendered by the ticker in place, so it carries its own start time.
+    node.dataset.startedAt = String(row.startedAt ?? "");
     node.appendChild(top);
     const detail = row.kind === "reply" ? row.text || "" : row.summary || row.target || "";
     if (detail) {
@@ -1304,6 +1308,7 @@
     const running = railNow.childElementCount ? String(railNow.childElementCount) : "";
     railRunning.textContent = running;
     railOpenCount.textContent = running;
+    syncTicker();
   }
 
   // ---------- composer -----------------------------------------------------
@@ -1775,6 +1780,17 @@
 
   function applyMeta(meta) {
     if (!meta) return;
+    metaRunning = meta.running === true;
+    // A board served by an older pi has no runStartedAt, so the header says waiting instead
+    // of inventing an elapsed time from the moment this tab happened to hear about the run.
+    runStartedAt = typeof meta.runStartedAt === "number" ? meta.runStartedAt : null;
+    // A run that settled without closing its row would keep it counting for ever, so the rail
+    // settles it here and the header and the ticker cannot disagree.
+    if (!metaRunning) {
+      for (const node of railNow.querySelectorAll(".act.running")) node.classList.replace("running", "error");
+    }
+    renderLive();
+    syncTicker();
     // The stop button exists only while there is something to stop.
     stopBtn.style.display = meta.running ? "" : "none";
     if (!meta.running) {
@@ -1837,9 +1853,78 @@
   });
   addEventListener("focus", stopFlash);
 
-  function setLive(up) {
-    live.classList.toggle("down", !up);
-    liveText.textContent = up ? "connected" : "reconnecting";
+  // What the header line is built from: the stream, the run, and the note a broken link leaves.
+  let linkUp = false;
+  let linkNote = "connecting";
+  /** null until the first meta says whether a run is in flight. */
+  let metaRunning = null;
+  let runStartedAt = null;
+  let ticker = null;
+
+  // The header line is one decision: a broken link wins, because without the stream the agent's
+  // state is unknown and an elapsed time would be a guess.
+  function renderLive() {
+    const working = linkUp && metaRunning === true;
+    live.classList.toggle("down", !linkUp);
+    live.classList.toggle("working", working);
+    if (!linkUp) {
+      liveText.textContent = linkNote || "reconnecting";
+      return;
+    }
+    // Nothing is known about the run until the first meta arrives, so claim nothing.
+    if (metaRunning === null) {
+      liveText.textContent = "connecting";
+      return;
+    }
+    liveText.textContent = working
+      ? runStartedAt === null
+        ? "waiting"
+        : `working · ${clockText(Date.now() - runStartedAt)}`
+      : "idle";
+  }
+
+  // Elapsed time the header can read at a glance: minutes, then hours once the minutes run out.
+  function clockText(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = String(total % 60).padStart(2, "0");
+    return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}` : `${minutes}:${seconds}`;
+  }
+
+  // A rail row shows seconds, then whole minutes and seconds, so the width stays steady.
+  function rowClock(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    if (total < 60) return `${total}s`;
+    if (total < 3600) return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+    return `${Math.floor(total / 3600)}h ${String(Math.floor((total % 3600) / 60)).padStart(2, "0")}m`;
+  }
+
+  // One clock drives the header and every running row. It runs only while something is worth
+  // ticking, so an idle board does not wake its tab every second.
+  function tick() {
+    if (metaRunning === true) renderLive();
+    for (const node of railNow.querySelectorAll(".act.running")) {
+      const started = Number(node.dataset.startedAt);
+      const timing = node.querySelector(".ms");
+      if (started && timing) timing.textContent = rowClock(Date.now() - started);
+    }
+  }
+
+  function syncTicker() {
+    const wanted = metaRunning === true || railNow.querySelector(".act.running") !== null;
+    if (wanted && !ticker) {
+      ticker = setInterval(tick, 1000);
+    } else if (!wanted && ticker) {
+      clearInterval(ticker);
+      ticker = null;
+    }
+  }
+
+  function setLive(up, note = "") {
+    linkUp = up;
+    if (!up) linkNote = note;
+    renderLive();
   }
 
   function connect() {
@@ -1853,8 +1938,7 @@
       // A refused stream keeps retrying forever, so say what actually happened: the token in
       // this address bar is not the one the board now knows.
       refusals += 1;
-      setLive(false);
-      if (refusals >= 3) liveText.textContent = "token refused — reopen the link pi printed";
+      setLive(false, refusals >= 3 ? "token refused — reopen the link pi printed" : "");
     };
     source.onmessage = (event) => {
       let payload;
@@ -1904,8 +1988,7 @@
     applyView();
     updateEmpty();
     if (!token) {
-      setLive(false);
-      liveText.textContent = "missing token";
+      setLive(false, "missing token");
       return;
     }
     connect();

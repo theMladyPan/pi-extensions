@@ -174,6 +174,8 @@ interface BoardMeta {
 	contextPercent: number | null;
 	/** True while the agent is working, so the board can offer a stop button. */
 	running: boolean;
+	/** Epoch ms when the current run began, so the board can show how long it has been working. */
+	runStartedAt: number | null;
 }
 
 interface Board {
@@ -196,6 +198,7 @@ const EMPTY_META: BoardMeta = {
 	cost: 0,
 	contextPercent: null,
 	running: false,
+	runStartedAt: null,
 };
 
 let board: Board | undefined;
@@ -203,6 +206,8 @@ let currentCtx: ExtensionContext | undefined;
 /** Whether a run is in flight. `agent_end` can be followed by more work, so this clears
  *  only when the whole run settles. */
 let running = false;
+/** When the run that is currently in flight began, or null while the board is idle. */
+let runStartedAt: number | null = null;
 let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
 /** Set by the extension so the HTTP handler can hand a board message to the session. */
@@ -624,6 +629,7 @@ function currentMeta(target: Board): BoardMeta {
 		cost: totals.cost,
 		contextPercent: currentCtx?.getContextUsage()?.percent ?? null,
 		running,
+		runStartedAt,
 	};
 }
 
@@ -1729,6 +1735,9 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
+		// A second session in the same process starts idle, so the previous run's clock is dropped.
+		running = false;
+		runStartedAt = null;
 		// Only the interactive session owns a port; print and subagent runs stay headless.
 		if (enabled && ctx.mode === "tui") {
 			announceBoard(ensureBoard(), ctx);
@@ -1738,6 +1747,8 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		currentCtx = ctx;
+		// One run can start the agent more than once, so the clock keeps its first start.
+		if (!running) runStartedAt = Date.now();
 		running = true;
 		pushMeta();
 		const live = Boolean(enabled && board) && ctx.mode === "tui";
@@ -1762,11 +1773,14 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	// that asked what happened to it.
 	pi.on("agent_settled", async (event) => {
 		running = false;
+		runStartedAt = null;
 		if (board) {
 			for (const row of board.activity) {
 				if (row.kind === "tool" && row.status === "running") {
 					row.status = "error";
 					row.summary = "stopped";
+					// No end event will arrive to fill this in, and the time is most useful right here.
+					row.durationMs = Date.now() - row.startedAt;
 					broadcast(board, { type: "activity", row });
 				}
 			}
