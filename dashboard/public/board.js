@@ -29,6 +29,9 @@
   let replyTarget = null;
   // A snapshot is what is already on the board, so nothing in it is new to the reader.
   let replaying = false;
+  // Only the first snapshot of a session frames the board: a reconnect restores cards the human
+  // already arranged, so it must leave the view exactly where they left it.
+  let framedView = false;
   let freshCount = 0;
 
   const GAP = 18;
@@ -1007,7 +1010,7 @@
     recomputePill();
     if (!sawFirstCard) {
       sawFirstCard = true;
-      fitAll();
+      if (!replaying) fitAll();
     }
     // An off-screen arrival is announced by the new-card pill, and a question has its own
     // centring below, so no scroll into view is needed (and the viewport cannot scroll).
@@ -2145,6 +2148,8 @@
   // What the header line is built from: the stream, the run, and the note a broken link leaves.
   let linkUp = false;
   let linkNote = "connecting";
+  /** Pending timer that puts the dimmed down state on screen. */
+  let dimTimer = null;
   /** null until the first meta says whether a run is in flight. */
   let metaRunning = null;
   let runStartedAt = null;
@@ -2219,21 +2224,33 @@
   function setLive(up, note = "") {
     linkUp = up;
     if (!up) linkNote = note;
+    // The last painted board stays on screen, so the content has to say it is stale too. A wake or
+    // a roam can break the stream for one retry cycle, so the down state waits a second and a link
+    // that returns first cancels it.
+    if (up) {
+      clearTimeout(dimTimer);
+      dimTimer = null;
+      document.body.classList.remove("link-down");
+    } else if (!dimTimer && !document.body.classList.contains("link-down")) {
+      dimTimer = setTimeout(() => {
+        dimTimer = null;
+        document.body.classList.add("link-down");
+      }, 1000);
+    }
     renderLive();
   }
 
   function connect() {
     const source = new EventSource(`/events?token=${encodeURIComponent(token)}`);
-    let refusals = 0;
-    source.onopen = () => {
-      setLive(true);
-      refusals = 0;
-    };
+    source.onopen = () => setLive(true);
     source.onerror = () => {
-      // A refused stream keeps retrying forever, so say what actually happened: the token in
-      // this address bar is not the one the board now knows.
-      refusals += 1;
-      setLive(false, refusals >= 3 ? "token refused — reopen the link pi printed" : "");
+      // The browser tells the two failures apart: an HTTP error, such as a token the board no
+      // longer knows, closes the stream for good, while a network error leaves it retrying.
+      if (source.readyState === EventSource.CLOSED) {
+        setLive(false, "token refused — reopen the link pi printed");
+      } else {
+        setLive(false, "pi not reachable — retrying");
+      }
     };
     source.onmessage = (event) => {
       let payload;
@@ -2261,7 +2278,13 @@
         }
         if (keptTarget && byId.has(keptTarget)) setReplyTarget(byId.get(keptTarget));
         sawFirstCard = (payload.cards || []).length > 0;
-        if (cards.length) fitAll();
+        // Armed on the first snapshot even when it is empty: the usual start is an empty snapshot
+        // and the first card frames through the new-card path, and the first reconnect must not
+        // throw that framing away.
+        if (!framedView) {
+          framedView = true;
+          if (cards.length) fitAll();
+        }
       } else if (payload.type === "move") {
         const record = byId.get(payload.id);
         if (record && payload.rect) placeCard(record, payload.rect);
@@ -2283,7 +2306,10 @@
     applyView();
     updateEmpty();
     if (!token) {
-      setLive(false, "missing token");
+      // No stream exists here, so nothing on the page is stale: only the header says why the board
+      // is blank.
+      linkNote = "missing token";
+      renderLive();
       return;
     }
     connect();

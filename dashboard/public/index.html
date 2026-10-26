@@ -39,6 +39,11 @@
     cursor: grab;
   }
   #viewport.dragging { cursor: grabbing; }
+  /* With the stream down nothing on the board can change, so it dims to read as stale. Each card's
+     contents dim rather than the viewport, so a docked composer stays readable while the agent is
+     blocked on a question. */
+  body.link-down #world > .card > *:not(#composer),
+  body.link-down #empty { opacity: .55; }
   /* Zoom is a real layout zoom, not a scaled bitmap: text is laid out at the size it is
      shown at, so it stays sharp instead of waiting for a repaint to catch up. */
   #world { position: absolute; top: 0; left: 0; zoom: 1; }
