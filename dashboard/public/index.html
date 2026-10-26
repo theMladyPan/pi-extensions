@@ -359,8 +359,13 @@
   .act .target, .act .note { color: var(--muted); font-size: 11px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .act.reply { background: #10161e; border-color: #232a33; }
-  .act.reply .note { color: #c9d1d9; white-space: pre-wrap; display: -webkit-box;
-    -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
+  .act.reply .note, .act.thinking .tail { white-space: pre-wrap; display: -webkit-box;
+    -webkit-box-orient: vertical; }
+  .act.reply .note { color: #c9d1d9; -webkit-line-clamp: 4; }
+  /* A thought streams in paragraphs, so its tail keeps the newest characters dim and monospaced
+     and clamps the height, which leaves the rest of the rail where it was. No scroll of its own. */
+  .act.thinking .tail { margin-top: 2px; color: var(--muted); font: 10px/1.35 var(--mono);
+    overflow-wrap: anywhere; overflow: hidden; -webkit-line-clamp: 5; }
   @keyframes pulseDot { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
 
   /* composer */

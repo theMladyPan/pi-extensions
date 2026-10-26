@@ -1525,6 +1525,8 @@
   const railRunning = document.getElementById("railRunning");
   const railOpenCount = document.getElementById("railOpenCount");
   const actEls = new Map();
+  /** A thought with no patch for this long is stalled, and its row says so with the clock. */
+  const THOUGHT_STALL_MS = 3000;
 
   // The rail is the user's furniture: its width and whether it is showing survive a reload.
   const RAIL_MIN = 160;
@@ -1672,15 +1674,29 @@
   }
 
   function actRow(row) {
-    const node = el("div", `act ${row.kind === "reply" ? "reply" : ""} ${row.status}`);
+    const thinking = row.kind === "thinking";
+    const node = el("div", `act ${row.kind === "reply" ? "reply" : ""} ${thinking ? "thinking" : ""} ${row.status}`);
+    // The row carries its kind and status so a patch can update it in place and the one clock can
+    // leave a thinking row's rate alone.
+    node.dataset.kind = String(row.kind ?? "");
+    node.dataset.status = String(row.status ?? "");
     const top = el("div", "top");
     top.appendChild(el("span", "dot"));
     const name = el("span", "name");
     // The phrase says what the call does; the tool name stays available on hover.
-    name.textContent = row.kind === "reply" ? "answer" : row.label || row.tool || "tool";
+    name.textContent = row.kind === "reply" ? "answer" : thinking ? "thinking" : row.label || row.tool || "tool";
     if (row.tool) name.title = row.tool;
     top.appendChild(name);
     const timing = el("span", "ms");
+    top.appendChild(timing);
+    // A running row is re-rendered by the ticker in place, so it carries its own start time.
+    node.dataset.startedAt = String(row.startedAt ?? "");
+    node.appendChild(top);
+    if (thinking) {
+      node.appendChild(el("div", "tail"));
+      paintThought(node, row);
+      return node;
+    }
     timing.textContent = row.durationMs
       ? `${(row.durationMs / 1000).toFixed(row.durationMs < 1000 ? 2 : 1)}s`
       : row.status === "running"
@@ -1688,10 +1704,6 @@
           ? rowClock(Date.now() - row.startedAt)
           : "…"
         : "";
-    top.appendChild(timing);
-    // A running row is re-rendered by the ticker in place, so it carries its own start time.
-    node.dataset.startedAt = String(row.startedAt ?? "");
-    node.appendChild(top);
     const detail = row.kind === "reply" ? row.text || "" : row.summary || row.target || "";
     if (detail) {
       const note = el("div", row.kind === "reply" ? "note" : "target");
@@ -1702,9 +1714,57 @@
     return node;
   }
 
+  /**
+   * A thought's count leads, then its rate while it runs or the time it took once it ends. A tilde
+   * means the number is our estimate rather than one the provider reported.
+   */
+  function thoughtTiming(row) {
+    const mark = row.tokensEstimated ? "~" : "";
+    const tokens = typeof row.tokens === "number" ? `${mark}${row.tokens} tok` : "";
+    const pace = row.status === "running" && row.rate ? `~${row.rate} tok/s` : "";
+    const took = row.durationMs ? `${(row.durationMs / 1000).toFixed(row.durationMs < 1000 ? 2 : 1)}s` : "";
+    return [tokens, pace || took].filter(Boolean).join(" · ");
+  }
+
+  /**
+   * The live parts of a thinking row: its timing, the tail and the stamp the ticker reads. Patching
+   * them in place keeps the dot's pulse running and leaves the user's text selection alone.
+   */
+  function paintThought(node, row) {
+    const timing = node.querySelector(".ms");
+    timing.textContent = thoughtTiming(row);
+    timing.title = row.tokensEstimated
+      ? "thinking tokens estimated from the characters streamed, about four per token"
+      : "thinking tokens reported by the provider";
+    node.querySelector(".tail").textContent = thoughtTail(row.text);
+    node.dataset.patchedAt = String(Date.now());
+  }
+
+  /**
+   * A thought streams in paragraphs, so the rail keeps its newest lines and lets the CSS clamp hold
+   * the height. Every newline costs a clamp line, so the newest five lines are kept whole and only a
+   * very long line falls back to a character cut, which moves past a low surrogate so that no emoji
+   * ends up as a box.
+   */
+  function thoughtTail(text, keep = 180) {
+    const flat = String(text || "").replace(/\s+$/, "");
+    let tail = flat.split("\n").slice(-5).join("\n");
+    if (tail.length > keep) {
+      const start = tail.length - keep;
+      tail = tail.slice(/[\uDC00-\uDFFF]/.test(tail[start]) ? start + 1 : start);
+    }
+    return tail.length < flat.length ? `…${tail}` : tail;
+  }
+
   function applyActivity(row) {
-    const node = actRow(row);
     const previous = actEls.get(row.id);
+    // A thought patches four times a second while its status stays put. Rebuilding the node would
+    // restart the dot's pulse and drop a text selection, so it is updated where it stands.
+    if (previous && row.kind === "thinking" && previous.dataset.status === row.status) {
+      paintThought(previous, row);
+      return;
+    }
+    const node = actRow(row);
     if (previous) previous.remove();
     actEls.set(row.id, node);
     if (row.status === "running") {
@@ -2477,7 +2537,13 @@
     for (const node of railNow.querySelectorAll(".act.running")) {
       const started = Number(node.dataset.startedAt);
       const timing = node.querySelector(".ms");
-      if (started && timing) timing.textContent = rowClock(Date.now() - started);
+      if (!started || !timing) continue;
+      // A thought's rate only moves when a patch lands, so a few still seconds hand the row back to
+      // the clock and a stalled thought stops looking live.
+      if (node.dataset.kind === "thinking" && Date.now() - Number(node.dataset.patchedAt) < THOUGHT_STALL_MS) {
+        continue;
+      }
+      timing.textContent = rowClock(Date.now() - started);
     }
     // Rail ages are derived from stored data, so re-reading them here is the only thing that
     // keeps the word current while nothing repaints the card.

@@ -149,10 +149,10 @@ interface StickyCard extends CardBase {
 
 type Card = NoteCard | SourceCard | QuestionCard | StickyCard;
 
-/** One row of the activity rail: a tool call, or the answer that closed a turn. */
+/** One row of the activity rail: a tool call, a thinking block, or the answer that closed a turn. */
 interface ActivityRow {
 	id: string;
-	kind: "tool" | "reply";
+	kind: "tool" | "reply" | "thinking";
 	tool?: string;
 	/** Two or three words saying what the call does, shown instead of the tool name. */
 	label?: string;
@@ -161,7 +161,13 @@ interface ActivityRow {
 	startedAt: number;
 	durationMs?: number;
 	summary?: string;
+	/** The newest characters of a thought, or the whole answer text. */
 	text?: string;
+	/** Thinking rows: approximate tokens a second, while the block still streams. */
+	rate?: number;
+	/** Thinking rows: thinking tokens, and whether the provider reported them or we estimated. */
+	tokens?: number;
+	tokensEstimated?: boolean;
 }
 
 /** What the header shows: which session this board belongs to and what it has spent. */
@@ -218,6 +224,8 @@ let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[], pre
 	async () => {};
 /** Set by the extension so the board can ask the session to compact its own context. */
 let compactSession: () => void = () => {};
+/** Set by the extension so closing the board also forgets the thought it was streaming. */
+let forgetThoughts: () => void = () => {};
 
 /**
  * An exchange waiting for its answer. Turn -1 is the sticky's own message; anything else is a
@@ -1299,6 +1307,7 @@ function stopBoard(): void {
 	board = undefined;
 	for (const resolveAnswer of pendingAnswers.values()) resolveAnswer("");
 	pendingAnswers.clear();
+	forgetThoughts();
 }
 
 /** Resolve a path inside the session working directory, refusing to escape it. */
@@ -1637,6 +1646,149 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		callArgs.delete(event.toolCallId);
 	});
 
+	// Thinking streams token by token and the user can watch it, so each block becomes a rail row of
+	// its own. The host keeps one small record per block: the newest characters and a few rate
+	// samples. The row id carries the message and the block's content index, so a second block in
+	// the same message gets a second row.
+	/** A few lines of text is all the rail can show, so the tail is a few hundred characters. */
+	const THOUGHT_TAIL = 400;
+	/** A few seconds of samples are enough to read a rate off, and cost nothing to keep. */
+	const THOUGHT_WINDOW_MS = 5000;
+	/** Four patches a second is faster than anyone reads and far slower than a provider streams. */
+	const THOUGHT_PUSH_MS = 250;
+	/** Providers count thinking tokens their own way; four characters each is the usual estimate. */
+	const CHARS_PER_TOKEN = 4;
+
+	interface Thought {
+		/** The message this block belongs to, so a finished message can claim its rows. */
+		messageKey: string;
+		/** Newest characters of the block, cut at a character boundary. */
+		tail: string;
+		/** True once the tail was cut, so the client knows it starts mid-thought. */
+		cut: boolean;
+		chars: number;
+		/** (time, running character count) pairs; the rate is read off the oldest and the newest. */
+		samples: { at: number; chars: number }[];
+		pushedAt: number;
+	}
+	/** Live and freshly finished thinking blocks, one entry each, keyed by row id. */
+	const thoughts = new Map<string, Thought>();
+	// The records only exist while a board is open, so the board's own cleanup has to drop them.
+	forgetThoughts = () => thoughts.clear();
+	/** Counts assistant messages, so two blocks in different messages never share a row id. */
+	let thoughtMessage = "0";
+
+	/** Approximate tokens a second over the newest samples. The rail labels it as approximate. */
+	const thoughtRate = (thought: Thought): number => {
+		const first = thought.samples[0];
+		const last = thought.samples[thought.samples.length - 1];
+		if (!first || !last) return 0;
+		const seconds = (last.at - first.at) / 1000;
+		return seconds > 0 ? Math.round((last.chars - first.chars) / seconds / CHARS_PER_TOKEN) : 0;
+	};
+
+	/** Keep the newest characters without splitting a surrogate pair, so no emoji turns into a box. */
+	const safeTail = (text: string, keep: number): string => {
+		const start = text.length - keep;
+		return /[\uDC00-\uDFFF]/.test(text[start] ?? "") ? text.slice(start + 1) : text.slice(start);
+	};
+
+	const pushThought = (target: Board, id: string, thought: Thought): void => {
+		patchActivity(target, id, {
+			status: "running",
+			text: `${thought.cut ? "…" : ""}${thought.tail}`,
+			rate: thoughtRate(thought),
+			tokens: Math.round(thought.chars / CHARS_PER_TOKEN),
+			tokensEstimated: true,
+		});
+	};
+
+	// The message counter has to stay right even with no board open, so a board that opens
+	// mid-session cannot hand a new message the id of an old one.
+	pi.on("message_start", async (event) => {
+		if (event.message.role !== "assistant") return;
+		thoughtMessage = nextId();
+	});
+
+	pi.on("message_update", async (event) => {
+		if (!board) return;
+		const update = event.assistantMessageEvent as {
+			type: string;
+			contentIndex?: number;
+			delta?: string;
+			content?: string;
+		};
+		if (update.type !== "thinking_start" && update.type !== "thinking_delta" && update.type !== "thinking_end") return;
+		const id = `think-${thoughtMessage}-${update.contentIndex ?? 0}`;
+		const now = Date.now();
+
+		if (update.type === "thinking_start") {
+			// A message that was aborted leaves its record behind; the new message makes it dead.
+			for (const [staleId, stale] of thoughts) {
+				if (stale.messageKey !== thoughtMessage) thoughts.delete(staleId);
+			}
+			thoughts.set(id, { messageKey: thoughtMessage, tail: "", cut: false, chars: 0, samples: [], pushedAt: now });
+			pushActivity(board, {
+				id,
+				kind: "thinking",
+				status: "running",
+				startedAt: now,
+				tokens: 0,
+				tokensEstimated: true,
+			});
+			return;
+		}
+
+		const thought = thoughts.get(id);
+		if (!thought) return;
+
+		if (update.type === "thinking_delta") {
+			const delta = update.delta ?? "";
+			thought.chars += delta.length;
+			thought.tail += delta;
+			if (thought.tail.length > THOUGHT_TAIL) {
+				thought.tail = safeTail(thought.tail, THOUGHT_TAIL);
+				thought.cut = true;
+			}
+			// One sample per delta would cost more than the rate is worth, so a sample lands with
+			// each push and the window is read off the newest few seconds of them.
+			const last = thought.samples[thought.samples.length - 1];
+			if (!last || now - last.at >= THOUGHT_PUSH_MS) {
+				thought.samples.push({ at: now, chars: thought.chars });
+				while (thought.samples.length > 2 && thought.samples[0].at < now - THOUGHT_WINDOW_MS) {
+					thought.samples.shift();
+				}
+			}
+			// A fast provider would flood the stream, so a delta only reaches the board four times a
+			// second. The final state is pushed by thinking_end.
+			if (now - thought.pushedAt >= THOUGHT_PUSH_MS) {
+				thought.pushedAt = now;
+				pushThought(board, id, thought);
+			}
+			return;
+		}
+
+		// thinking_end carries the authoritative content, so the tail follows it and the row stops
+		// spinning with its total. The provider's own count is preferred later, at message_end.
+		const content = update.content ?? thought.tail;
+		thought.chars = Math.max(thought.chars, content.length);
+		if (content) {
+			thought.cut = content.length > THOUGHT_TAIL;
+			thought.tail = thought.cut ? safeTail(content, THOUGHT_TAIL) : content;
+		}
+		const row = board.activity.find((candidate) => candidate.id === id);
+		patchActivity(board, id, {
+			status: "ok",
+			durationMs: now - (row?.startedAt ?? now),
+			text: `${thought.cut ? "…" : ""}${thought.tail}`,
+			rate: undefined,
+			tokens: Math.round(thought.chars / CHARS_PER_TOKEN),
+			tokensEstimated: true,
+		});
+		// The finished row holds the text now, so the record keeps only what message_end needs.
+		thought.samples.length = 0;
+	});
+
 	// A delegate run lasts minutes and ends in a report the user reads. The rail can only show one
 	// line of it, so the run gets a card that states where it is and then holds the outcome.
 	interface DelegateRun {
@@ -1839,6 +1991,14 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		if (event.message.role === "assistant" && addUsage(event.message as { usage?: { input?: number; output?: number; cost?: { total?: number } } })) {
 			pushMeta();
 		}
+		// The provider's own thinking count beats the estimate. It covers the whole message, so it
+		// only belongs to a row when the message held a single block; otherwise each row keeps the
+		// estimate it can honestly claim.
+		const mine = [...thoughts].filter(([, thought]) => thought.messageKey === thoughtMessage);
+		for (const [id] of mine) thoughts.delete(id);
+		const reported = (event.message as { usage?: { reasoning?: number } }).usage?.reasoning;
+		if (!board || typeof reported !== "number" || reported <= 0 || mine.length !== 1) return;
+		patchActivity(board, mine[0][0], { tokens: reported, tokensEstimated: false });
 	});
 
 	pi.on("model_select", async () => {
@@ -1887,8 +2047,10 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		running = false;
 		runStartedAt = null;
 		if (board) {
+			// A thinking block cut off mid-stream gets the same treatment as a tool call.
+			thoughts.clear();
 			for (const row of board.activity) {
-				if (row.kind === "tool" && row.status === "running") {
+				if ((row.kind === "tool" || row.kind === "thinking") && row.status === "running") {
 					row.status = "error";
 					row.summary = "stopped";
 					// No end event will arrive to fill this in, and the time is most useful right here.
