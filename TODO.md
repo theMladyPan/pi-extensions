@@ -31,8 +31,9 @@ Ticked means in the repo. It does not mean exercised.
 
 ## pi-bench — board as master, pi as slaves
 
-A standalone daemon that owns the agents, replacing the extension. Detail, proofs
-and next slice: [`pi-bench/STATE.md`](pi-bench/STATE.md).
+Moved out of this repository into its own application: `~/projekty/pi-studio`
+(remote `theMladyPan/pi-studio`). Its `STATE.md` carries the proofs and the next
+slice; this list only remembers why it exists.
 
 - [x] **Daemon vertical slice** — `pi-bench/server.mjs`: threads, one `--mode rpc`
       child per thread, `POST /thread`, `POST /message`, `GET /events`, `GET /state`.
@@ -41,7 +42,7 @@ and next slice: [`pi-bench/STATE.md`](pi-bench/STATE.md).
       client gained an opt-in `body.threads` layout (no bottom composer, a `+` button,
       the field docked in the card). The extension's board is untouched.
 - [ ] **Board verbs for children** — `POST /card/note`, `/card/source`, `/card/ask`,
-      plus a thin `slave.ts` a child loads with `-e`.
+      plus a thin `slave.ts` a child loads with `-e`. Now tracked in pi-studio.
 - [ ] **Persistence of threads** — session ids and cards, so a restarted daemon
       resumes a thread by spawning a child on its session.
 - [ ] **Steer and abort per thread** — the wire is proven in `delegate.ts`.
