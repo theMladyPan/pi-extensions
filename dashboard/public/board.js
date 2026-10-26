@@ -4,6 +4,13 @@
 
   const world = document.getElementById("world");
   const viewport = document.getElementById("viewport");
+  // `overflow: clip` keeps the viewport out of the scroll containers, but an engine that ignores
+  // it (and falls back to `hidden`) would still scroll when the composer or an editor takes
+  // focus, leaving the pan state behind. Zeroing the offset holds the invariant on every engine.
+  viewport.addEventListener("scroll", () => {
+    viewport.scrollTop = 0;
+    viewport.scrollLeft = 0;
+  });
   const emptyHint = document.getElementById("empty");
   const live = document.getElementById("live");
   const liveText = document.getElementById("liveText");
@@ -88,7 +95,14 @@
       }
       if (best) return best;
     }
-    return best || { x: ax, y: ay, w, h };
+    // Every ring was searched and none was free: put the card clear of the whole board, right of
+    // the rightmost card and level with the highest one, instead of stacking it on the card that
+    // already sits at the anchor.
+    const right = occupied.reduce((far, spot) => Math.max(far, spot.x + spot.w), -Infinity);
+    const top = occupied.reduce((high, spot) => Math.min(high, spot.y), Infinity);
+    // Nothing placed yet (or nothing with a positive edge): the anchor is the whole board.
+    if (right === -Infinity || top === Infinity) return { x: ax, y: ay, w, h };
+    return { x: right + GAP, y: top, w, h };
   }
 
   const viewportCenter = () => ({
@@ -104,6 +118,8 @@
     if (cls) node.className = cls;
     return node;
   };
+  /** The card dot's colour, in one place so the card and its rail row cannot drift apart. */
+  const dotKind = (kind) => (kind === "source" ? "code" : kind === "question" ? "question" : "note");
   /**
    * The world is zoomed with the CSS `zoom` property, so text is laid out at the size it is
    * shown at and never softens the way a scaled bitmap does. `zoom` scales the element's own
@@ -580,7 +596,7 @@
 
     const head = el("div", "head");
     head.innerHTML = `
-      <span class="dot ${isSource ? "code" : isQuestion ? "question" : kind === "sticky" ? "sticky" : "note"}"></span>
+      <span class="dot ${dotKind(kind)}"></span>
       <span class="title"></span>
       <span class="sub"></span>
       <span class="spacer"></span>
@@ -609,6 +625,7 @@
       card.classList.remove("fresh");
       // Hidden, not removed: dropping it would shift the buttons under the pointer.
       badge.style.visibility = "hidden";
+      syncRailCard(byId.get(card.dataset.id));
       recomputePill();
     };
     card.addEventListener("pointerdown", clearFresh, true);
@@ -777,6 +794,7 @@
     paintThread(entry, data);
     fitContent(entry, data);
     renumberQueue();
+    syncRailCard(entry);
   }
 
   /**
@@ -799,13 +817,17 @@
       if (!bodyTight && !threadTight) return;
       entry.card.classList.add("auto-height");
       requestAnimationFrame(() => {
+        // The card can be closed between the two frames, and a snapshot replay clears and
+        // re-creates the same id, so only this same entry may still claim a place.
+        if (byId.get(entry.id) !== entry) return;
         const rect = {
           x: Math.round(parseFloat(entry.card.style.left)),
           y: Math.round(parseFloat(entry.card.style.top)),
           w: entry.card.offsetWidth,
           h: entry.card.offsetHeight,
         };
-        entry.card.dataset.rect = JSON.stringify(rect);
+        // Through placeCard, so the space the card grew into is the space later cards avoid.
+        placeCard(entry, rect);
         void saveLayout(entry.id, rect);
       });
     });
@@ -847,7 +869,8 @@
       sawFirstCard = true;
       fitAll();
     }
-    entry.card.scrollIntoView && entry.card.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // An off-screen arrival is announced by the new-card pill, and a question has its own
+    // centring below, so no scroll into view is needed (and the viewport cannot scroll).
     // A question blocks the agent, so it lands under the eye and the keyboard. A replay brings
     // back cards the user already has, so it never pulls the view or steals the focus.
     // A question already on screen keeps the view: a second one must not pull it away.
@@ -870,6 +893,7 @@
     byId.clear();
     occupied.length = 0;
     freshCount = 0;
+    clearRailCards();
     paintPill();
     sawFirstCard = false;
     updateEmpty();
@@ -885,6 +909,7 @@
     const at = cards.indexOf(record.card);
     if (at >= 0) cards.splice(at, 1);
     byId.delete(record.id);
+    dropRailCard(record.id);
     releaseSpot(record.card);
     renumberQueue();
     recomputePill();
@@ -1257,6 +1282,93 @@
     grip.addEventListener("pointerup", stop);
     grip.addEventListener("pointercancel", stop);
   })();
+
+  // The rail is the overview of the board: every card, newest first, with the one state worth
+  // knowing. A row is the way back to its card.
+  const railCards = document.getElementById("railCards");
+  const railCardCount = document.getElementById("railCardCount");
+  const railRows = new Map();
+
+  /** An age short enough to share a row with a title. */
+  function agoText(ms) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+    return `${Math.floor(seconds / 86400)}d`;
+  }
+
+  /** The one state word a row has room for, in the words the card itself already uses. */
+  function railState(entry) {
+    const data = entry.data || {};
+    // "updated" rides on the arrival badge's own .fresh class, so there is one notion of new.
+    const updated = entry.card.classList.contains("fresh");
+    const wants = data.type === "question" && data.status === "open";
+    if (data.type === "question" && data.status === "expired") return { text: "expired", wants: false, updated };
+    if (wants) return { text: "answer needed", wants, updated };
+    if (updated) return { text: "updated", wants, updated };
+    if (data.type === "sticky") return { text: data.status || "queued", wants, updated };
+    return { text: agoText(Date.now() - (data.at || Date.now())), wants, updated };
+  }
+
+  function paintRailCount() {
+    railCardCount.textContent = railRows.size ? String(railRows.size) : "";
+    syncTicker();
+  }
+
+  /** Just the state word and its tone, so the clock and a repaint share one writer. */
+  function paintRailState(entry) {
+    const row = railRows.get(entry.id);
+    if (!row) return;
+    const { text, wants, updated } = railState(entry);
+    // The clock calls this every second, so a word that has not changed must not touch the DOM.
+    if (row.children[2].textContent !== text) {
+      row.children[2].textContent = text;
+      row.classList.toggle("wants", wants);
+      row.classList.toggle("updated", updated);
+      row.title = `${row.children[1].textContent} · ${text}`;
+    }
+  }
+
+  /**
+   * One row per card, built once and patched in place: this runs on every card repaint, so it
+   * must not rebuild the list or touch any other card's DOM. Arrival order is the order the
+   * cards array keeps, so a new card is only ever prepended.
+   */
+  function syncRailCard(entry) {
+    if (!entry) return;
+    let row = railRows.get(entry.id);
+    if (!row) {
+      row = el("button", "rail-card");
+      row.type = "button";
+      row.dataset.id = entry.id;
+      row.append(el("span", "dot"), el("span", "rail-title"), el("span", "rail-state"));
+      row.addEventListener("click", () => {
+        const record = byId.get(row.dataset.id);
+        if (record) centerOn(record);
+      });
+      railRows.set(entry.id, row);
+      railCards.prepend(row);
+    }
+    row.children[0].className = `dot ${dotKind(entry.data.type)}`;
+    row.children[1].textContent = entry.titleEl.textContent;
+    paintRailState(entry);
+    paintRailCount();
+  }
+
+  function dropRailCard(id) {
+    const row = railRows.get(id);
+    if (!row) return;
+    row.remove();
+    railRows.delete(id);
+    paintRailCount();
+  }
+
+  function clearRailCards() {
+    railCards.replaceChildren();
+    railRows.clear();
+    paintRailCount();
+  }
 
   function actRow(row) {
     const node = el("div", `act ${row.kind === "reply" ? "reply" : ""} ${row.status}`);
@@ -1909,10 +2021,16 @@
       const timing = node.querySelector(".ms");
       if (started && timing) timing.textContent = rowClock(Date.now() - started);
     }
+    // Rail ages are derived from stored data, so re-reading them here is the only thing that
+    // keeps the word current while nothing repaints the card.
+    for (const id of railRows.keys()) {
+      const entry = byId.get(id);
+      if (entry) paintRailState(entry);
+    }
   }
 
   function syncTicker() {
-    const wanted = metaRunning === true || railNow.querySelector(".act.running") !== null;
+    const wanted = metaRunning === true || railNow.querySelector(".act.running") !== null || railRows.size > 0;
     if (wanted && !ticker) {
       ticker = setInterval(tick, 1000);
     } else if (!wanted && ticker) {
