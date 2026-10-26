@@ -63,10 +63,17 @@
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     box-shadow: 0 8px 24px rgba(1, 4, 9, .5); min-width: 220px; min-height: 120px;
   }
-  .card.active { border-color: var(--accent-dim); box-shadow: 0 12px 32px rgba(31, 111, 235, .25); }
+  /* Selection is an outline, not a border colour: a card can then be active and still show its own
+     state in the border, so waiting stays pink and replying stays amber. The width and the offset
+     are divided by the zoom, like the focus ring, so both read the same at every fitted zoom. The
+     offset clears the 1px halo a state colour draws, since outlines paint above shadows. */
+  .card.active { outline: calc(2px / var(--zoom, 1)) solid var(--accent-dim);
+    outline-offset: calc(2px / var(--zoom, 1));
+    box-shadow: 0 12px 32px rgba(31, 111, 235, .25); }
   /* An answered question grows to hold its reply, up to a readable limit. */
   .card.auto-height { height: auto !important; min-height: 160px; max-height: 760px; }
-  .card.fresh { border-color: var(--accent); animation: freshPulse 1.8s ease-in-out 2; }
+  /* The badge and its pulse carry "new"; the border is left to the card's state. */
+  .card.fresh { animation: freshPulse 1.8s ease-in-out 2; }
   @keyframes freshPulse {
     0%, 100% { box-shadow: 0 8px 24px rgba(1, 4, 9, .5); }
     50% { box-shadow: 0 8px 32px rgba(88, 166, 255, .45); }
@@ -87,8 +94,11 @@
     cursor: grab; user-select: none;
   }
   .card.dragging .head { cursor: grabbing; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
-  .dot.note { background: var(--amber); }
+  /* One colour per kind, in the card head and the rail row alike. */
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.note { background: var(--muted); }
+  .dot.code { background: #d2a8ff; }
+  .dot.sticky { background: var(--amber); }
   .dot.question { background: var(--pink); box-shadow: 0 0 0 3px rgba(219,97,162,.18); }
   .title { font-weight: 600; font-size: 13px; letter-spacing: .2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
@@ -115,7 +125,10 @@
   .card.mini { height: auto !important; min-height: 0; }
   .card.mini .body, .card.mini .thread, .card.mini .resize { display: none; }
   .card.mini .head { border-bottom: none; }
-  .card.replying { border-color: #d29922; box-shadow: 0 0 0 1px rgba(210,153,34,.45), 0 12px 32px rgba(1,4,9,.5); }
+  /* The pulse would repaint the halo of a card that holds the composer, so the amber ring is left
+     to say it is the reply target. */
+  .card.replying { border-color: #d29922; box-shadow: 0 0 0 1px rgba(210,153,34,.45), 0 12px 32px rgba(1,4,9,.5);
+    animation: none; }
 
   /* Follow-ups live under the card body, in the order they were asked. The whole column scrolls
      (.card-scroll), so the thread never grows a scrollbar of its own. */
@@ -205,7 +218,7 @@
   .code-scroll { position: absolute; inset: 0; overflow: auto; background: #0f141b; }
   .code-inner { position: relative; min-width: 100%; }
   .row { position: absolute; left: 0; display: flex; font: 13px/var(--lh) var(--mono); white-space: pre; }
-  .row .n { flex: none; width: 56px; text-align: right; padding-right: 12px; color: #484f58; user-select: none; }
+  .row .n { flex: none; width: 56px; text-align: right; padding-right: 12px; color: var(--muted); user-select: none; }
   .row .t { color: #c9d1d9; padding-right: 24px; }
   .row.hit { background: rgba(88,166,255,.13); box-shadow: inset 2px 0 0 var(--accent); }
   .row.hit .n { color: var(--accent); }
@@ -317,7 +330,7 @@
   .act.error { border-color: rgba(248,81,73,.45); }
   .act .name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .act .ms { margin-left: auto; color: var(--muted); font-size: 11px; flex: none; }
-  .act .target, .act .note { color: #6e7681; font-size: 11px; overflow: hidden;
+  .act .target, .act .note { color: var(--muted); font-size: 11px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .act.reply { background: #10161e; border-color: #232a33; }
   .act.reply .note { color: #c9d1d9; white-space: pre-wrap; display: -webkit-box;
@@ -432,7 +445,6 @@
   .sticky-text { color: #f0e6d2; background: #2a2415; border-left: 3px solid #d29922;
     padding: 8px 10px; border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere;
     font-size: 13px; }
-  .card.sticky .dot { background: var(--amber); }
   .sticky-status { font: 11px var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
   .sticky-status.sent { color: var(--accent); }
   .sticky-status.answered { color: var(--green); }
@@ -443,6 +455,12 @@
   header button:hover { color: var(--text); border-color: var(--border-bright); }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
     font-size: 14px; pointer-events: none; text-align: center; padding: 20px; }
+  /* Each of the board's three animations repeats a state the text already spells out, so the board
+     loses nothing when the reader asks for less motion. Last, because it kills rules from the card
+     states, the header and the rail alike. */
+  @media (prefers-reduced-motion: reduce) {
+    .card.fresh, .card.flash, header .live.working b, .act.running .dot { animation: none; }
+  }
 </style>
 </head>
 <body>

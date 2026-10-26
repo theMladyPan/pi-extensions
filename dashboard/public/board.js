@@ -124,7 +124,8 @@
     return node;
   };
   /** The card dot's colour, in one place so the card and its rail row cannot drift apart. */
-  const dotKind = (kind) => (kind === "source" ? "code" : kind === "question" ? "question" : "note");
+  const dotKind = (kind) =>
+    kind === "source" ? "code" : kind === "question" ? "question" : kind === "sticky" ? "sticky" : "note";
   /**
    * The world is zoomed with the CSS `zoom` property, so text is laid out at the size it is
    * shown at and never softens the way a scaled bitmap does. `zoom` scales the element's own
@@ -517,7 +518,7 @@
         : turn.status === "stopped"
           ? "stopped"
           : turn.status === "sent"
-            ? "running"
+            ? "sent"
             : `queued · ${turn.mode === "steer" ? "steer" : "queue"}`;
     wrap.appendChild(status);
     if (turn.images) {
@@ -573,7 +574,7 @@
         : data.status === "stopped"
           ? "stopped"
           : data.status === "sent"
-            ? "delivered"
+            ? "sent"
             : `queued · ${data.mode === "steer" ? "steer" : "queue"}`;
     holder.appendChild(status);
     if (data.reply) {
@@ -1684,7 +1685,26 @@
   const replyChip = document.getElementById("replyChip");
   const replyChipText = document.getElementById("replyChipText");
   let sendMode = "queue";
-  composerHint.textContent = "waits for this run to finish";
+
+  /**
+   * The mode buttons choose between steering the run and queueing behind it, so they say nothing
+   * while the agent is idle. Hidden then, and the hint says the message leaves now instead of
+   * claiming it waits for a run that is not happening. A stream that is down leaves the composer
+   * readable on purpose, so it is the hint that has to stop promising a send.
+   */
+  function paintComposer() {
+    const running = metaRunning === true;
+    for (const button of document.querySelectorAll("#composer .modes button[data-mode]")) {
+      button.hidden = !running;
+    }
+    composerHint.textContent = !linkUp
+      ? "offline"
+      : !running
+        ? "sends now"
+        : sendMode === "steer"
+          ? "interrupts the run"
+          : "waits for this run to finish";
+  }
 
   /**
    * A reply is aimed at one card, so the composer shows which until it is sent or cleared.
@@ -1707,7 +1727,7 @@
     } else {
       msgBox.placeholder = "message the agent…  (enter sends, shift+enter for a new line, paste an image or pick files)";
     }
-    composerHint.textContent = sendMode === "steer" ? "interrupts the run" : "waits for this run to finish";
+    paintComposer();
   }
 
   document.getElementById("replyChipClear").addEventListener("click", () => setReplyTarget(null));
@@ -1718,7 +1738,7 @@
       for (const other of document.querySelectorAll("#composer .modes button[data-mode]")) {
         other.classList.toggle("on", other === button);
       }
-      composerHint.textContent = sendMode === "steer" ? "interrupts the run" : "waits for this run to finish";
+      paintComposer();
     });
   }
 
@@ -2102,7 +2122,8 @@
       drawChips();
       closePicker();
       if (replyTarget === sentTarget) setReplyTarget(null);
-      composerHint.textContent = sendMode === "steer" ? "steered" : "queued";
+      // With no run in flight the message is being sent, not queued behind one.
+      composerHint.textContent = metaRunning !== true ? "sent" : sendMode === "steer" ? "steered" : "queued";
     } catch (error) {
       const gone = error instanceof TypeError; // fetch rejects like this when nothing answers
       composerHint.textContent = gone
@@ -2216,7 +2237,12 @@
 
   function applyMeta(meta) {
     if (!meta) return;
+    const wasRunning = metaRunning === true;
     metaRunning = meta.running === true;
+    // Steering means nothing with no run in flight, so the composer follows the same state. Meta
+    // also arrives at every assistant message, so only a run boundary repaints: a repaint would
+    // wipe the "sent" or "failed: …" line the composer is showing while the stream is alive.
+    if (metaRunning !== wasRunning) paintComposer();
     // A board served by an older pi has no runStartedAt, so the header says waiting instead
     // of inventing an elapsed time from the moment this tab happened to hear about the run.
     runStartedAt = typeof meta.runStartedAt === "number" ? meta.runStartedAt : null;
@@ -2301,6 +2327,9 @@
   let metaRunning = null;
   let runStartedAt = null;
   let ticker = null;
+  // The first paint waits until here: the composer section runs before the run and link state
+  // above exist, and its hardcoded hint contradicted what paintComposer says.
+  paintComposer();
 
   // The header line is one decision: a broken link wins, because without the stream the agent's
   // state is unknown and an elapsed time would be a guess.
@@ -2377,6 +2406,7 @@
   }
 
   function setLive(up, note = "") {
+    const flipped = linkUp !== up;
     linkUp = up;
     if (!up) linkNote = note;
     // The last painted board stays on screen, so the content has to say it is stale too. A wake or
@@ -2392,6 +2422,8 @@
         document.body.classList.add("link-down");
       }, 1000);
     }
+    // A retry that changes nothing leaves the hint alone, so a transient line survives it.
+    if (flipped) paintComposer();
     renderLive();
   }
 
@@ -2449,8 +2481,15 @@
       } else if (payload.type === "activity") {
         applyActivity(payload.row);
       } else if (payload.type === "card" || payload.type === "update") {
+        const known = byId.has(payload.card.id);
+        // An open question is re-broadcast on every update, so its blink has to key on the
+        // transition into blocking the agent, not on the state the tab already shows.
+        const wasOpen = known && questionWants(byId.get(payload.card.id).data);
         applyMessage(payload.card, payload.quiet === true);
-        startFlash();
+        // A quiet repaint and a card the tab already holds are not news; only an arrival or a
+        // question that has just started blocking the agent is worth a blink in a background tab.
+        const record = byId.get(payload.card.id);
+        if ((!known && payload.quiet !== true) || (record && !wasOpen && questionWants(record.data))) startFlash();
       } else if (payload.type === "clear") {
         clearBoard();
       }
