@@ -283,15 +283,21 @@
     border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
   header .stat:empty { display: none; }
   header .stat em { color: var(--text); font-style: normal; }
-  /* The chip is a button, so it has to look clickable without shouting in a header that is
-     already eleven controls wide. */
-  #statCtx { cursor: pointer; }
+  /* The chip is also the compact button. Both labels sit in one grid cell, so they swap in place
+     and the header never shifts under the pointer as the word appears. */
+  #statCtx { cursor: pointer; display: inline-grid; align-items: center; justify-items: center; }
+  /* `display` on the id beats the user agent's [hidden] rule, so hiding is spelled out. */
+  #statCtx[hidden] { display: none; }
+  #statCtx > * { grid-area: 1 / 1; white-space: nowrap; }
+  #statCtx #statCtxValue { color: var(--text); }
+  #statCtx .act { visibility: hidden; color: var(--accent); }
   #statCtx:hover, #statCtx:focus-visible { color: var(--text); border-color: var(--border-bright); }
-  #statCtx .act { display: none; color: var(--accent); }
-  #statCtx:hover .act, #statCtx:focus-visible .act { display: inline; }
-  /* Nothing to compact while a run is in flight: compaction aborts it first. */
-  #statCtx.busy { cursor: default; }
-  #statCtx.busy:hover .act, #statCtx.busy:focus-visible .act { display: none; }
+  #statCtx:hover #statCtxValue, #statCtx:focus-visible #statCtxValue { visibility: hidden; }
+  #statCtx:hover .act, #statCtx:focus-visible .act { visibility: visible; }
+  /* Nothing to compact while a run is in flight: compaction aborts it first, so the action is
+     not offered, but a click still answers why rather than doing nothing. */
+  #statCtx.busy:hover #statCtxValue, #statCtx.busy:focus-visible #statCtxValue { visibility: visible; }
+  #statCtx.busy:hover .act, #statCtx.busy:focus-visible .act { visibility: hidden; }
 
   /* activity rail */
   #rail {
@@ -495,7 +501,7 @@
   <span class="stat" id="statCost"></span>
   <!-- The context chip is also the compact button: the action sits on the number it changes,
        and the word appears on hover or focus so the row keeps its width at rest. -->
-  <button class="stat" id="statCtx" title="compact the context, the same as /compact" hidden><em id="statCtxValue"></em><span class="act"> · compact</span></button>
+  <button class="stat" id="statCtx" title="compact the context, the same as /compact" hidden><span id="statCtxValue"></span><span class="act" aria-hidden="true">compact</span></button>
   <button id="newPill" style="display:none">0 new</button>
   <button id="stop" style="display:none" title="stop this run (same as escape)">stop</button>
   <button id="tidy">tidy</button>
