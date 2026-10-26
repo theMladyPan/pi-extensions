@@ -850,8 +850,17 @@
       // Watched only while it can still stop being new.
       seenObserver.observe(card);
     }
-    // A card the human clicks is seen at once, without waiting for the observer's countdown.
-    card.addEventListener("pointerdown", () => clearFresh(card), true);
+    // A card the human clicks is seen at once, without waiting for the observer's countdown. A
+    // middle press is the workspace grab and belongs to the canvas, so it reads as neither a click
+    // nor a raise: it must not mark a card read, lift it, or take the selection away.
+    card.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (event.button === 1) return;
+        clearFresh(card);
+      },
+      true,
+    );
 
     const entry = {
       id: data.id,
@@ -874,10 +883,15 @@
     if (data.mini) setMini(card, true);
     paintCard(entry, data);
 
-    card.addEventListener("pointerdown", () => {
-      card.style.zIndex = z++;
-      cards.forEach((c) => c.classList.toggle("active", c === card));
-    }, true);
+    card.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (event.button === 1) return;
+        card.style.zIndex = z++;
+        cards.forEach((c) => c.classList.toggle("active", c === card));
+      },
+      true,
+    );
 
     // The keyboard and the mouse agree on which card is current: focus landing inside a card marks
     // it, so the outline, `r` and the digit keys follow the keyboard rather than the last click.
@@ -910,8 +924,9 @@
     });
 
     head.addEventListener("pointerdown", (event) => {
-      // Buttons in the header are for clicking, not for dragging the card.
-      if (event.target.closest(".close, .edit, .reply, .min, .ask-pill")) return;
+      // Buttons in the header are for clicking, not for dragging the card. The middle button pans
+      // the canvas even here, so it belongs to the workspace rather than to the card.
+      if (event.button !== 0 || event.target.closest(".close, .edit, .reply, .min, .ask-pill")) return;
       event.preventDefault();
       card.classList.add("dragging");
       const sx = event.clientX;
@@ -940,6 +955,7 @@
     });
 
     grip.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
       event.stopPropagation();
       event.preventDefault();
       const sx = event.clientX;
@@ -1564,26 +1580,67 @@
     applyView();
   }, { passive: false });
 
-  viewport.addEventListener("pointerdown", (event) => {
-    if (event.target.closest(".card")) return;
+  /** True once the middle drag that just ended actually moved, read by the `auxclick` below. */
+  let middleDragMoved = () => false;
+
+  /**
+   * Panning is one gesture wherever it starts: the canvas moves under the pointer and the release
+   * ends it, wherever the pointer happens to be by then. Both the background drag and the middle
+   * button come through here, so they cannot drift apart.
+   */
+  function beginPan(event) {
     viewport.classList.add("dragging");
-    cards.forEach((c) => c.classList.remove("active"));
-    const sx = event.clientX;
-    const sy = event.clientY;
-    const ox = view.x;
-    const oy = view.y;
+    let lastX = event.clientX;
+    let lastY = event.clientY;
+    let moved = false;
+    // Movement is applied as it happens rather than from the press, so a zoom or a fit in the
+    // middle of a drag is not undone by the next inch of the pointer.
     const move = (ev) => {
-      view.x = ox + (ev.clientX - sx);
-      view.y = oy + (ev.clientY - sy);
+      // A release the page never heard about would otherwise leave the board sliding on hover.
+      if (!ev.buttons) return up();
+      if (Math.abs(ev.clientX - lastX) + Math.abs(ev.clientY - lastY) > 2) moved = true;
+      view.x += ev.clientX - lastX;
+      view.y += ev.clientY - lastY;
+      lastX = ev.clientX;
+      lastY = ev.clientY;
       applyView();
     };
     const up = () => {
       viewport.classList.remove("dragging");
       removeEventListener("pointermove", move);
       removeEventListener("pointerup", up);
+      removeEventListener("pointercancel", up);
     };
+    // A middle click that never travelled is a click, and a middle click on a link opens it. Only
+    // the drag is swallowed.
+    if (event.button === 1) middleDragMoved = () => moved;
     addEventListener("pointermove", move);
     addEventListener("pointerup", up);
+    addEventListener("pointercancel", up);
+  }
+
+  // The left button pans the background. Over a card it belongs to the card, which drags, resizes
+  // and selects with it, so this gesture never starts there.
+  viewport.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest(".card")) return;
+    cards.forEach((c) => c.classList.remove("active"));
+    beginPan(event);
+  });
+
+  // The middle button is the workspace grab, so it works over anything the canvas holds: a card, the
+  // rail, the composer. The one exception is the detail panel, which is a dialog rather than part
+  // of the surface and reads better when a stray middle drag does not slide the board behind it.
+  document.addEventListener("pointerdown", (event) => {
+    if (event.button !== 1 || !(event.target instanceof Element)) return;
+    if (event.target.closest("#actDetail")) return;
+    // Chromium opens its autoscroll compass on a middle press and would keep the pointer for it.
+    event.preventDefault();
+    beginPan(event);
+  });
+  document.addEventListener("auxclick", (event) => {
+    if (event.button !== 1 || !middleDragMoved()) return;
+    event.preventDefault();
+    middleDragMoved = () => false;
   });
 
   function fitAll() {
@@ -1724,6 +1781,7 @@
     const grip = document.getElementById("railGrip");
     let dragging = false;
     grip.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
       dragging = true;
       grip.setPointerCapture(event.pointerId);
       document.body.classList.add("rail-resizing");
