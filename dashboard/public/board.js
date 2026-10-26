@@ -823,13 +823,7 @@
 
     head.querySelector(".close").addEventListener("click", (event) => {
       event.stopPropagation();
-      dropCard(entry);
-      // Closing has to reach the server, otherwise a refresh brings the card back.
-      void fetch(`/close?token=${encodeURIComponent(token)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cardId: entry.id }),
-      }).catch(() => {});
+      closeCard(entry);
     });
 
     head.addEventListener("pointerdown", (event) => {
@@ -1101,6 +1095,16 @@
     paintPill();
     sawFirstCard = false;
     updateEmpty();
+  }
+
+  /** Close a card here and on the server, so a refresh does not bring it back. */
+  function closeCard(entry) {
+    dropCard(entry);
+    void fetch(`/close?token=${encodeURIComponent(token)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cardId: entry.id }),
+    }).catch(() => {});
   }
 
   /** Remove a card from the board and let later cards fill the space it held. */
@@ -2213,14 +2217,25 @@
     }
   }
 
-  // `r` opens a thread on the card you last clicked, whichever kind it is. The composer keeps
-  // its own keys, so a message being typed is never cut short.
+  // `r` opens a thread on the card you last clicked and `q` closes it. The composer keeps its
+  // own keys, so a message being typed is never cut short.
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "r" || event.metaKey || event.ctrlKey || event.altKey) return;
+    const key = event.key.toLowerCase();
+    if ((key !== "r" && key !== "q") || event.metaKey || event.ctrlKey || event.altKey) return;
     if (typingSomewhere()) return;
+    // The picker is its own surface: a board shortcut behind it would act on what is out of reach.
+    if (!picker.hidden) return;
     const active = document.querySelector(".card.active");
     const record = active ? byId.get(active.dataset.id) : null;
     if (!record) return;
+    if (key === "q") {
+      // The × is hidden on an open question, so the key does not go where the button cannot:
+      // closing one would leave the agent waiting with nothing left to answer.
+      if (questionWants(record.data)) return;
+      event.preventDefault();
+      closeCard(record);
+      return;
+    }
     event.preventDefault();
     setReplyTarget(record);
   });
