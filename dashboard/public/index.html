@@ -374,11 +374,6 @@
     display: flex; gap: 10px; padding: 10px 14px; background: rgba(10,15,22,.96);
     border-top: 1px solid var(--border); backdrop-filter: blur(8px);
   }
-  /* A board of threads has no single session to message, so its field lives inside a card and the
-     bottom bar is gone. The same client serves a one-session board, which keeps both. */
-  body.threads #viewport { inset: 44px 0 0 var(--rail); }
-  body.threads #composer:not(.docked) { display: none; }
-  body.threads #newThread { display: grid; }
   #composer .type { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
   /* Docked: the same field, living at the bottom of the card it is replying to. */
   #composer.docked {
@@ -442,20 +437,6 @@
   #replyChip button:hover { background: rgba(210,153,34,.25); }
 
   /* Folder picker: anchored above the composer, sized so a folder fits in one glance. */
-  /* One button starts a thread. It sits where the eye goes for "make another one" and stays out
-     of the canvas, so it can never be buried under a card. */
-  #newThread {
-    position: fixed; right: 18px; bottom: 18px; z-index: 12;
-    width: 46px; height: 46px; border-radius: 50%;
-    display: none; place-items: center; padding: 0;
-    font-size: 24px; line-height: 1; font-weight: 400;
-    color: #0d1117; background: var(--accent); border: none;
-    box-shadow: 0 6px 18px rgba(0,0,0,.45);
-  }
-  #newThread:hover { filter: brightness(1.08); }
-  #newThread:disabled { opacity: .55; cursor: progress; }
-  #newThread:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
-
   #picker { position: fixed; z-index: 2000; display: flex; flex-direction: column; gap: 6px;
     padding: 8px; background: rgba(13,17,23,.98); border: 1px solid var(--border-bright);
     border-radius: 10px; box-shadow: 0 18px 40px rgba(0,0,0,.55); }
@@ -593,11 +574,9 @@
   </div>
 </div>
 
-<button id="newThread" type="button" aria-label="start a new thread" title="start a new thread">+</button>
-
 <div id="viewport">
   <div id="world"></div>
-  <div class="empty" id="empty">press + to start a thread</div>
+  <div class="empty" id="empty">waiting for the agent to put something on the board…</div>
 </div>
 
 <div id="picker" role="dialog" aria-label="attach files or folders" hidden>

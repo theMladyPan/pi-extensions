@@ -2633,10 +2633,7 @@
       for (const path of sentPaths) picked.delete(path);
       drawChips();
       closePicker();
-      // A thread is a conversation: the field stays in the card it just answered, so the next
-      // message does not need the card clicked again. Escape puts it away.
-      if (replyTarget === sentTarget && sentTarget && byId.has(sentTarget.id)) setReplyTarget(sentTarget);
-      else setReplyTarget(null);
+      if (replyTarget === sentTarget) setReplyTarget(null);
       // With no run in flight the message is being sent, not queued behind one.
       composerHint.textContent = metaRunning !== true ? "sent" : sendMode === "steer" ? "steered" : "queued";
     } catch (error) {
@@ -2650,47 +2647,6 @@
   }
 
   sendBtn.addEventListener("click", () => void sendMessage());
-
-  // ---------- threads -------------------------------------------------------
-  // A thread is a card with an agent behind it. The server creates it, and it arrives on the
-  // stream like any other card, so this waits for it rather than assuming it is already here.
-  const newThreadBtn = document.getElementById("newThread");
-
-  function focusThread(id) {
-    let tries = 0;
-    const wait = () => {
-      const entry = byId.get(id);
-      if (!entry) {
-        // A card that never arrives is a dead board, not a slow one, so it stops asking.
-        if (tries++ < 60) setTimeout(wait, 50);
-        else console.error("pi-bench: the new thread never arrived");
-        return;
-      }
-      centerOn(entry);
-      setReplyTarget(entry);
-      msgBox.focus();
-    };
-    wait();
-  }
-
-  newThreadBtn.addEventListener("click", async () => {
-    newThreadBtn.disabled = true;
-    try {
-      const response = await fetch(`/thread?token=${encodeURIComponent(token)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-      if (!response.ok) throw new Error((await response.text()).slice(0, 80) || response.statusText);
-      const created = await response.json();
-      if (created.threadId) focusThread(created.threadId);
-    } catch (error) {
-      console.error(`pi-bench: could not start a thread: ${error.message || error}`);
-      hintLine(`could not start a thread: ${error.message || error}`, true);
-    } finally {
-      newThreadBtn.disabled = false;
-    }
-  });
 
   // Stop asks the server to abort the run, then waits for meta to confirm it settled.
   stopBtn.addEventListener("click", async () => {
@@ -2816,9 +2772,6 @@
 
   function applyMeta(meta) {
     if (!meta) return;
-    // A board of threads has no single session behind it, so the field lives in the card and the
-    // bottom bar is gone. Same client, two backends, one visual language.
-    document.body.classList.toggle("threads", meta.mode === "threads");
     const wasRunning = metaRunning === true;
     metaRunning = meta.running === true;
     // Steering means nothing with no run in flight, so the composer follows the same state. Meta
