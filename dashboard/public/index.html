@@ -28,6 +28,16 @@
   ::-webkit-scrollbar-thumb:hover { background: #3d444d; background-clip: content-box; }
   ::-webkit-scrollbar-corner { background: transparent; }
   body { font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  /* The keyboard is a first-class way round this board, so focus is always visible, and it sits
+     outside the element so a card border or a hover ring cannot hide it. */
+  button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  /* The board's zoom scales everything drawn inside it, ring included, so the ring on the board is
+     divided by the zoom the script publishes. Chrome outside the board keeps its plain 2px. */
+  #world button:focus-visible, #world a:focus-visible, #world [tabindex]:focus-visible {
+    outline-width: calc(2px / var(--zoom, 1)); outline-offset: calc(2px / var(--zoom, 1));
+  }
 
   /* `hidden` is a scroll container, so a focused card can shift the board behind the pan state;
      `clip` is not. Where `clip` is unsupported the script zeroes that scroll offset instead. */
@@ -212,8 +222,9 @@
     padding: 8px 10px; cursor: pointer;
   }
   .q-opt:hover:not(:disabled) { border-color: var(--accent-dim); background: #1f2631; }
-  /* The keyboard path starts here, so a focused option looks like a hovered one. */
-  .q-opt:focus { outline: none; border-color: var(--accent-dim); background: #1f2631; }
+  /* The keyboard path starts here, so a focused option looks like a hovered one rather than
+     carrying the global outline on top of it. */
+  .q-opt:focus-visible { outline: none; border-color: var(--accent-dim); background: #1f2631; }
   .q-opt:disabled { cursor: default; opacity: .55; }
   .q-opt.picked { border-color: var(--accent); background: rgba(88,166,255,.12); opacity: 1; }
   .q-free { display: flex; gap: 6px; }
@@ -396,9 +407,12 @@
     color: var(--muted); white-space: nowrap; cursor: pointer; }
   #pickList { max-height: 230px; overflow: auto; border: 1px solid var(--border);
     border-radius: 6px; background: #0d1117; }
-  #pickList .p-item { display: flex; align-items: center; gap: 7px; padding: 3px 6px;
-    font: 12px var(--mono); color: var(--text); cursor: pointer; }
-  #pickList .p-item:hover { background: #161b22; }
+  /* Each row is a real button so the list can be walked with the keyboard; the button look is
+     stripped so a row still reads as a row. */
+  #pickList .p-item { display: flex; align-items: center; gap: 7px; padding: 3px 6px; width: 100%;
+    font: 12px var(--mono); color: var(--text); background: none; border: 0; text-align: left;
+    cursor: pointer; }
+  #pickList .p-item:hover, #pickList .p-item.hl { background: #161b22; }
   #pickList .p-item.on .p-name { color: var(--green); }
   #pickList .p-item .p-tick { color: var(--muted); font-size: 10px; width: 9px; }
   #pickList .p-item.on .p-tick { color: var(--green); }
@@ -433,9 +447,11 @@
 </head>
 <body>
 <header>
-  <span class="brand" title="ctrl+wheel: zoom · drag background: pan · drag header: move · corner: resize">pi</span>
+  <span class="brand" title="ctrl+wheel: zoom · wheel or drag background: pan · drag header: move · corner: resize · f: fit · 0: 100% · n: next · r: reply">pi</span>
   <span class="sess" id="sess"></span>
-  <span class="live" id="live"><b></b> <span id="liveText">connecting</span></span>
+  <!-- Polite, so the state is spoken when it changes; the elapsed clock is decoration that ticks
+       every second and is hidden, so it is never read out. -->
+  <span class="live" id="live" role="status" aria-live="polite"><b aria-hidden="true"></b> <span id="liveText">connecting</span><span id="liveClock" aria-hidden="true"></span></span>
   <span class="grow"></span>
   <span class="stat" id="statModel"></span>
   <span class="stat" id="statTokens"></span>
@@ -471,7 +487,7 @@
       <button data-mode="steer">steer</button>
       <button id="pickFiles" title="attach files or folders from disk">files</button>
     </div>
-    <span class="hintline" id="composerHint"></span>
+    <span class="hintline" id="composerHint" role="status" aria-live="polite"></span>
     <button id="send">send</button>
   </div>
 </div>
@@ -481,7 +497,7 @@
   <div class="empty" id="empty">waiting for the agent to put something on the board…</div>
 </div>
 
-<div id="picker" hidden>
+<div id="picker" role="dialog" aria-label="attach files or folders" hidden>
   <div class="p-row">
     <button id="pickUp" title="parent folder">↑</button>
     <input id="pickPath" type="text" spellcheck="false" title="type a folder and press enter" />

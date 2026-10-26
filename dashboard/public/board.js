@@ -14,6 +14,8 @@
   const emptyHint = document.getElementById("empty");
   const live = document.getElementById("live");
   const liveText = document.getElementById("liveText");
+  const liveClock = document.getElementById("liveClock");
+  const resetBtn = document.getElementById("reset");
   const token = new URLSearchParams(location.search).get("token") || "";
 
   // Kept in step with the code font size in index.html: 13px text, 20px rows.
@@ -139,6 +141,11 @@
       world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`;
     }
     if (typeof recomputePill === "function") recomputePill();
+    // The button says the zoom it is showing, not a fixed promise of 100%.
+    resetBtn.textContent = `${Math.round(view.k * 100)}%`;
+    // The board's zoom scales the focus ring drawn inside it too, so the rule in index.html
+    // divides the ring by this to keep it the same thickness at every zoom.
+    document.documentElement.style.setProperty("--zoom", String(view.k));
   };
 
   // ---------- syntax highlighting -----------------------------------------
@@ -693,10 +700,10 @@
       <span class="spacer"></span>
       <button type="button" class="ask-pill" aria-label="centre this question">answer needed</button>
       <span class="chip"></span>
-      <button class="min" title="minimize this card">▾</button>
-      <button class="reply" title="ask a follow-up about this card">↩</button>
-      <button class="edit" title="edit this note">✎</button>
-      <button class="close" title="close">×</button>`;
+      <button class="min" title="minimize this card" aria-label="minimize this card">▾</button>
+      <button class="reply" title="ask a follow-up about this card" aria-label="ask a follow-up about this card">↩</button>
+      <button class="edit" title="edit this note" aria-label="edit this note">✎</button>
+      <button class="close" title="close" aria-label="close">×</button>`;
     // One scroll column holds the note and its follow-ups, so a long card has one scrollbar.
     const scroll = el("div", "card-scroll");
     const body = el("div", "body");
@@ -746,6 +753,13 @@
       card.style.zIndex = z++;
       cards.forEach((c) => c.classList.toggle("active", c === card));
     }, true);
+
+    // The keyboard and the mouse agree on which card is current: focus landing inside a card marks
+    // it, so the outline, `r` and the digit keys follow the keyboard rather than the last click.
+    card.addEventListener("focusin", (event) => {
+      cards.forEach((c) => c.classList.toggle("active", c === card));
+      reveal(event.target);
+    });
 
     head.querySelector(".min").addEventListener("click", (event) => {
       event.stopPropagation();
@@ -1142,15 +1156,35 @@
     return x < viewport.clientWidth && x + card.offsetWidth * view.k > 0 && y < viewport.clientHeight && y + card.offsetHeight * view.k > 0;
   }
 
+  /**
+   * Bring the focused control into view, moving the view as little as it can. A control already
+   * fully on screen is left alone, so tabbing through a card never drags the canvas out from under
+   * the reader, and a card taller than the screen shows the field the focus is on, not its top.
+   */
+  function reveal(node) {
+    // A control touched to the header or the composer edge reads as cramped, so it keeps a margin.
+    const margin = 12;
+    const box = node.getBoundingClientRect();
+    const area = viewport.getBoundingClientRect();
+    const right = box.right - area.right;
+    const bottom = box.bottom - area.bottom;
+    if (box.left >= area.left + margin && box.top >= area.top + margin && right <= -margin && bottom <= -margin) return;
+    if (box.left < area.left + margin) view.x += area.left + margin - box.left;
+    else if (right > -margin) view.x -= right + margin;
+    if (box.top < area.top + margin) view.y += area.top + margin - box.top;
+    else if (bottom > -margin) view.y -= bottom + margin;
+    applyView();
+  }
+
   function updateEmpty() {
     if (emptyHint) emptyHint.style.display = cards.length ? "none" : "grid";
   }
 
   // ---------- view ---------------------------------------------------------
   /**
-   * Ctrl (or Cmd) plus wheel zooms around the pointer. A plain wheel is left alone so the
-   * browser scrolls whatever sits under the cursor: a card's body, a code view, the rail.
-   * Panning the board is drag-only, because a stray scroll should never move the layout.
+   * Ctrl (or Cmd) plus wheel zooms around the pointer. A plain wheel over the empty canvas pans
+   * the view: panning moves nothing on the board, so a stray scroll still cannot rearrange it,
+   * while a wheel over a card keeps scrolling that card.
    */
   /** Tell the server where a card sits, so placement survives a refresh. */
   function saveLayout(cardId, rect, mini) {
@@ -1175,6 +1209,8 @@
     if (button) {
       button.textContent = mini ? "▸" : "▾";
       button.title = mini ? "restore this card" : "minimize this card";
+      // The glyph says nothing out loud, so the spoken name follows the tooltip.
+      button.setAttribute("aria-label", button.title);
     }
   }
 
@@ -1326,10 +1362,23 @@
     jumpToKey(link.dataset.key);
   });
 
+  /** A wheel reports pixels, lines or pages, so one factor turns any of them into pixels. */
+  const wheelPixels = (event, delta) =>
+    delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1);
+
   viewport.addEventListener("wheel", (event) => {
-    if (!event.ctrlKey && !event.metaKey) return;
+    if (!event.ctrlKey && !event.metaKey) {
+      // Only the empty canvas pans. The rail, composer and picker sit outside the viewport, and a
+      // wheel over a card scrolls that card.
+      if (event.target.closest(".card")) return;
+      event.preventDefault();
+      view.x -= wheelPixels(event, event.deltaX);
+      view.y -= wheelPixels(event, event.deltaY);
+      applyView();
+      return;
+    }
     event.preventDefault();
-    const k = Math.min(3, Math.max(0.25, view.k * Math.exp(-event.deltaY * 0.0015)));
+    const k = Math.min(3, Math.max(0.25, view.k * Math.exp(-wheelPixels(event, event.deltaY) * 0.0015)));
     const rect = viewport.getBoundingClientRect();
     const px = event.clientX - rect.left;
     const py = event.clientY - rect.top;
@@ -1384,15 +1433,43 @@
     applyView();
   }
 
+  /**
+   * `100%` is real size without losing your place, so the zoom pivots on a card that is really on
+   * the board: the active one, or else the one nearest the middle of the screen. Its position on
+   * screen stays put, which is what keeps 100% from landing on empty canvas. An empty board only
+   * changes the zoom, because there is nothing to hold still.
+   */
+  function resetZoom() {
+    if (!cards.length) {
+      view.k = 1;
+      applyView();
+      return;
+    }
+    // A board that is entirely off screen is framed first: 100% of empty canvas is still empty.
+    if (!cards.some(isVisible)) fitAll();
+    const mid = viewportCenter();
+    const away = (card) => {
+      const x = parseFloat(card.style.left) + card.offsetWidth / 2 - mid.x;
+      const y = parseFloat(card.style.top) + card.offsetHeight / 2 - mid.y;
+      return x * x + y * y;
+    };
+    const pivot =
+      document.querySelector(".card.active") || cards.reduce((best, card) => (away(best) <= away(card) ? best : card));
+    const px = parseFloat(pivot.style.left) + pivot.offsetWidth / 2;
+    const py = parseFloat(pivot.style.top) + pivot.offsetHeight / 2;
+    // Where the pivot sits on screen right now, which is where 100% has to leave it.
+    const sx = px * view.k + view.x;
+    const sy = py * view.k + view.y;
+    view.k = 1;
+    view.x = sx - px;
+    view.y = sy - py;
+    applyView();
+  }
+
   document.getElementById("fit").addEventListener("click", fitAll);
   document.getElementById("tidy").addEventListener("click", tidy);
   document.getElementById("newPill").addEventListener("click", jumpToFresh);
-  document.getElementById("reset").addEventListener("click", () => {
-    view.k = 1;
-    view.x = 0;
-    view.y = 0;
-    applyView();
-  });
+  resetBtn.addEventListener("click", resetZoom);
 
   // ---------- activity rail ------------------------------------------------
   const stopBtn = document.getElementById("stop");
@@ -1729,6 +1806,12 @@
   let pickerAt = "";
   let listed = [];
   let listedTotal = 0;
+  /**
+   * The row the arrow keys are on, which the filter keeps the focus away from so typing works.
+   * `-1` is no row: a fresh list starts unhighlighted, so Enter never attaches what the list
+   * happened to open on.
+   */
+  let pickAt = -1;
   /** Every listing bumps this, so a slow reply cannot land on top of a newer one. */
   let browseSeq = 0;
   let filterTimer = 0;
@@ -1771,37 +1854,49 @@
     }
     for (const entry of listed) {
       const isPicked = picked.has(entry.path);
-      const row = el("div", `p-item${entry.dir ? " dir" : ""}${isPicked ? " on" : ""}`);
+      // A real button, so the list can be walked with the keyboard: Enter or Space is a pick.
+      const row = el("button", `p-item${entry.dir ? " dir" : ""}${isPicked ? " on" : ""}`);
+      row.type = "button";
       row.title = entry.path;
       const tick = el("span", "p-tick");
       tick.textContent = isPicked ? "●" : "○";
+      // The row's name is the file, so the glyph says nothing out loud and `aria-pressed` says it.
+      tick.setAttribute("aria-hidden", "true");
+      row.setAttribute("aria-pressed", String(isPicked));
       const name = el("span", "p-name");
       name.textContent = entry.name;
       row.append(tick, name);
       // A click picks; the chevron opens, because walking a tree and choosing in it are two acts.
-      row.addEventListener("click", () => {
+      // A button cannot hold another button, so the chevron is decoration the row listens for.
+      row.addEventListener("click", (event) => {
+        if (event.target.classList.contains("p-open")) return void browse(entry.path);
         if (isPicked) picked.delete(entry.path);
         else picked.set(entry.path, { dir: entry.dir });
         drawList();
         drawChips();
       });
       if (entry.dir) {
-        const open = el("button", "p-open");
+        const open = el("span", "p-open");
         open.textContent = "›";
         open.title = "open this folder";
-        open.addEventListener("click", (event) => {
-          event.stopPropagation();
-          void browse(entry.path);
-        });
+        // ArrowRight opens from the keyboard, so the glyph is not a second control to stop at.
+        open.setAttribute("aria-hidden", "true");
         row.appendChild(open);
       }
       pickList.appendChild(row);
     }
+    markHighlight();
     if (listedTotal > listed.length) {
       const note = el("div", "p-empty");
       note.textContent = `${listedTotal - listed.length} more — type in the filter to narrow it`;
       pickList.appendChild(note);
     }
+  }
+
+  /** Paint the row the arrows are on; the filter keeps the focus so typing keeps filtering. */
+  function markHighlight() {
+    const rows = [...pickList.querySelectorAll(".p-item")];
+    rows.forEach((row, at) => row.classList.toggle("hl", at === pickAt));
   }
 
   /** The list hangs off the composer's top edge, which is where the field is however the page moves. */
@@ -1836,6 +1931,8 @@
       pickUp.dataset.parent = data.parent;
       listed = data.entries;
       listedTotal = data.total ?? data.entries.length;
+      // A new folder starts the walk nowhere, so no row is armed until an arrow key moves.
+      pickAt = -1;
       drawList();
       drawChips();
       picker.hidden = false;
@@ -1857,10 +1954,16 @@
   }
 
   const closePicker = () => {
+    // A keyboard user inside the list gets the keyboard back on the control that opened it; a
+    // click elsewhere has already chosen its own target.
+    const inside = !picker.hidden && picker.contains(document.activeElement);
     picker.hidden = true;
     // Whatever is still in flight belongs to a picker that is gone.
     browseSeq += 1;
     clearTimeout(filterTimer);
+    // Picking files is rarely the end of the message, so a draft in hand takes the keyboard back.
+    if (inside && msgBox.value.trim()) msgBox.focus();
+    else if (inside) document.getElementById("pickFiles").focus();
   };
 
   document.getElementById("pickFiles").addEventListener("click", () => {
@@ -1888,20 +1991,45 @@
       if (!picker.hidden) void browse(pickerAt, { focus: false });
     }, 160);
   });
-  pickFilter.addEventListener("keydown", (event) => {
+  // The whole overlay answers the keyboard, so Escape leaves from a row or the hidden box, not
+  // only from the two fields, and the arrows walk the list while the filter keeps the focus.
+  picker.addEventListener("keydown", (event) => {
+    // The path field already took this keystroke (it browses what was typed).
+    if (event.defaultPrevented) return;
     if (event.key === "Escape") {
       event.preventDefault();
       closePicker();
-      msgBox.focus();
+      return;
+    }
+    const rows = [...pickList.querySelectorAll(".p-item")];
+    const onRow = event.target.closest(".p-item");
+    // Walking continues from the row the focus is on, which Tab can reach without the arrows.
+    const from = onRow ? rows.indexOf(onRow) : pickAt;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      if (!listed.length) return;
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      pickAt = (from + step + listed.length) % listed.length;
+      markHighlight();
+      if (onRow) rows[pickAt]?.focus();
+      rows[pickAt]?.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (event.key === "Enter" && !event.target.closest("button")) {
+      // A row is a button, so Enter on one clicks it natively, and every other button in the
+      // dialog keeps its own Enter; only a field hands the keystroke to the highlight.
+      if (!rows[pickAt]) return;
+      event.preventDefault();
+      rows[pickAt].click();
+      return;
+    }
+    // Right only opens a folder from a row, so it stays a caret move inside the fields.
+    if (event.key === "ArrowRight" && onRow && listed[from] && listed[from].dir) {
+      event.preventDefault();
+      void browse(listed[from].path);
     }
   });
   pickPathInput.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closePicker();
-      msgBox.focus();
-      return;
-    }
     if (event.key !== "Enter") return;
     event.preventDefault();
     void browse(pickPathInput.value.trim() || "/");
@@ -2047,6 +2175,25 @@
     button.click();
   });
 
+  // The board is drivable without a mouse: `f` frames it, `0` is real size, `n` is what is next.
+  // The composer keeps its plain letters, because a field the user is typing in is never read.
+  document.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (typingSomewhere()) return;
+    // The picker is its own surface: a board shortcut behind it would move what is out of reach.
+    if (!picker.hidden) return;
+    if (event.key === "f") {
+      event.preventDefault();
+      fitAll();
+    } else if (event.key === "0") {
+      event.preventDefault();
+      resetZoom();
+    } else if (event.key === "n") {
+      event.preventDefault();
+      jumpToFresh();
+    }
+  });
+
   msgBox.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && replyTarget) {
       event.preventDefault();
@@ -2161,6 +2308,9 @@
     const working = linkUp && metaRunning === true;
     live.classList.toggle("down", !linkUp);
     live.classList.toggle("working", working);
+    // The clock ticks every second, so it is kept out of the spoken text and hidden: a screen
+    // reader hears "working" once instead of a count read out every second.
+    liveClock.textContent = "";
     if (!linkUp) {
       liveText.textContent = linkNote || "reconnecting";
       return;
@@ -2170,11 +2320,16 @@
       liveText.textContent = "connecting";
       return;
     }
-    liveText.textContent = working
-      ? runStartedAt === null
-        ? "waiting"
-        : `working · ${clockText(Date.now() - runStartedAt)}`
-      : "idle";
+    if (!working) {
+      liveText.textContent = "idle";
+      return;
+    }
+    if (runStartedAt === null) {
+      liveText.textContent = "waiting";
+      return;
+    }
+    liveText.textContent = "working";
+    liveClock.textContent = `· ${clockText(Date.now() - runStartedAt)}`;
   }
 
   // Elapsed time the header can read at a glance: minutes, then hours once the minutes run out.
