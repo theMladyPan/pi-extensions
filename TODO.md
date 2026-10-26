@@ -29,6 +29,23 @@ Ticked means in the repo. It does not mean exercised.
 - [ ] **5 · Provenance** — card ↔ session ↔ tool calls ↔ commit, so a card can say
       what it produced.
 
+## pi-bench — board as master, pi as slaves
+
+A standalone daemon that owns the agents, replacing the extension. Detail, proofs
+and next slice: [`pi-bench/STATE.md`](pi-bench/STATE.md).
+
+- [x] **Daemon vertical slice** — `pi-bench/server.mjs`: threads, one `--mode rpc`
+      child per thread, `POST /thread`, `POST /message`, `GET /events`, `GET /state`.
+      Verified by curl: message in, `pong` out, child gone when idle.
+- [ ] **Wire the established client** — the daemon serves `dashboard/public/`; the
+      composer still posts the extension's shapes. Remove the global composer, add
+      the `+` button and a per-card send, without touching the visuals.
+- [ ] **Board verbs for children** — `POST /card/note`, `/card/source`, `/card/ask`,
+      plus a thin `slave.ts` a child loads with `-e`.
+- [ ] **Persistence of threads** — session ids and cards, so a restarted daemon
+      resumes a thread by spawning a child on its session.
+- [ ] **Steer and abort per thread** — the wire is proven in `delegate.ts`.
+
 The two decisions that are expensive to revisit: the host owns the state and the
 browser only renders events, and the runtime seam lives in the board rather than in
 a fork of pi.
