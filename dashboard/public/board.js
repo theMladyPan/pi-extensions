@@ -129,6 +129,22 @@
   const THREAD_ROWS = 8;
   const rectOf = (card) => JSON.parse(card.dataset.rect);
 
+  /**
+   * One slot in a cascade: the column origin `right` the cascade opens from, the row it lands on,
+   * and the card's size. Column 0 sits under the anchor; a later column clears the widest card of
+   * the one before it, so both callers agree on the geometry.
+   */
+  function cascadeSpot(origin, right, position, width, height) {
+    const column = Math.floor((position - 1) / THREAD_ROWS);
+    const step = ((position - 1) % THREAD_ROWS) + 1;
+    return {
+      x: (column ? right + GAP : origin.x) + step * STEP,
+      y: origin.y + step * THREAD_STEP_Y,
+      w: width,
+      h: height,
+    };
+  }
+
   function threadSpot(thread, width, height) {
     const anchor = thread ? byId.get(thread) : null;
     const base = anchor && anchor.card.dataset.rect ? rectOf(anchor.card) : null;
@@ -143,14 +159,7 @@
     // The first slot nobody else holds: a closed sibling leaves a hole, and the next arrival takes
     // it instead of landing exactly on a card that is still there.
     for (let position = 1; position <= cards.length + 1; position++) {
-      const column = Math.floor((position - 1) / THREAD_ROWS);
-      const step = ((position - 1) % THREAD_ROWS) + 1;
-      const rect = {
-        x: (column ? right + GAP : base.x) + step * STEP,
-        y: base.y + step * THREAD_STEP_Y,
-        w: width,
-        h: height,
-      };
+      const rect = cascadeSpot(base, right, position, width, height);
       // A card that is neither the anchor nor a sibling is in the way, so the cascade gives up
       // rather than opening a note buried under a card the human is reading.
       if (cards.some((card) => !mine.has(card.dataset.id) && overlaps(rect, rectOf(card)))) return null;
@@ -1227,6 +1236,52 @@
     fitAll();
   }
 
+  /**
+   * Re-cascade every thread from its root, as if the cards had just arrived. Roots are visited in
+   * arrival order, so a thread nested inside another cascades from a root that already moved. The
+   * human pressed a button that moves furniture, so a card is placed by position even where
+   * something stands; two threads that then overlap are left for tidy to sort out.
+   */
+  function stack() {
+    for (const thread of new Set(cards.map((card) => card.dataset.threadRoot))) {
+      if (!thread) continue;
+      const root = byId.get(thread);
+      // threadMates already answers in arrival order, which is the order the cascade climbs.
+      const mates = threadMates(thread).map((card) => byId.get(card.dataset.id)).filter(Boolean);
+      // A closed root hands the anchor to the earliest member still open, which stays where it is.
+      const anchor = root || mates[0];
+      if (!anchor || !anchor.card.dataset.rect) continue;
+      const base = rectOf(anchor.card);
+      // A card that names its own thread is root and member at once; as the anchor it stays put.
+      const rest = mates.filter((member) => member !== anchor);
+      // A column opens once, from the widest card of the column that finished, so its rows cannot
+      // march right by a whole card each time.
+      let column = 0;
+      let right = base.x + base.w;
+      let widest = right;
+      for (const [index, member] of rest.entries()) {
+        const at = Math.floor(index / THREAD_ROWS);
+        if (at !== column) {
+          column = at;
+          right = widest;
+        }
+        const now = member.card.dataset.rect ? rectOf(member.card) : null;
+        // A folded card measures as its header only; the stored height is the one to unfold into.
+        const h = member.card.classList.contains("mini") && now ? now.h : member.card.offsetHeight;
+        const rect = cascadeSpot(base, right, index + 1, member.card.offsetWidth, h);
+        widest = Math.max(widest, rect.x + rect.w);
+        // Already where the cascade wants it: nothing to move and nothing to save.
+        if (now && now.x === rect.x && now.y === rect.y && now.w === rect.w && now.h === rect.h) continue;
+        placeCard(member, rect);
+        // One request per moved card, no batch: the client keeps no queue of its own and the human
+        // asked for one action, so there is nothing to merge a batch out of.
+        void saveLayout(member.id, rect);
+      }
+      applyThreadOrder(thread);
+    }
+    fitAll();
+  }
+
   function paintPill() {
     const pill = document.getElementById("newPill");
     if (!pill) return;
@@ -1589,6 +1644,7 @@
 
   document.getElementById("fit").addEventListener("click", fitAll);
   document.getElementById("tidy").addEventListener("click", tidy);
+  document.getElementById("stack").addEventListener("click", stack);
   // The thread order is the human's furniture too: the button says what the board does now, and
   // its title says what a click will do.
   const orderBtn = document.getElementById("threadOrder");
