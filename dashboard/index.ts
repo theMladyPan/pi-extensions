@@ -96,6 +96,8 @@ interface CardBase {
 	mini?: boolean;
 	/** Follow-up questions and their answers, oldest first. */
 	turns?: Turn[];
+	/** The card whose reply started the run that made this one, so the board stacks them. */
+	threadRoot?: string;
 }
 
 /**
@@ -216,6 +218,8 @@ let currentCtx: ExtensionContext | undefined;
 let running = false;
 /** When the run that is currently in flight began, or null while the board is idle. */
 let runStartedAt: number | null = null;
+/** The card the run in flight was asked on; cards it makes stack under it. */
+let activeThread: string | undefined;
 let emit: (name: string, data: unknown) => void = () => {};
 const pendingAnswers = new Map<string, (answer: string) => void>();
 /** Set by the extension so the HTTP handler can hand a board message to the session. */
@@ -758,10 +762,16 @@ function resolveAsk(cardId: string): void {
 /** Hand one exchange to the session and keep its card showing what happened to it. */
 async function sendNow(job: Outgoing): Promise<void> {
 	const pending: Pending = { cardId: job.cardId, turn: job.turn };
+	// Steer and the outbox both hand over here, so this is the one place a run learns which
+	// card asked for it.
+	activeThread = job.cardId;
 	try {
 		await deliver(job.text, job.mode, job.images, job.preamble);
 		setPending(pending, "sent");
 	} catch {
+		// Nothing reached the session, so no run works under this card's name any more. A steer can
+		// enter here while another job owns the thread, and that job keeps it.
+		if (activeThread === job.cardId) activeThread = undefined;
 		setPending(pending, "answered", "could not deliver this message");
 	}
 }
@@ -810,10 +820,13 @@ function upsert(target: Board, card: Card): boolean {
 		// user and survives the rewrite.
 		card.turns = previous.turns;
 		card.mini = previous.mini;
+		card.threadRoot = previous.threadRoot; // a refreshed card stays in the thread it was born in
 		target.cards[existing] = card;
 		broadcast(target, { type: "update", card });
 		return false;
 	}
+	// Every card the agent makes passes through here, so the run in flight stamps its own.
+	if (activeThread) card.threadRoot = activeThread;
 	target.cards.push(card);
 	if (target.cards.length > 200) target.cards.shift();
 	broadcast(target, { type: "card", card });
@@ -2007,9 +2020,11 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
-		// A second session in the same process starts idle, so the previous run's clock is dropped.
+		// A second session in the same process starts idle, so the previous run's clock and its
+		// thread are dropped: the card they name belongs to the session that is gone.
 		running = false;
 		runStartedAt = null;
+		activeThread = undefined;
 		// Only the interactive session owns a port; print and subagent runs stay headless.
 		if (enabled && ctx.mode === "tui") {
 			announceBoard(ensureBoard(), ctx);
@@ -2046,6 +2061,8 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	pi.on("agent_settled", async (event) => {
 		running = false;
 		runStartedAt = null;
+		// A stopped or failed run leaves no thread behind for the next card to inherit.
+		activeThread = undefined;
 		if (board) {
 			// A thinking block cut off mid-stream gets the same treatment as a tool call.
 			thoughts.clear();

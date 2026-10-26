@@ -25,6 +25,13 @@
   const cards = [];
   const byId = new Map();
   let z = 1;
+  // Z order inside a thread: the newest card on top by default. Someone who wants the other
+  // way wants it every time, so the choice lives beside the rail's width.
+  const ORDER_KEY = "board.threadOrder";
+  let newestFirst = true;
+  try {
+    newestFirst = localStorage.getItem(ORDER_KEY) !== "oldest";
+  } catch {}
   const occupied = [];
   let sawFirstCard = false;
   /** The card the composer is currently replying into, or null for a fresh message. */
@@ -108,6 +115,69 @@
     // Nothing placed yet (or nothing with a positive edge): the anchor is the whole board.
     if (right === -Infinity || top === Infinity) return { x: ax, y: ay, w, h };
     return { x: right + GAP, y: top, w, h };
+  }
+
+  /** The cards one reply spawned, oldest first: the order they arrived in. */
+  const threadMates = (thread) => cards.filter((card) => card.dataset.threadRoot === thread);
+
+  /**
+   * A thread cascades from the card the reply was asked on, like a stack of windows: each card
+   * one header lower and a little right, so every title stays readable. A long thread wraps into
+   * a column right of the one before it instead of running off the canvas.
+   */
+  const THREAD_STEP_Y = 34;
+  const THREAD_ROWS = 8;
+  const rectOf = (card) => JSON.parse(card.dataset.rect);
+
+  function threadSpot(thread, width, height) {
+    const anchor = thread ? byId.get(thread) : null;
+    const base = anchor && anchor.card.dataset.rect ? rectOf(anchor.card) : null;
+    // An anchor that is gone, or a card with no thread, keeps the free-spot rule.
+    if (!base) return null;
+    const mates = threadMates(thread);
+    const placed = [base, ...mates.map(rectOf)];
+    const mine = new Set([thread, ...mates.map((card) => card.dataset.id)]);
+    // Where the thread already reaches, read from the cards as they sit so sideways drift is
+    // included and closing one cannot narrow the column it left behind. A wrap clears this.
+    const right = placed.reduce((far, rect) => Math.max(far, rect.x + rect.w), -Infinity);
+    // The first slot nobody else holds: a closed sibling leaves a hole, and the next arrival takes
+    // it instead of landing exactly on a card that is still there.
+    for (let position = 1; position <= cards.length + 1; position++) {
+      const column = Math.floor((position - 1) / THREAD_ROWS);
+      const step = ((position - 1) % THREAD_ROWS) + 1;
+      const rect = {
+        x: (column ? right + GAP : base.x) + step * STEP,
+        y: base.y + step * THREAD_STEP_Y,
+        w: width,
+        h: height,
+      };
+      // A card that is neither the anchor nor a sibling is in the way, so the cascade gives up
+      // rather than opening a note buried under a card the human is reading.
+      if (cards.some((card) => !mine.has(card.dataset.id) && overlaps(rect, rectOf(card)))) return null;
+      if (!placed.some((other) => other.x === rect.x && other.y === rect.y)) return rect;
+    }
+    return null;
+  }
+
+  /**
+   * Z within one thread only, so cards outside it keep the order the human gave them. The anchor
+   * is the thread's oldest card and is ordered with its members; the restamp starts from the lowest
+   * z the group already holds, so the thread keeps its place among the other cards however often
+   * the pass runs.
+   */
+  function applyThreadOrder(thread) {
+    const anchor = byId.get(thread);
+    const stack = anchor ? [anchor.card, ...threadMates(thread)] : threadMates(thread);
+    if (!newestFirst) stack.reverse();
+    let next = stack.reduce((low, card) => Math.min(low, Number(card.style.zIndex) || z), z);
+    for (const card of stack) card.style.zIndex = next++;
+    z = Math.max(z, next);
+  }
+
+  function applyAllThreadOrder() {
+    for (const thread of new Set(cards.map((card) => card.dataset.threadRoot))) {
+      if (thread) applyThreadOrder(thread);
+    }
   }
 
   const viewportCenter = () => ({
@@ -721,10 +791,11 @@
     const height = data.rect ? data.rect.h : defaultHeight;
 
     // The server remembers where a card was put, so a refresh and other tabs agree. A card
-    // without a place goes in the nearest free area to the middle of what you are looking at.
+    // without a place cascades under the card its reply was asked on, and without a thread goes
+    // in the nearest free area to the middle of what you are looking at.
     const spot = data.rect
       ? { x: data.rect.x, y: data.rect.y, w: width, h: height }
-      : findFreeSpot(width, height, viewportCenter());
+      : threadSpot(data.threadRoot, width, height) ?? findFreeSpot(width, height, viewportCenter());
     occupied.push(spot);
     if (!data.rect) void saveLayout(data.id, spot);
 
@@ -733,6 +804,7 @@
     card.dataset.rect = JSON.stringify(spot);
     card.dataset.kind = kind;
     card.dataset.id = data.id;
+    if (data.threadRoot) card.dataset.threadRoot = data.threadRoot;
 
     const head = el("div", "head");
     head.innerHTML = `
@@ -756,6 +828,8 @@
     card.append(head, scroll, grip);
     world.appendChild(card);
     cards.push(card);
+    // A new card takes its place in the stack; a replay settles every thread once it is done.
+    if (data.threadRoot && !replaying) applyThreadOrder(data.threadRoot);
 
     const badge = el("span", "new-badge");
     // A restored card is one you already had, so it does not carry a "new" tag.
@@ -1515,6 +1589,33 @@
 
   document.getElementById("fit").addEventListener("click", fitAll);
   document.getElementById("tidy").addEventListener("click", tidy);
+  // The thread order is the human's furniture too: the button says what the board does now, and
+  // its title says what a click will do.
+  const orderBtn = document.getElementById("threadOrder");
+  function paintOrderBtn() {
+    orderBtn.textContent = newestFirst ? "newest" : "oldest";
+    orderBtn.setAttribute("aria-pressed", newestFirst ? "true" : "false");
+    orderBtn.title = newestFirst
+      ? "newest card in a thread sits on top — click to put the oldest on top"
+      : "oldest card in a thread sits on top — click to put the newest on top";
+  }
+  function flipOrder() {
+    newestFirst = !newestFirst;
+    try {
+      localStorage.setItem(ORDER_KEY, newestFirst ? "newest" : "oldest");
+    } catch {}
+    paintOrderBtn();
+    applyAllThreadOrder();
+  }
+  paintOrderBtn();
+  orderBtn.addEventListener("click", flipOrder);
+  // Another tab flipping the order repaints this one, so the two agree without a reload.
+  window.addEventListener("storage", (event) => {
+    if (event.key !== ORDER_KEY) return;
+    newestFirst = event.newValue !== "oldest";
+    paintOrderBtn();
+    applyAllThreadOrder();
+  });
   document.getElementById("newPill").addEventListener("click", jumpToFresh);
   resetBtn.addEventListener("click", resetZoom);
 
@@ -2357,6 +2458,9 @@
     } else if (event.key === "n") {
       event.preventDefault();
       jumpToFresh();
+    } else if (event.key === "o") {
+      event.preventDefault();
+      flipOrder();
     }
   });
 
@@ -2622,6 +2726,8 @@
           replaying = false;
         }
         if (keptTarget && byId.has(keptTarget)) setReplyTarget(byId.get(keptTarget));
+        // Every thread comes back in the order the human chose, not the order the server lists.
+        applyAllThreadOrder();
         sawFirstCard = (payload.cards || []).length > 0;
         // Armed on the first snapshot even when it is empty: the usual start is an empty snapshot
         // and the first card frames through the new-card path, and the first reconnect must not

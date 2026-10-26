@@ -498,7 +498,7 @@
 </head>
 <body>
 <header>
-  <span class="brand" title="ctrl+wheel: zoom · wheel or drag background: pan · drag header: move · corner: resize · f: fit · 0: 100% · n: next · r: reply · q: close">pi</span>
+  <span class="brand" title="ctrl+wheel: zoom · wheel or drag background: pan · drag header: move · corner: resize · f: fit · 0: 100% · n: next · r: reply · q: close · o: thread order">pi</span>
   <span class="sess" id="sess"></span>
   <!-- Polite, so the state is spoken when it changes; the elapsed clock is decoration that ticks
        every second and is hidden, so it is never read out. -->
@@ -512,6 +512,7 @@
   <button class="stat" id="statCtx" title="compact the context, the same as /compact" hidden><span id="statCtxValue"></span><span class="act" aria-hidden="true">compact</span></button>
   <button id="newPill" style="display:none">0 new</button>
   <button id="stop" style="display:none" title="stop this run (same as escape)">stop</button>
+  <button id="threadOrder"></button>
   <button id="tidy">tidy</button>
   <button id="fit">fit all</button>
   <button id="reset">100%</button>
