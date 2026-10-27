@@ -46,6 +46,13 @@
   const GAP = 18;
   const STEP = 24;
 
+  /**
+   * What a pointer down on a card may not grab: the controls in its head, the composer docked inside
+   * it, a link or a checkbox, the resize corner. Everything else is surface, which drags the card.
+   */
+  const INTERACTIVE =
+    ".close, .edit, .reply, .min, .ask-pill, .resize, input, textarea, button, a, [contenteditable], .xref, .tick, .q-options, #composer";
+
   // Cards are sized in columns rather than pixels: code reads best at 120 monospace
   // columns, prose at 80. Both are measured from the fonts actually in use.
   const SOURCE_COLS = 120;
@@ -926,32 +933,19 @@
     head.addEventListener("pointerdown", (event) => {
       // Buttons in the header are for clicking, not for dragging the card. The middle button pans
       // the canvas even here, so it belongs to the workspace rather than to the card.
-      if (event.button !== 0 || event.target.closest(".close, .edit, .reply, .min, .ask-pill")) return;
-      event.preventDefault();
-      card.classList.add("dragging");
-      const sx = event.clientX;
-      const sy = event.clientY;
-      const ox = parseFloat(card.style.left);
-      const oy = parseFloat(card.style.top);
-      const move = (ev) => {
-        card.style.left = `${ox + (ev.clientX - sx) / view.k}px`;
-        card.style.top = `${oy + (ev.clientY - sy) / view.k}px`;
-      };
-      const up = () => {
-        card.classList.remove("dragging");
-        removeEventListener("pointermove", move);
-        removeEventListener("pointerup", up);
-        const rect = {
-          x: Math.round(parseFloat(card.style.left)),
-          y: Math.round(parseFloat(card.style.top)),
-          w: card.offsetWidth,
-          h: card.offsetHeight,
-        };
-        placeCard(entry, rect);
-        void saveLayout(entry.id, rect);
-      };
-      addEventListener("pointermove", move);
-      addEventListener("pointerup", up);
+      if (event.button !== 0 || event.target.closest(INTERACTIVE)) return;
+      startCardDrag(card, entry, event);
+    });
+
+    // The whole card is a handle, so reading a board feels like a surface rather than a web page.
+    // Selecting its text is the ctrl press, the same modifier the wheel uses for zoom.
+    card.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
+      // The head starts the same drag on its own press, and preventing the default there does not
+      // stop the event from reaching here.
+      if (card.classList.contains("dragging")) return;
+      if (event.target.closest(INTERACTIVE)) return;
+      startCardDrag(card, entry, event);
     });
 
     grip.addEventListener("pointerdown", (event) => {
@@ -1407,6 +1401,36 @@
   }
 
   /** Move a card locally and take the space it now holds into account. */
+  /** Move a card by dragging it, in board units, so the card keeps up at any zoom. */
+  function startCardDrag(card, entry, event) {
+    // The text is not being selected, so the browser must not start selecting it.
+    event.preventDefault();
+    card.classList.add("dragging");
+    const sx = event.clientX;
+    const sy = event.clientY;
+    const ox = parseFloat(card.style.left);
+    const oy = parseFloat(card.style.top);
+    const move = (ev) => {
+      card.style.left = `${ox + (ev.clientX - sx) / view.k}px`;
+      card.style.top = `${oy + (ev.clientY - sy) / view.k}px`;
+    };
+    const up = () => {
+      card.classList.remove("dragging");
+      removeEventListener("pointermove", move);
+      removeEventListener("pointerup", up);
+      const rect = {
+        x: Math.round(parseFloat(card.style.left)),
+        y: Math.round(parseFloat(card.style.top)),
+        w: card.offsetWidth,
+        h: card.offsetHeight,
+      };
+      placeCard(entry, rect);
+      void saveLayout(entry.id, rect);
+    };
+    addEventListener("pointermove", move);
+    addEventListener("pointerup", up);
+  }
+
   function placeCard(record, rect) {
     const card = record.card;
     card.style.left = `${rect.x}px`;
@@ -1558,11 +1582,39 @@
   const wheelPixels = (event, delta) =>
     delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1);
 
+  /**
+   * The innermost thing under the pointer that can actually scroll, going no further than the card it
+   * belongs to. A source card scrolls its code view, a note with comments scrolls its column, and an
+   * open editor scrolls the text being written.
+   */
+  function scrollerAt(target, within) {
+    let node = target instanceof Element ? target : null;
+    while (node && node !== within) {
+      const overflow = getComputedStyle(node).overflowY;
+      if (node.scrollHeight - node.clientHeight > 1 && (overflow === "auto" || overflow === "scroll")) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
   viewport.addEventListener("wheel", (event) => {
     if (!event.ctrlKey && !event.metaKey) {
-      // Only the empty canvas pans. The rail, composer and picker sit outside the viewport, and a
-      // wheel over a card scrolls that card.
-      if (event.target.closest(".card")) return;
+      // One target per wheel, decided by the selection: a card you picked keeps the wheel wherever the
+      // pointer is, so the board does not slide while you read that card, and a board with nothing
+      // selected pans even under a card. The rail, composer and picker sit outside the viewport.
+      const selected = document.querySelector(".card.active");
+      const column = selected?.querySelector(".card-scroll");
+      const under =
+        selected && event.target instanceof Element && selected.contains(event.target)
+          ? scrollerAt(event.target, selected)
+          : null;
+      const scroller = under ?? column;
+      const room = scroller ? scroller.scrollHeight - scroller.clientHeight : 0;
+      if (room > 1) {
+        event.preventDefault();
+        scroller.scrollTop += wheelPixels(event, event.deltaY) || wheelPixels(event, event.deltaX);
+        return;
+      }
       event.preventDefault();
       view.x -= wheelPixels(event, event.deltaX);
       view.y -= wheelPixels(event, event.deltaY);
@@ -2218,6 +2270,129 @@
     }
   });
 
+  // ---------- model and thinking chips --------------------------------------
+  // Both chips open a list instead of acting on the click: the header says which model and level
+  // the session runs, and the list is how that changes. The server owns the switch, so the board
+  // asks and repaints from the meta that follows.
+  const statModel = document.getElementById("statModel");
+  const statModelValue = document.getElementById("statModelValue");
+  const statThinking = document.getElementById("statThinking");
+  const statThinkingValue = document.getElementById("statThinkingValue");
+  const statMenu = document.getElementById("statMenu");
+  /** What each chip may offer, filled from the meta. */
+  const statChoices = { model: [], thinking: [] };
+  /** The chip the open list belongs to, or null while it is closed. */
+  let statMenuChip = null;
+
+  function closeStatMenu(refocus = false) {
+    if (statMenu.hidden) return;
+    statMenu.hidden = true;
+    const chip = statMenuChip;
+    statMenuChip = null;
+    statModel.classList.remove("open");
+    statThinking.classList.remove("open");
+    if (refocus && chip) chip.focus();
+  }
+
+  async function chooseStat(kind, value) {
+    closeStatMenu(true);
+    hintLine(`${kind === "model" ? "switching to" : "thinking"} ${value}…`);
+    try {
+      const response = await fetch(`/${kind}?token=${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value }),
+      });
+      if (!response.ok) hintLine((await response.text()).trim() || `could not set the ${kind}`, true);
+    } catch {
+      hintLine("could not reach the board server", true);
+    }
+  }
+
+  function openStatMenu(chip, kind) {
+    const options = statChoices[kind];
+    statMenu.innerHTML = "";
+    const head = el("div", "m-head");
+    head.textContent = kind;
+    statMenu.append(head);
+    for (const option of options) {
+      const item = el("button", `m-item${option.on ? " on" : ""}`);
+      item.type = "button";
+      item.setAttribute("role", "menuitemradio");
+      item.setAttribute("aria-checked", option.on ? "true" : "false");
+      const tick = el("span", "m-tick");
+      tick.textContent = option.on ? "✓" : "";
+      item.append(tick);
+      const label = el("span", "m-name");
+      label.textContent = option.label;
+      item.append(label);
+      if (option.note) {
+        const note = el("span", "m-note");
+        note.textContent = option.note;
+        item.append(note);
+      }
+      item.title = option.label;
+      item.addEventListener("click", () => void chooseStat(kind, option.value));
+      statMenu.append(item);
+    }
+    if (!options.length) {
+      const empty = el("div", "m-empty");
+      empty.textContent = "nothing to choose";
+      statMenu.append(empty);
+    }
+    statMenu.hidden = false;
+    statMenuChip = chip;
+    chip.classList.add("open");
+    // Hung under its chip and pulled back inside the window, so a chip near the right edge still
+    // shows the whole list.
+    const box = chip.getBoundingClientRect();
+    statMenu.style.top = `${Math.round(box.bottom + 6)}px`;
+    statMenu.style.left = `${Math.round(Math.max(8, Math.min(box.left, innerWidth - statMenu.offsetWidth - 8)))}px`;
+    const current = statMenu.querySelector(".m-item.on") || statMenu.querySelector(".m-item");
+    if (current) current.focus();
+  }
+
+  for (const [chip, kind] of [
+    [statModel, "model"],
+    [statThinking, "thinking"],
+  ]) {
+    chip.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const wasOpen = statMenuChip === chip;
+      closeStatMenu();
+      if (!wasOpen) openStatMenu(chip, kind);
+    });
+  }
+
+  // A click anywhere else puts the list away, which is what any menu is expected to do.
+  document.addEventListener("click", (event) => {
+    if (statMenu.hidden || statMenu.contains(event.target)) return;
+    if (event.target.closest("#statModel, #statThinking")) return;
+    closeStatMenu();
+  });
+
+  // The list is its own surface: while it is open, escape closes it and the arrows walk it, and
+  // no board shortcut behind it fires. Captured first, so the card keys never see those presses.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (statMenu.hidden) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeStatMenu(true);
+        return;
+      }
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      const items = [...statMenu.querySelectorAll(".m-item")];
+      if (!items.length) return;
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      const at = items.indexOf(document.activeElement);
+      items[(at + step + items.length) % items.length].focus();
+    },
+    { capture: true },
+  );
+
   /**
    * A reply is aimed at one card, so the composer shows which until it is sent or cleared.
    * Without this the follow-up would arrive as a new sticky and the thread would be lost.
@@ -2683,6 +2858,16 @@
     }
   }
 
+  // The selection is a reading position, so Escape gives it up: the wheel goes back to moving the
+  // board instead of the card it was reading. Anything that handled Escape first — an editor, the
+  // detail panel, the picker, a reply target — has already prevented the default by the time this
+  // listener sees the keystroke, so the board keeps its selection there.
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || event.defaultPrevented) return;
+    if (!document.querySelector(".card.active")) return;
+    for (const card of cards) card.classList.remove("active");
+  });
+
   // `r` opens a thread on the card you last clicked and `q` closes it. The composer keeps its
   // own keys, so a message being typed is never cut short.
   document.addEventListener("keydown", (event) => {
@@ -2697,8 +2882,9 @@
       }
       return;
     }
-    // The picker is its own surface: a board shortcut behind it would act on what is out of reach.
-    if (!picker.hidden) return;
+    // The picker and the header menus are their own surfaces: a board shortcut behind one of them
+    // would act on what is out of reach.
+    if (!picker.hidden || !statMenu.hidden) return;
     const active = document.querySelector(".card.active");
     const record = active ? byId.get(active.dataset.id) : null;
     if (!record) return;
@@ -2718,7 +2904,7 @@
   document.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey || !/^[1-6]$/.test(event.key)) return;
     if (typingSomewhere()) return;
-    if (!actPanel.hidden) return;
+    if (!actPanel.hidden || !statMenu.hidden) return;
     const record = openQuestion();
     if (!record) return;
     // The option buttons carry their own click handler, so this reuses the whole answer path.
@@ -2733,8 +2919,9 @@
   document.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (typingSomewhere()) return;
-    // The picker is its own surface: a board shortcut behind it would move what is out of reach.
-    if (!picker.hidden || !actPanel.hidden) return;
+    // The picker and the header menus are their own surfaces: a board shortcut behind them would
+    // move what is out of reach.
+    if (!picker.hidden || !actPanel.hidden || !statMenu.hidden) return;
     if (event.key === "f") {
       event.preventDefault();
       fitAll();
@@ -2803,13 +2990,29 @@
     sess.append(name);
     sess.title = `${meta.cwd || folder} · port ${meta.port}`;
     setBaseTitle(`pi - ${folder}`);
-    const model = document.getElementById("statModel");
-    if (meta.model) {
-      model.innerHTML = `<em>${meta.model.split("/").pop()}</em>`;
-      model.title = meta.model;
-    } else {
-      model.innerHTML = "";
-    }
+    // The model chip names the provider as well as the model, so a session that switched provider
+    // reads at a glance. The thinking chip offers only the levels pi would accept for that model.
+    statModelValue.textContent = meta.model || "";
+    statModel.hidden = !meta.model;
+    statModel.title = meta.model ? `model ${meta.model} — click to switch` : "";
+    const levels = Array.isArray(meta.thinkingLevels) ? meta.thinkingLevels : [];
+    const level = meta.thinking || "";
+    // A model without reasoning has one level, so it gets no chip to open.
+    statThinking.hidden = !level || levels.length < 2;
+    statThinkingValue.textContent = level ? `think ${level}` : "";
+    statThinking.title = level ? `thinking ${level} — click to change` : "";
+    statChoices.model = (Array.isArray(meta.models) ? meta.models : []).map((entry) => ({
+      value: entry.ref,
+      label: entry.ref,
+      note: entry.name && entry.name !== entry.ref ? entry.name : "",
+      on: entry.ref === meta.model,
+    }));
+    statChoices.thinking = levels.map((candidate) => ({
+      value: candidate,
+      label: candidate,
+      note: "",
+      on: candidate === level,
+    }));
     document.getElementById("statTokens").innerHTML =
       meta.tokensIn || meta.tokensOut ? `↑${shortNum(meta.tokensIn)} ↓${shortNum(meta.tokensOut)}` : "";
     document.getElementById("statCost").innerHTML =

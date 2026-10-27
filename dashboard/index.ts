@@ -35,7 +35,7 @@ import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 
@@ -177,12 +177,27 @@ interface ActivityRow {
 	plain?: boolean;
 }
 
+/** One row of the header's model menu. */
+interface BoardModelChoice {
+	/** `provider/id`, which is also what picking one sends back. */
+	ref: string;
+	/** The model's own name, shown beside the ref when it says more than the id does. */
+	name: string;
+}
+
 /** What the header shows: which session this board belongs to and what it has spent. */
 interface BoardMeta {
 	folder: string;
 	cwd: string;
 	port: number;
+	/** The running model as `provider/id`, so the header says which provider it came from. */
 	model: string;
+	/** The thinking level the session runs at, empty when the model has no levels. */
+	thinking: string;
+	/** The levels this model accepts, so the header offers only what pi would take. */
+	thinkingLevels: string[];
+	/** What the model menu may switch to. */
+	models: BoardModelChoice[];
 	tokensIn: number;
 	tokensOut: number;
 	cost: number;
@@ -210,6 +225,9 @@ const EMPTY_META: BoardMeta = {
 	cwd: "",
 	port: 0,
 	model: "",
+	thinking: "",
+	thinkingLevels: [],
+	models: [],
 	tokensIn: 0,
 	tokensOut: 0,
 	cost: 0,
@@ -505,6 +523,8 @@ function flushSave(): void {
 
 let board: Board | undefined;
 let currentCtx: ExtensionContext | undefined;
+/** The extension API, kept so the header can switch this session's model and thinking level. */
+let session: ExtensionAPI | undefined;
 /** Whether a run is in flight. `agent_end` can be followed by more work, so this clears
  *  only when the whole run settles. */
 let running = false;
@@ -1037,6 +1057,52 @@ function addUsage(message: { usage?: { input?: number; output?: number; cost?: {
 	return true;
 }
 
+/**
+ * The models the model menu may offer. A session scoped with `--models` runs only those, so the
+ * menu never lists one pi would refuse; without a scope every model with credentials is fair game.
+ */
+function selectableModels(): Model<Api>[] {
+	if (!currentCtx) return [];
+	if (currentCtx.scopedModels.length > 0) return currentCtx.scopedModels.map((entry) => entry.model);
+	return currentCtx.modelRegistry.getAvailable();
+}
+
+const modelRef = (model: Model<Api>): string => `${model.provider}/${model.id}`;
+
+/** The thinking levels the running model accepts, `off` first. */
+function supportedLevels(): string[] {
+	const model = currentCtx?.model;
+	return model ? getSupportedThinkingLevels(model) : [];
+}
+
+/** Switch this session's model. Returns why it could not, or null when it did. */
+async function switchModel(ref: string): Promise<string | null> {
+	if (!session) return "no session yet";
+	const model = selectableModels().find((candidate) => modelRef(candidate) === ref);
+	if (!model) return `not available: ${ref}`;
+	// pi keeps the configured default for new sessions, so this reaches the current one only.
+	try {
+		if (!(await session.setModel(model))) return `no credentials for ${ref}`;
+	} catch (error) {
+		return `could not switch to ${ref}: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	pushMeta();
+	return null;
+}
+
+/** Change the thinking level. The level is checked here because pi would silently clamp a bad one. */
+function switchThinking(level: string): string | null {
+	if (!session) return "no session yet";
+	if (!supportedLevels().includes(level)) return `not available: ${level}`;
+	try {
+		session.setThinkingLevel(level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
+	} catch (error) {
+		return `could not set ${level}: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	pushMeta();
+	return null;
+}
+
 function currentMeta(target: Board): BoardMeta {
 	const cwd = currentCtx?.cwd ?? process.cwd();
 	const model = currentCtx?.model;
@@ -1044,7 +1110,10 @@ function currentMeta(target: Board): BoardMeta {
 		folder: cwd.split("/").filter(Boolean).pop() ?? cwd,
 		cwd,
 		port: target.port,
-		model: model ? `${model.id}` : "",
+		model: model ? modelRef(model) : "",
+		thinking: session?.getThinkingLevel() ?? "",
+		thinkingLevels: supportedLevels(),
+		models: selectableModels().map((entry) => ({ ref: modelRef(entry), name: entry.name })),
 		tokensIn: totals.tokensIn,
 		tokensOut: totals.tokensOut,
 		cost: totals.cost,
@@ -1574,6 +1643,20 @@ function startBoard(): Board {
 				res.end(JSON.stringify({ compacting: true }));
 				return;
 			}
+			if (req.method === "POST" && (url.pathname === "/model" || url.pathname === "/thinking")) {
+				const payload = await readJson<{ value?: string }>(req, res);
+				if (!payload) return;
+				const value = typeof payload.value === "string" ? payload.value : "";
+				const problem = url.pathname === "/model" ? await switchModel(value) : switchThinking(value);
+				if (problem) {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end(problem);
+					return;
+				}
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ ok: true }));
+				return;
+			}
 			if (req.method === "POST" && url.pathname === "/layout") {
 				// The browser owns placement; the server only remembers it. Storing it means a
 				// closed card frees its space and a refresh reproduces the board exactly.
@@ -1942,6 +2025,7 @@ const clearTool = defineTool({
 });
 
 export default function dashboardExtension(pi: ExtensionAPI) {
+	session = pi;
 	emit = (name, data) => pi.events.emit(name, data);
 
 	pi.registerTool(noteTool);
@@ -2505,6 +2589,10 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", async () => {
+		pushMeta();
+	});
+
+	pi.on("thinking_level_select", async () => {
 		pushMeta();
 	});
 

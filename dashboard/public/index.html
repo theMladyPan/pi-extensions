@@ -280,27 +280,55 @@
   header .sess { font: 13px var(--mono); color: var(--text); }
   header .sess b { color: var(--accent); font-weight: 600; }
   header .stat { font: 12px var(--mono); color: var(--muted); background: #161b22;
-    border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
+    border: 1px solid var(--border); border-radius: 6px; padding: 0 9px; white-space: nowrap;
+    display: inline-flex; align-items: center; height: 24px; }
   header .stat:empty { display: none; }
   header .stat em { color: var(--text); font-style: normal; }
-  /* The chip is also the compact button: the same box as its neighbours, so it has to keep their
-     metrics. `appearance` strips the button chrome, and the width is pinned to the seven
-     characters of "ctx 42%" so a one-digit percentage does not make it narrower. */
-  #statCtx { cursor: pointer; appearance: none; position: relative;
-    min-width: calc(7ch + 14px + 2px); }
+  /* The chip is also the compact button, and it carries two faces: the number, and the word that
+     replaces it on hover. Both sit in one grid cell, stacked, so the cell is always as wide as the
+     longer face and the chip cannot resize or shift when the word swaps in. `appearance` strips the
+     button chrome. */
+  #statCtx { cursor: pointer; appearance: none; display: inline-grid; align-content: center; }
   /* `display` on the id beats the user agent's [hidden] rule, so hiding is spelled out. */
   #statCtx[hidden] { display: none; }
-  #statCtx #statCtxValue { color: var(--text); white-space: nowrap; }
-  /* Overlaid rather than laid out beside the number, so the word costs the chip no width. */
-  #statCtx .act { position: absolute; inset: 0; display: grid; place-items: center;
-    visibility: hidden; color: var(--accent); pointer-events: none; }
+  #statCtx > span { grid-area: 1 / 1; white-space: nowrap; }
+  #statCtx #statCtxValue { color: var(--text); }
+  /* The word keeps the number's colour, family and size: only the reading changes. Its class is its
+     own, because `.act` belongs to the activity rows and would bring their padding and border in. */
+  #statCtx .word { visibility: hidden; color: var(--text); pointer-events: none; }
   #statCtx:hover, #statCtx:focus-visible { color: var(--text); border-color: var(--border-bright); }
   #statCtx:hover #statCtxValue, #statCtx:focus-visible #statCtxValue { visibility: hidden; }
-  #statCtx:hover .act, #statCtx:focus-visible .act { visibility: visible; }
+  #statCtx:hover .word, #statCtx:focus-visible .word { visibility: visible; }
   /* Nothing to compact while a run is in flight: compaction aborts it first, so the action is
      not offered, but a click still answers why rather than doing nothing. */
   #statCtx.busy:hover #statCtxValue, #statCtx.busy:focus-visible #statCtxValue { visibility: visible; }
-  #statCtx.busy:hover .act, #statCtx.busy:focus-visible .act { visibility: hidden; }
+  #statCtx.busy:hover .word, #statCtx.busy:focus-visible .word { visibility: hidden; }
+  /* The model and thinking chips open a list rather than acting on the click itself, so they keep
+     the stat box and add a pointer and a caret. */
+  header .stat.pick { cursor: pointer; appearance: none; }
+  header .stat.pick[hidden] { display: none; }
+  header .stat.pick em { display: inline-block; max-width: 52ch; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+  header .stat.pick::after { content: "▾"; color: var(--muted); font-size: 9px; margin-left: 6px; }
+  header .stat.pick:hover, header .stat.pick:focus-visible, header .stat.pick.open {
+    color: var(--text); border-color: var(--border-bright); }
+  /* The list a chip opens: the same box as the folder picker, hung under the chip it belongs to. */
+  #statMenu { position: fixed; z-index: 2000; display: flex; flex-direction: column; gap: 1px;
+    min-width: 230px; max-width: min(560px, 92vw); max-height: 62vh; overflow: auto; padding: 6px;
+    background: rgba(13,17,23,.98); border: 1px solid var(--border-bright); border-radius: 10px;
+    box-shadow: 0 18px 40px rgba(0,0,0,.55); }
+  #statMenu[hidden] { display: none; }
+  #statMenu .m-head { color: var(--muted); font: 10px var(--mono); text-transform: uppercase;
+    letter-spacing: .6px; padding: 3px 6px 5px; }
+  #statMenu .m-item { display: flex; align-items: center; gap: 7px; width: 100%;
+    font: 12px var(--mono); color: var(--text); background: none; border: 0; text-align: left;
+    padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+  #statMenu .m-item:hover, #statMenu .m-item:focus-visible { background: #161b22; outline: none; }
+  #statMenu .m-item .m-tick { width: 9px; color: var(--muted); font-size: 10px; }
+  #statMenu .m-item.on, #statMenu .m-item.on .m-tick { color: var(--green); }
+  #statMenu .m-item .m-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #statMenu .m-item .m-note { color: var(--muted); font-size: 10px; white-space: nowrap; }
+  #statMenu .m-empty { padding: 8px 6px; color: var(--muted); font: 11px var(--mono); }
 
   /* activity rail */
   #rail {
@@ -531,12 +559,15 @@
        every second and is hidden, so it is never read out. -->
   <span class="live" id="live" role="status" aria-live="polite"><b aria-hidden="true"></b> <span id="liveText">connecting</span><span id="liveClock" aria-hidden="true"></span></span>
   <span class="grow"></span>
-  <span class="stat" id="statModel"></span>
+  <!-- The model and thinking chips are menus: the header names what the session runs on, and a
+       click lists what it could run on instead. -->
+  <button class="stat pick" id="statModel" title="switch model" hidden><em id="statModelValue"></em></button>
+  <button class="stat pick" id="statThinking" title="change the thinking level" hidden><em id="statThinkingValue"></em></button>
   <span class="stat" id="statTokens"></span>
   <span class="stat" id="statCost"></span>
   <!-- The context chip is also the compact button: the action sits on the number it changes,
        and the word appears on hover or focus so the row keeps its width at rest. -->
-  <button class="stat" id="statCtx" title="compact the context, the same as /compact" hidden><span id="statCtxValue"></span><span class="act" aria-hidden="true">compact</span></button>
+  <button class="stat" id="statCtx" title="compact the context, the same as /compact" hidden><span id="statCtxValue"></span><span class="word" aria-hidden="true">compact?</span></button>
   <button id="newPill" style="display:none">0 new</button>
   <button id="stop" style="display:none" title="stop this run (same as escape)">stop</button>
   <button id="threadOrder"></button>
@@ -545,6 +576,8 @@
   <button id="fit">fit all</button>
   <button id="reset">100%</button>
 </header>
+
+<div id="statMenu" role="menu" aria-label="model and thinking level" hidden></div>
 
 <aside id="rail">
   <div class="rail-head">cards <b id="railCardCount"></b><button id="railToggle" title="hide the rail">«</button></div>
