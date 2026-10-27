@@ -24,12 +24,12 @@
  * Voice mode is a separate extension. When both are loaded, the `board:note`
  * event lets voice read board notes aloud; neither depends on the other.
  *
- * Cards and rail rows are saved per working directory, so `/reload` restarts the host
- * without emptying the canvas.
+ * Cards and rail rows are saved per pi session, so `/reload` restarts the host without emptying
+ * the canvas, a new session starts on an empty board, and resuming one brings its cards back.
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -238,11 +238,11 @@ const EMPTY_META: BoardMeta = {
 
 /**
  * The board's cards outlive the process. `/reload` restarts the host, so without a file on disk
- * the canvas empties every time the extension is updated. The file is per working directory and
- * lives beside the remembered port and token. Two sessions in the same folder share one file and
- * the last writer wins; that is accepted, because the alternative is a lock nobody asked for.
- * File contents, including anything secret that was opened onto the board, therefore live in
- * `~/.pi/agent/state/boards/` at mode 0600, and nothing ever deletes them.
+ * the canvas empties every time the extension is updated. There is one file per pi session, in a
+ * folder per working directory: a board is the work of one conversation, so starting a session
+ * starts an empty board and resuming one brings its own cards back. File contents, including
+ * anything secret that was opened onto the board, therefore live in `~/.pi/agent/state/boards/` at
+ * mode 0600, and nothing ever deletes them.
  */
 const BOARD_STATE_VERSION = 1;
 const BOARD_STATE_DIR = join(homedir(), ".pi", "agent", "state", "boards");
@@ -257,9 +257,46 @@ const MAX_BOARD_CARDS = 200;
  */
 const MAX_SAVED_SOURCE_CHARS = 200_000;
 
-/** Named by the folder, and the folder name is also inside the file, so it stays explainable. */
-function boardStateFile(cwd: string): string {
+/** The folder one working directory's boards live in, named by the folder itself. */
+function boardFolder(cwd: string): string {
+	return join(BOARD_STATE_DIR, createHash("sha256").update(cwd).digest("hex").slice(0, 16));
+}
+
+/**
+ * One session's board. The session id is what makes a board follow the conversation rather than the
+ * folder, and it is a uuid, so a file cannot be claimed by two sessions. A run with no session
+ * behind it keeps the single folder-wide board, which is what headless use had before.
+ */
+function boardStateFile(cwd: string, sessionId: string): string {
+	const name = sessionId.replace(/[^A-Za-z0-9_-]/g, "");
+	return join(boardFolder(cwd), `${name || "folder"}.json`);
+}
+
+/**
+ * The single board a folder wrote before boards belonged to sessions: a flat file beside the
+ * folders, named by the folder hash alone.
+ */
+function legacyBoardStateFile(cwd: string): string {
 	return join(BOARD_STATE_DIR, `${createHash("sha256").update(cwd).digest("hex").slice(0, 16)}.json`);
+}
+
+/**
+ * The board a folder kept before this split belongs to the conversation it was drawn for, so the
+ * session that resumes that folder's work claims it once. A session that starts new does not: an
+ * empty board is the whole point of a new session.
+ */
+function adoptLegacyBoard(cwd: string, sessionId: string, reason: string): void {
+	if (reason !== "resume" && reason !== "reload") return;
+	const store = boardStateFile(cwd, sessionId);
+	if (existsSync(store)) return;
+	const legacy = legacyBoardStateFile(cwd);
+	if (!existsSync(legacy)) return;
+	try {
+		mkdirSync(dirname(store), { recursive: true, mode: 0o700 });
+		renameSync(legacy, store);
+	} catch {
+		// A board that cannot be moved still opens, empty, rather than failing the session.
+	}
 }
 
 const asText = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
@@ -482,7 +519,7 @@ function writeBoardState(target: Board): void {
 			cards: target.cards.map(saveableCard),
 			activity: target.activity.map(saveableRow),
 		};
-		mkdirSync(BOARD_STATE_DIR, { recursive: true, mode: 0o700 });
+		mkdirSync(dirname(target.store), { recursive: true, mode: 0o700 });
 		// Same pattern as the remembered port: a half-written file would restore as a broken board.
 		const temp = `${target.store}.${process.pid}.tmp`;
 		writeFileSync(temp, `${JSON.stringify(saved)}\n`, { mode: 0o600 });
@@ -1140,14 +1177,36 @@ function hintOnBoard(text: string): void {
 }
 
 /**
- * Start over. A new session has no transcript behind it, so the cards, the rail and the counters that
- * describe the old one go with it, and every tab is told rather than left holding what is gone.
+ * Point the board at the session that is running now. A board is the work of one conversation, so a
+ * switch reads that session's own file: a new session finds an empty one, a resumed session its own
+ * cards and its own rail. What the session being left drew is written first, so leaving loses nothing.
  */
-function resetBoard(target: Board): void {
-	// A question on the board is waiting for an answer the agent will never read now.
+function bindSession(target: Board, ctx: ExtensionContext | undefined, reason = ""): void {
+	const cwd = ctx?.cwd ?? process.cwd();
+	const store = boardStateFile(cwd, ctx?.sessionManager.getSessionId() ?? "");
+	if (store === target.store) return;
+	flushSave();
+	// A fork is the same work under a new id, so it starts from the board it was cut from.
+	if (reason === "fork" && !existsSync(store)) {
+		try {
+			mkdirSync(dirname(store), { recursive: true, mode: 0o700 });
+			copyFileSync(target.store, store);
+		} catch {
+			// A board that cannot be copied forks empty rather than failing the session.
+		}
+	}
+	// A question the old conversation asked is waiting for an answer nobody will read now.
 	for (const card of target.cards) resolveAsk(card.id);
+	target.store = store;
+	const restored = readBoardState(store);
+	// The arrays are the ones the server and the card tools already hold, so they are refilled
+	// rather than replaced.
 	target.cards.length = 0;
+	target.cards.push(...restored.cards);
 	target.activity.length = 0;
+	target.activity.push(...restored.activity);
+	// Nothing in flight belongs to the session that just arrived: no process remembers the queue it
+	// sat in, and its counters start where the session itself starts.
 	closedCards.clear();
 	awaitingTurns.length = 0;
 	recentSends.clear();
@@ -1156,9 +1215,9 @@ function resetBoard(target: Board): void {
 	totals.tokensIn = 0;
 	totals.tokensOut = 0;
 	totals.cost = 0;
-	// `reset` rather than `clear`: the rail belongs to the session too, and `clear` leaves it alone.
-	broadcast(target, { type: "reset" });
+	// A tab left open across the switch paints the board it belongs to now, cards and rail together.
 	pushMeta();
+	broadcast(target, { type: "snapshot", cards: target.cards, activity: target.activity, meta: target.meta });
 }
 
 /**
@@ -1299,19 +1358,14 @@ function urlFor(target: Board): string {
 
 function broadcast(target: Board, message: unknown): void {
 	// The durable half of the board is its cards and their layout, and `card`, `update`, `remove`,
-	// `move`, `clear` and `reset` are the only events that change it, so those schedule a save.
-	// `activity`, `meta` and `hint` are left out for write rate alone: the ticker sends `activity`
-	// four times a second. So the restored rail is a snapshot from the last card event, and a long
-	// stretch of tool calls after the last card is lost.
+	// `move` and `clear` are the only events that change it, so those schedule a save. `activity`,
+	// `meta` and `hint` are left out for write rate alone: the ticker sends `activity` four times a
+	// second. So the restored rail is a snapshot from the last card event, and a long stretch of
+	// tool calls after the last card is lost.
 	const kind = (message as { type?: string } | null)?.type;
 	if (
 		target === board &&
-		(kind === "card" ||
-			kind === "update" ||
-			kind === "remove" ||
-			kind === "move" ||
-			kind === "clear" ||
-			kind === "reset")
+		(kind === "card" || kind === "update" || kind === "remove" || kind === "move" || kind === "clear")
 	) {
 		scheduleSave(target);
 	}
@@ -1409,9 +1463,9 @@ function startBoard(): Board {
 	const freshToken = () => randomBytes(16).toString("hex");
 	let token = remembered.token ?? freshToken();
 	const clients = new Set<ServerResponse>();
-	// The file belongs to the folder the user is working in, and its path is fixed before the
-	// first save so a later session switch cannot split the board across two files.
-	const store = boardStateFile(currentCtx?.cwd ?? process.cwd());
+	// The file belongs to the session, so a switch rebinds the board instead of writing one
+	// conversation's cards into another's file.
+	const store = boardStateFile(currentCtx?.cwd ?? process.cwd(), currentCtx?.sessionManager.getSessionId() ?? "");
 	const restored = readBoardState(store);
 	const cards: Card[] = restored.cards;
 	const activity: ActivityRow[] = restored.activity;
@@ -1834,6 +1888,8 @@ function startBoard(): Board {
 }
 
 let enabled = process.env.PI_BOARD_DISABLED !== "1";
+/** True between `session_before_switch` and the `session_start` that replaces the session. */
+let switchingSession = false;
 
 function ensureBoard(): Board {
 	if (!board) board = startBoard();
@@ -2133,8 +2189,6 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 				// given belongs to the session that just ended, and pi refuses it from there on.
 				const result = await ctx.newSession({
 					withSession: async (next) => {
-						const target = boardForTool();
-						if (target) resetBoard(target);
 						next.ui.notify("New session started. The board is empty.", "info");
 					},
 				});
@@ -2666,17 +2720,27 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		pushMeta();
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		currentCtx = ctx;
 		// A second session in the same process starts idle, so the previous run's clock and its
 		// thread are dropped: the card they name belongs to the session that is gone.
 		running = false;
 		runStartedAt = null;
 		activeThread = undefined;
+		switchingSession = false;
+		// A board drawn before boards belonged to sessions is claimed by the session resuming that
+		// folder, and only by it: a new session starts on an empty board.
+		adoptLegacyBoard(ctx.cwd, ctx.sessionManager.getSessionId(), event.reason);
 		// Only the interactive session owns a port; print and subagent runs stay headless.
 		if (enabled && ctx.mode === "tui") {
-			announceBoard(ensureBoard(), ctx);
+			const target = ensureBoard();
+			bindSession(target, ctx, event.reason);
+			announceBoard(target, ctx);
 			pushMeta();
+		} else if (board) {
+			// A headless session moves the board to its own file too, so a tab opened later does not
+			// show the conversation that is no longer running.
+			bindSession(board, ctx, event.reason);
 		}
 	});
 
@@ -2737,7 +2801,18 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 		void pumpOutbox();
 	});
 
+	pi.on("session_before_switch", async () => {
+		// The process keeps running for the session that replaces this one, so the board keeps its
+		// port and the tab pointing at it stays live; the start that follows rebinds its cards.
+		switchingSession = true;
+	});
+
 	pi.on("session_shutdown", async () => {
+		if (switchingSession) {
+			// What this session drew is written before its file stops being the live one.
+			flushSave();
+			return;
+		}
 		stopBoard();
 	});
 }

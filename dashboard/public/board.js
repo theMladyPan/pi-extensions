@@ -3247,6 +3247,9 @@
         // the draft is aimed at has to survive too, or a reply loses its card mid-conversation.
         const keptTarget = replyTarget ? replyTarget.id : null;
         clearBoard();
+        // A snapshot is the whole board, rail included: a session switch arrives as one, and the
+        // rows of the conversation it replaced belong to nobody now.
+        clearRailActivity();
         replaying = true;
         // A card that throws mid-replay must not leave the flag set: the tab would then never
         // badge, centre or restore a target again.
@@ -3289,10 +3292,6 @@
         hintLine(payload.text || "");
       } else if (payload.type === "clear") {
         clearBoard();
-      } else if (payload.type === "reset") {
-        // A new session starts from nothing, and the rail describes the session that ended.
-        clearBoard();
-        clearRailActivity();
       }
     };
   }
