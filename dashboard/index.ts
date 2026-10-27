@@ -540,6 +540,11 @@ let deliver: (text: string, mode: "queue" | "steer", images: InboundImage[], pre
 	async () => {};
 /** Set by the extension so the board can ask the session to compact its own context. */
 let compactSession: () => void = () => {};
+/**
+ * Set by the extension so the board can start a new session. `newSession` is handed to a command, not
+ * to the board, so the board runs the command and this returns why it could not, or null when it did.
+ */
+let startNewSession: () => string | null = () => "no session yet";
 /** Set by the extension so closing the board also forgets the thought it was streaming. */
 let forgetThoughts: () => void = () => {};
 /** Set by the extension so closing the board also drops the detail its rail rows point at. */
@@ -1135,6 +1140,28 @@ function hintOnBoard(text: string): void {
 }
 
 /**
+ * Start over. A new session has no transcript behind it, so the cards, the rail and the counters that
+ * describe the old one go with it, and every tab is told rather than left holding what is gone.
+ */
+function resetBoard(target: Board): void {
+	// A question on the board is waiting for an answer the agent will never read now.
+	for (const card of target.cards) resolveAsk(card.id);
+	target.cards.length = 0;
+	target.activity.length = 0;
+	closedCards.clear();
+	awaitingTurns.length = 0;
+	recentSends.clear();
+	forgetThoughts();
+	forgetActivityDetails();
+	totals.tokensIn = 0;
+	totals.tokensOut = 0;
+	totals.cost = 0;
+	// `reset` rather than `clear`: the rail belongs to the session too, and `clear` leaves it alone.
+	broadcast(target, { type: "reset" });
+	pushMeta();
+}
+
+/**
  * A follow-up is a question about one card, so the session is told which card and given a short
  * quote. The quote is capped because the conversation already holds the rest: repeating it would
  * pay twice for the same words and would not survive the cache that a plain append keeps.
@@ -1272,14 +1299,19 @@ function urlFor(target: Board): string {
 
 function broadcast(target: Board, message: unknown): void {
 	// The durable half of the board is its cards and their layout, and `card`, `update`, `remove`,
-	// `move` and `clear` are the only events that change it, so those schedule a save. `activity`,
-	// `meta` and `hint` are left out for write rate alone: the ticker sends `activity` four times a
-	// second. So the restored rail is a snapshot from the last card event, and a long stretch of
-	// tool calls after the last card is lost.
+	// `move`, `clear` and `reset` are the only events that change it, so those schedule a save.
+	// `activity`, `meta` and `hint` are left out for write rate alone: the ticker sends `activity`
+	// four times a second. So the restored rail is a snapshot from the last card event, and a long
+	// stretch of tool calls after the last card is lost.
 	const kind = (message as { type?: string } | null)?.type;
 	if (
 		target === board &&
-		(kind === "card" || kind === "update" || kind === "remove" || kind === "move" || kind === "clear")
+		(kind === "card" ||
+			kind === "update" ||
+			kind === "remove" ||
+			kind === "move" ||
+			kind === "clear" ||
+			kind === "reset")
 	) {
 		scheduleSave(target);
 	}
@@ -1623,6 +1655,19 @@ function startBoard(): Board {
 				currentCtx.abort();
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ stopped: true }));
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/new") {
+				// The board cannot replace the session itself, so it asks the command that can. A run in
+				// flight is the human's to stop first: a new session would leave it half-written.
+				const problem = startNewSession();
+				if (problem) {
+					res.writeHead(409, { "Content-Type": "text/plain" });
+					res.end(problem);
+					return;
+				}
+				res.writeHead(202, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ starting: true }));
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/compact") {
@@ -2052,7 +2097,7 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("board", {
-		description: "Show the board URL: /board [on|off|clear]",
+		description: "Show the board URL: /board [on|off|clear|new]",
 		handler: async (args, ctx) => {
 			currentCtx = ctx;
 			const verb = args.trim().toLowerCase();
@@ -2079,6 +2124,22 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 				target.cards.length = 0;
 				broadcast(target, { type: "clear" });
 				ctx.ui.notify("Board cleared", "info");
+				return;
+			}
+			if (verb === "new") {
+				// `/new`, from the board. The command is the only place a new session can be started,
+				// so the board's button asks for this verb instead of reaching the session directly.
+				// Everything after the switch belongs in `withSession`: the context this handler was
+				// given belongs to the session that just ended, and pi refuses it from there on.
+				const result = await ctx.newSession({
+					withSession: async (next) => {
+						const target = boardForTool();
+						if (target) resetBoard(target);
+						next.ui.notify("New session started. The board is empty.", "info");
+					},
+				});
+				// A cancelled switch replaced nothing, so this context is the live one still.
+				if (result.cancelled) ctx.ui.notify("the new session was cancelled", "warning");
 				return;
 			}
 			announceBoard(ensureBoard(), ctx);
@@ -2108,6 +2169,15 @@ export default function dashboardExtension(pi: ExtensionAPI) {
 						...images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
 					];
 		await pi.sendUserMessage(content, { deliverAs: mode === "steer" ? "steer" : "followUp" });
+	};
+
+	// The board can ask for a new session; the `/board new` verb is what actually starts it.
+	startNewSession = () => {
+		if (!currentCtx) return "no session yet";
+		// A new session while a run is streaming would leave that run writing into nothing.
+		if (running) return "stop the run first";
+		pi.sendUserMessage("/board new", { expandPromptTemplates: true });
+		return null;
 	};
 
 	// The board can ask for a compaction, which is the same manual path `/compact` takes. It is

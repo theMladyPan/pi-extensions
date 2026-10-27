@@ -1940,6 +1940,17 @@
     paintRailCount();
   }
 
+  /** The rail is the work of one session, so a new session starts it empty. */
+  function clearRailActivity() {
+    closeActPanel();
+    railNow.replaceChildren();
+    railLog.replaceChildren();
+    actEls.clear();
+    railRunning.textContent = "";
+    railOpenCount.textContent = "";
+    syncTicker();
+  }
+
   function actRow(row) {
     const thinking = row.kind === "thinking";
     const node = el("div", `act ${row.kind === "reply" ? "reply" : ""} ${thinking ? "thinking" : ""} ${row.status}`);
@@ -2834,6 +2845,37 @@
       stopBtn.textContent = "stop";
     }
   });
+
+  // Starting over loses the transcript and every card, so the button answers nothing on the first
+  // press: it turns into the question, and only the second press does it. Left alone, it goes back.
+  const newBtn = document.getElementById("newBtn");
+  const NEW_ARMED_MS = 4000;
+  let disarmNew = 0;
+
+  function disarmNewButton() {
+    clearTimeout(disarmNew);
+    disarmNew = 0;
+    newBtn.classList.remove("armed");
+  }
+
+  newBtn.addEventListener("click", async () => {
+    if (!disarmNew) {
+      newBtn.classList.add("armed");
+      disarmNew = setTimeout(disarmNewButton, NEW_ARMED_MS);
+      return;
+    }
+    disarmNewButton();
+    newBtn.disabled = true;
+    hintLine("starting a new session…");
+    try {
+      const response = await fetch(`/new?token=${encodeURIComponent(token)}`, { method: "POST" });
+      if (!response.ok) hintLine((await response.text()).trim() || "could not start a new session", true);
+    } catch {
+      hintLine("could not reach the board server", true);
+    } finally {
+      newBtn.disabled = false;
+    }
+  });
   const composer = document.getElementById("composer");
   const composerHome = composer.parentElement;
   let composerAt = composer.nextElementSibling;
@@ -3247,6 +3289,10 @@
         hintLine(payload.text || "");
       } else if (payload.type === "clear") {
         clearBoard();
+      } else if (payload.type === "reset") {
+        // A new session starts from nothing, and the rail describes the session that ended.
+        clearBoard();
+        clearRailActivity();
       }
     };
   }

@@ -541,6 +541,14 @@
   header button { font: 12px var(--mono); color: var(--muted); background: #161b22;
     border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; cursor: pointer; }
   header button:hover { color: var(--text); border-color: var(--border-bright); }
+  /* The armed press is the question, so it is the one place in the header that says danger. */
+  header button.armed { color: var(--red); border-color: rgba(248, 81, 73, .5); }
+  /* Two faces, one cell: the button keeps its size and its place while it asks. */
+  #newBtn { display: inline-grid; align-content: center; }
+  #newBtn > span { grid-area: 1 / 1; }
+  #newBtn #newSure { visibility: hidden; }
+  #newBtn.armed #newIdle { visibility: hidden; }
+  #newBtn.armed #newSure { visibility: visible; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
     font-size: 14px; pointer-events: none; text-align: center; padding: 20px; }
   /* Each of the board's three animations repeats a state the text already spells out, so the board
@@ -570,6 +578,10 @@
   <button class="stat" id="statCtx" title="compact the context, the same as /compact" hidden><span id="statCtxValue"></span><span class="word" aria-hidden="true">compact?</span></button>
   <button id="newPill" style="display:none">0 new</button>
   <button id="stop" style="display:none" title="stop this run (same as escape)">stop</button>
+  <!-- Starting over is the one header button that throws work away, so it asks twice: the first
+       press turns it into a question, the second answers it. Both faces share one grid cell, so the
+       armed button is the same size in the same place: the second press lands where the first did. -->
+  <button id="newBtn" title="start over: a new session in this folder, and an empty board (same as /new)"><span id="newIdle">start over</span><span id="newSure">sure?</span></button>
   <button id="threadOrder"></button>
   <button id="stack" title="cascade every thread again under its root">stack</button>
   <button id="tidy">tidy</button>
