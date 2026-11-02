@@ -512,7 +512,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 	let active = false;
 	let muted = false;
 	let wrapUpEnabled = process.env.PI_VOICE_WRAP !== "0";
-	// The dashboard extension is independent; when both run, notes spoken on the board are read aloud too.
+	// A board publishes `board:note`; when one is loaded, its notes are read aloud here too.
 	let mirrorBoardNotes = process.env.PI_VOICE_BOARD !== "0";
 	let lang: Lang = LANGS[initialLang] ? initialLang : "en";
 	const voice = DEFAULT_VOICE;
@@ -903,7 +903,7 @@ export default function voiceExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Composition with the dashboard extension: a note put on the board is also spoken.
+	// A note put on the board is also spoken, when the loaded board emits `board:note`.
 	pi.events.on("board:note", (data) => {
 		if (!active || !mirrorBoardNotes) return;
 		const note = data as { title?: string; text?: string };

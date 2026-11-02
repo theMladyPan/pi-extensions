@@ -57,6 +57,10 @@ it exits cleanly with no stderr output.
 (cd mdrender && npm install)
 ```
 
+## Retired extensions
+
+- **`dashboard/`** — the single-session board, its server and its client page. [pi-studio](https://github.com/theMladyPan/pi-studio) replaced it with a daemon that gives every agent a card and a thread, so the extension, its `board_*` tools and its `docs/roadmap-board.md` plan are gone. The last tree that held them is branch `archive/dashboard-extension` (commit `dac4240`); pi-studio's `bridge/child-bridge.mjs` registers the `board_*` tools for its own threads. Leftover state in `~/.pi/agent/state/dashboard.json` and `~/.pi/agent/state/boards/` is inert.
+
 ## Notes for Pi agents
 
 - This directory is a Git repository. Check `git status` before edits or pulls.
