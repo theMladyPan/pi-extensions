@@ -61,6 +61,8 @@ it exits cleanly with no stderr output.
 
 - **`dashboard/`** — the single-session board, its server and its client page. [pi-studio](https://github.com/theMladyPan/pi-studio) replaced it with a daemon that gives every agent a card and a thread, so the extension, its `board_*` tools and its `docs/roadmap-board.md` plan are gone. The last tree that held them is branch `archive/dashboard-extension` (commit `dac4240`); pi-studio's `bridge/child-bridge.mjs` registers the `board_*` tools for its own threads. Leftover state in `~/.pi/agent/state/dashboard.json` and `~/.pi/agent/state/boards/` is inert.
 
+- **`voice/`** — spoken driving of the console pi: live dictation from the microphone, breadcrumbs read aloud while tools run, and a spoken wrap-up. It registered `alt+s`, `alt+x`, `alt+l` and `/voice`, and it needed a TUI session (`ctx.mode === "tui"`), so a pi-studio thread never got anything from it. Last tree: branch `archive/voice-mode` (commit `06d5868`). What it did, and what a board version would touch, is recorded in pi-studio's `TODO.md`.
+
 ## Notes for Pi agents
 
 - This directory is a Git repository. Check `git status` before edits or pulls.
