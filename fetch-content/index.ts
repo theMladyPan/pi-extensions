@@ -5,6 +5,8 @@ const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 
 const FETCH_TIMEOUT_MS = 30_000;
+const LLM_TIMEOUT_MS = 60_000;
+const MAX_OUTPUT_TOKENS = { summary: 4_000, verbatim: 16_000 } as const;
 const BROWSER_USER_AGENT =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const MAX_CONTENT_LENGTH = 100_000;
@@ -97,7 +99,12 @@ function cleanHtml(html: string): string {
 	return truncate(stripped);
 }
 
-async function fetchAndClean(rawUrl: string, parentSignal?: AbortSignal): Promise<string> {
+// `needsLlm` is false when the body was already clean text (plain text, Markdown,
+// JSON, CSV): retyping it through a model costs latency, money, and fidelity.
+async function fetchAndClean(
+	rawUrl: string,
+	parentSignal?: AbortSignal,
+): Promise<{ content: string; needsLlm: boolean }> {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 	if (parentSignal) {
@@ -137,30 +144,25 @@ async function fetchAndClean(rawUrl: string, parentSignal?: AbortSignal): Promis
 		throw new Error(`Unsupported content type for ${rawUrl}: ${contentType}`);
 	}
 
+	// The body is already read above; reuse it instead of a second, failing read.
 	if (!response.ok) {
 		let detail = response.statusText;
-		try {
-			const raw = await response.text();
-			if (raw.trim()) {
-				try {
-					detail = extractErrorMessage(JSON.parse(raw), response.statusText);
-				} catch {
-					detail = raw.trim();
-				}
+		if (body.trim()) {
+			try {
+				detail = extractErrorMessage(JSON.parse(body), response.statusText);
+			} catch {
+				detail = body.trim().slice(0, 500);
 			}
-		} catch {
-			// keep statusText
 		}
 		throw new Error(`Fetch failed for ${rawUrl} (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}
 
 	// Non-HTML payloads are returned as-is (truncated), no tag stripping needed.
 	if (!/text\/html|application\/xhtml/i.test(contentType)) {
-		const trimmed = body.trim();
-		return truncate(trimmed);
+		return { content: truncate(body.trim()), needsLlm: false };
 	}
 
-	return cleanHtml(body);
+	return { content: cleanHtml(body), needsLlm: true };
 }
 
 async function processWithDeepseek(
@@ -171,6 +173,13 @@ async function processWithDeepseek(
 	signal?: AbortSignal,
 ): Promise<string> {
 	const focus = prompt.trim() ? `\n\nFocus the extraction on this question/topic:\n${prompt.trim()}` : "";
+
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+	if (signal) {
+		if (signal.aborted) controller.abort();
+		else signal.addEventListener("abort", () => controller.abort(), { once: true });
+	}
 
 	const instructions = `You are a web content extraction assistant. Process raw text scraped from a web page.
 
@@ -186,40 +195,58 @@ ${
 Raw scraped content:
 ${text}`;
 
-	const response = await fetch(OPENROUTER_CHAT_URL, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${apiKey}`,
-		},
-		body: JSON.stringify({
-			model: OPENROUTER_MODEL,
-			messages: [{ role: "user", content: instructions }],
-			temperature: 0.2,
-		}),
-		signal,
-	});
+	let response: Response;
+	try {
+		response = await fetch(OPENROUTER_CHAT_URL, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			},
+			body: JSON.stringify({
+				model: OPENROUTER_MODEL,
+				messages: [{ role: "user", content: instructions }],
+				temperature: 0.2,
+				// Extraction is a copy/edit task. Left on, the model burns ~100k
+				// reasoning tokens per page (11x slower, 60x costlier).
+				reasoning: { enabled: false },
+				max_tokens: MAX_OUTPUT_TOKENS[mode],
+			}),
+			signal: controller.signal,
+		});
+	} catch (err) {
+		clearTimeout(timeout);
+		throw new Error(
+			`DeepSeek request failed: ${extractErrorMessage(err, controller.signal.aborted ? `timed out after ${LLM_TIMEOUT_MS}ms` : "network error")}`,
+		);
+	}
+
+	let raw: string;
+	try {
+		raw = await response.text();
+	} catch (err) {
+		throw new Error(
+			`DeepSeek response read failed: ${extractErrorMessage(err, controller.signal.aborted ? `timed out after ${LLM_TIMEOUT_MS}ms` : "network error")}`,
+		);
+	} finally {
+		clearTimeout(timeout);
+	}
 
 	if (!response.ok) {
 		let detail = response.statusText;
-		try {
-			const raw = await response.text();
-			if (raw.trim()) {
-				try {
-					detail = extractErrorMessage(JSON.parse(raw), response.statusText);
-				} catch {
-					detail = raw.trim();
-				}
+		if (raw.trim()) {
+			try {
+				detail = extractErrorMessage(JSON.parse(raw), response.statusText);
+			} catch {
+				detail = raw.trim().slice(0, 500);
 			}
-		} catch {
-			// keep statusText
 		}
 		throw new Error(`DeepSeek processing failed (status ${response.status}${detail ? `: ${detail}` : ""})`);
 	}
 
 	let data: unknown;
 	try {
-		data = await response.json();
+		data = JSON.parse(raw);
 	} catch {
 		throw new Error("Malformed JSON response from OpenRouter API");
 	}
@@ -242,6 +269,7 @@ interface FetchResult {
 interface CleanedFetch {
 	url: string;
 	cleaned: string;
+	needsLlm: boolean;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -305,7 +333,7 @@ export default function (pi: ExtensionAPI) {
 			for (let i = 0; i < fetchSettled.length; i++) {
 				const s = fetchSettled[i];
 				if (s.status === "fulfilled") {
-					cleaned.push({ url: validUrls[i], cleaned: s.value });
+					cleaned.push({ url: validUrls[i], cleaned: s.value.content, needsLlm: s.value.needsLlm });
 				} else {
 					fetchFailures.push({
 						url: validUrls[i],
@@ -329,18 +357,26 @@ export default function (pi: ExtensionAPI) {
 			const results: FetchResult[] = [];
 			const processFailures: Array<{ url: string; error: string }> = [];
 
+			// Verbatim on already-clean text: return the bytes exactly, skip the model.
+			const passthroughInVerbatim = mode === "verbatim";
+			const llmQueue: CleanedFetch[] = [];
+			for (const item of cleaned) {
+				if (passthroughInVerbatim && !item.needsLlm) results.push({ url: item.url, content: item.cleaned });
+				else llmQueue.push(item);
+			}
+
 			if (!openrouterKey) {
-				for (const item of cleaned) {
+				for (const item of llmQueue) {
 					results.push({
 						url: item.url,
 						content: `${item.cleaned}\n\n> Note: OPENROUTER_API_KEY not set; returning locally cleaned text without LLM processing.`,
 					});
 				}
-			} else {
+			} else if (llmQueue.length > 0) {
 				onUpdate?.({ content: [{ type: "text", text: "Processing with DeepSeek..." }] });
 
 				const processSettled = await Promise.allSettled(
-					cleaned.map((item) =>
+					llmQueue.map((item) =>
 						processWithDeepseek(item.cleaned, mode, prompt, openrouterKey, signal).then(
 							(content): FetchResult => ({ url: item.url, content }),
 						),
@@ -353,7 +389,7 @@ export default function (pi: ExtensionAPI) {
 						results.push(s.value);
 					} else {
 						processFailures.push({
-							url: cleaned[i].url,
+							url: llmQueue[i].url,
 							error: extractErrorMessage(s.reason, "unknown error"),
 						});
 					}
@@ -388,7 +424,8 @@ export default function (pi: ExtensionAPI) {
 					fetchedCount: results.length,
 					failedCount: failures.length,
 					invalidUrls,
-					llmUsed: Boolean(openrouterKey),
+					llmUsed: Boolean(openrouterKey) && llmQueue.length > 0,
+					llmSkippedUrls: cleaned.filter((c) => !llmQueue.includes(c)).map((c) => c.url),
 				},
 			};
 		},
