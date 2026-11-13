@@ -59,6 +59,11 @@ it exits cleanly with no stderr output.
 
 ## Retired extensions
 
+Each one is tagged `last-seen/<name>` at the commit that still held it, so the tree it lived in is one
+`git checkout` away without a branch to keep.
+
+- **`mode-switch/`** — three working modes picked with a key (plan, agent, boss), each with its own brief and, while planning, a narrower tool set. A mode was the extension's own state, and its boss kept a copy of `delegate/orchestrator.md`; a board thread is now given its mode when it is started, and the tool rules live in pi-studio. Last seen: tag `last-seen/mode-switch`.
+
 - **`dashboard/`** — the single-session board, its server and its client page. [pi-studio](https://github.com/theMladyPan/pi-studio) replaced it with a daemon that gives every agent a card and a thread, so the extension, its `board_*` tools and its `docs/roadmap-board.md` plan are gone. The last tree that held them is branch `archive/dashboard-extension` (commit `dac4240`); pi-studio's `bridge/child-bridge.mjs` registers the `board_*` tools for its own threads. Leftover state in `~/.pi/agent/state/dashboard.json` and `~/.pi/agent/state/boards/` is inert.
 
 - **`voice/`** — spoken driving of the console pi: live dictation from the microphone, breadcrumbs read aloud while tools run, and a spoken wrap-up. It registered `alt+s`, `alt+x`, `alt+l` and `/voice`, and it needed a TUI session (`ctx.mode === "tui"`), so a pi-studio thread never got anything from it. Last tree: branch `archive/voice-mode` (commit `06d5868`). What it did, and what a board version would touch, is recorded in pi-studio's `TODO.md`.
