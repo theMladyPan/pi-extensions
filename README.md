@@ -42,7 +42,6 @@ Run the relevant test before publishing:
 
 ```bash
 (cd browser-screenshot && uv run test_runner.py)
-node --experimental-strip-types --test next-steps/queue.test.ts
 (cd mdrender && node test/test_runner.mjs)
 pi --list-models >/dev/null
 ```
@@ -63,6 +62,8 @@ Each one is tagged `last-seen/<name>` at the commit that still held it, so the t
 `git checkout` away without a branch to keep.
 
 - **`mode-switch/`** — three working modes picked with a key (plan, agent, boss), each with its own brief and, while planning, a narrower tool set. A mode was the extension's own state, and its boss kept a copy of `delegate/orchestrator.md`; a board thread is now given its mode when it is started, and the tool rules live in pi-studio. Last seen: tag `last-seen/mode-switch`.
+
+- **`next-steps/`** — a queue of things to do next, reordered with keys and dispatched one at a time. It refused to open outside a terminal session, so a board thread never saw it, and the board's cards are where a list of what is next lives now. Last seen: tag `last-seen/next-steps`.
 
 - **`dashboard/`** — the single-session board, its server and its client page. [pi-studio](https://github.com/theMladyPan/pi-studio) replaced it with a daemon that gives every agent a card and a thread, so the extension, its `board_*` tools and its `docs/roadmap-board.md` plan are gone. The last tree that held them is branch `archive/dashboard-extension` (commit `dac4240`); pi-studio's `bridge/child-bridge.mjs` registers the `board_*` tools for its own threads. Leftover state in `~/.pi/agent/state/dashboard.json` and `~/.pi/agent/state/boards/` is inert.
 
