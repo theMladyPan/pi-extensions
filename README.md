@@ -65,6 +65,8 @@ Each one is tagged `last-seen/<name>` at the commit that still held it, so the t
 
 - **`next-steps/`** — a queue of things to do next, reordered with keys and dispatched one at a time. It refused to open outside a terminal session, so a board thread never saw it, and the board's cards are where a list of what is next lives now. Last seen: tag `last-seen/next-steps`.
 
+- **`stats.ts`** — a footer line with time to the first token and tokens per second. A footer needs a terminal session, and the numbers it showed are on the studio's board already: a rate beside a running thought, and token and cost totals for a thread and for the whole workspace. Last seen: tag `last-seen/stats`.
+
 - **`dashboard/`** — the single-session board, its server and its client page. [pi-studio](https://github.com/theMladyPan/pi-studio) replaced it with a daemon that gives every agent a card and a thread, so the extension, its `board_*` tools and its `docs/roadmap-board.md` plan are gone. The last tree that held them is branch `archive/dashboard-extension` (commit `dac4240`); pi-studio's `bridge/child-bridge.mjs` registers the `board_*` tools for its own threads. Leftover state in `~/.pi/agent/state/dashboard.json` and `~/.pi/agent/state/boards/` is inert.
 
 - **`voice/`** — spoken driving of the console pi: live dictation from the microphone, breadcrumbs read aloud while tools run, and a spoken wrap-up. It registered `alt+s`, `alt+x`, `alt+l` and `/voice`, and it needed a TUI session (`ctx.mode === "tui"`), so a pi-studio thread never got anything from it. Last tree: branch `archive/voice-mode` (commit `06d5868`). What it did, and what a board version would touch, is recorded in pi-studio's `TODO.md`.
