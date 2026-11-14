@@ -302,6 +302,9 @@ def run_browser_session(runner_input: RunnerInput) -> RunnerResult:
         with sync_playwright() as pw:
             context: BrowserContext = pw.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
+                # Full Chrome build: the headless shell lacks the PDF viewer, so
+                # file:///...pdf downloads instead of rendering.
+                channel="chromium",
                 headless=True,
                 viewport=DEFAULT_VIEWPORT,
                 ignore_https_errors=runner_input.ignore_https_errors,
