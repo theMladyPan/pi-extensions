@@ -7,7 +7,10 @@ Retired on `dev`; the last tree that held it is on branch `archive/dashboard-ext
 (`dac4240`, `dashboard/` plus `docs/roadmap-board.md`). The roadmap that lived in
 `docs/roadmap-board.md` moved with the work: pi-studio's `STATE.md` and `TODO.md` carry it.
 
+`delegate.ts` is retired the same way: pi-studio spawns children as board threads, so a tool
+that shelled out to a fresh pi process was a second path to the same place. The last tree that
+held it is tag `last-seen/delegate` (commit `3f0b0ba`).
+
 ## Left in this repository
 
-- [ ] **Retire `delegate.ts`** — pi-studio spawns children as board threads, so a tool that
-      shells out to a fresh pi process is a second path to the same place.
+Nothing open.

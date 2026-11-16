@@ -71,6 +71,8 @@ Each one is tagged `last-seen/<name>` at the commit that still held it, so the t
 
 - **`voice/`** — spoken driving of the console pi: live dictation from the microphone, breadcrumbs read aloud while tools run, and a spoken wrap-up. It registered `alt+s`, `alt+x`, `alt+l` and `/voice`, and it needed a TUI session (`ctx.mode === "tui"`), so a pi-studio thread never got anything from it. Last tree: branch `archive/voice-mode` (commit `06d5868`). What it did, and what a board version would touch, is recorded in pi-studio's `TODO.md`.
 
+- **`delegate.ts`** — a tool that shelled out to a fresh pi process to run one bounded task as a scout, implement, review, chore or architect child, with pre-pass scouts and reviewers. pi-studio now spawns children as board threads with its own role prompts, tool rules and thinking levels, so the extension was a second path to the same place. Last seen: tag `last-seen/delegate` (commit `3f0b0ba`). Its `delegate/orchestrator.md` model routing and workflow are gone with it; the role bodies survive in pi-studio's `prompts/roles/`.
+
 ## Notes for Pi agents
 
 - This directory is a Git repository. Check `git status` before edits or pulls.
